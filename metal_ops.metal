@@ -1,0 +1,7882 @@
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+
+using namespace metal;
+
+// 解决 Shared Memory Bank Conflict 的 Morton 映射
+METAL_FUNC static ushort2 morton_order(ushort thread_index_in_simdgroup) {
+    ushort lane_id = thread_index_in_simdgroup;
+    ushort quad_id = lane_id / 4;
+    ushort M_floor_of_quadrant = (quad_id / 4) * 4;
+    ushort M_in_quadrant = (lane_id / 2) % 4;
+    ushort M_in_simd = M_floor_of_quadrant + M_in_quadrant;
+    ushort N_floor_of_quadrant = (quad_id & 2) * 2;
+    ushort N_in_quadrant = (lane_id % 2) * 2;
+    ushort N_in_simd = N_floor_of_quadrant + N_in_quadrant;
+    return ushort2(N_in_simd, M_in_simd);
+}
+
+METAL_FUNC static float2 load_device_8x8_pair(
+    device const float* src,
+    uint row_stride,
+    uint row_base,
+    uint col_base,
+    uint extent,
+    ushort lane) {
+    const ushort2 offset = morton_order(lane);
+    const uint row = row_base + uint(offset.y);
+    const uint col = col_base + uint(offset.x);
+    if (row < extent && (col + 1u) < extent) {
+        return float2(*reinterpret_cast<device const packed_float2*>(src + row * row_stride + col));
+    }
+    const float first = (row < extent && col < extent) ? src[row * row_stride + col] : 0.0f;
+    const float second = (row < extent && (col + 1u) < extent) ? src[row * row_stride + col + 1u] : 0.0f;
+    return float2(first, second);
+}
+
+METAL_FUNC static float fused_mlp_gelu_scalar(float value) {
+    const float scale = sqrt(2.0f / M_PI_F);
+    const float cube = value * value * value;
+    float inner = scale * (value + 0.044715f * cube);
+    inner = clamp(inner, -20.0f, 20.0f);
+    return 0.5f * value * (1.0f + fast::tanh(inner));
+}
+
+METAL_FUNC static float4 fused_mlp_gelu_float4_exact(float4 value) {
+    return float4(
+        fused_mlp_gelu_scalar(value.x),
+        fused_mlp_gelu_scalar(value.y),
+        fused_mlp_gelu_scalar(value.z),
+        fused_mlp_gelu_scalar(value.w)
+    );
+}
+
+#pragma METAL internals : enable
+
+namespace lowreg_matrix {
+
+template <typename T>
+METAL_FUNC vec<T, 2> load_tg_8x8(
+    threadgroup const T* src,
+    uint stride,
+    ushort2 origin,
+    ushort lane,
+    bool transpose = false) {
+    const ushort2 offset = morton_order(lane);
+    const uint row = uint(origin.x) + uint(offset.y);
+    const uint col = uint(origin.y) + uint(offset.x);
+    if (transpose) {
+        return vec<T, 2>(src[col * stride + row], src[(col + 1u) * stride + row]);
+    }
+    return vec<T, 2>(src[row * stride + col], src[row * stride + col + 1u]);
+}
+
+template <typename T>
+METAL_FUNC void store_tg_8x8(
+    threadgroup T* dst,
+    uint stride,
+    ushort2 origin,
+    ushort lane,
+    vec<T, 2> value,
+    bool transpose = false) {
+    const ushort2 offset = morton_order(lane);
+    if (transpose) {
+        const uint row = uint(origin.x) + uint(offset.x);
+        const uint col = uint(origin.y) + uint(offset.y);
+        dst[col * stride + row] = value[0];
+        dst[(col + 1u) * stride + row] = value[1];
+        return;
+    }
+
+    const uint row = uint(origin.x) + uint(offset.y);
+    const uint col = uint(origin.y) + uint(offset.x);
+    dst[row * stride + col] = value[0];
+    dst[row * stride + col + 1u] = value[1];
+}
+
+template <typename T, typename U, typename V>
+METAL_FUNC vec<T, 2> mma_8x8(
+    vec<U, 2> a_value,
+    vec<V, 2> b_value,
+    vec<T, 2> accumulator) {
+    typedef vec<U, 64> native_a_type;
+    typedef vec<V, 64> native_b_type;
+    typedef vec<T, 64> native_c_type;
+    native_a_type a_native;
+    native_b_type b_native;
+    native_c_type c_native;
+
+    *reinterpret_cast<thread vec<U, 2>*>(&a_native) = a_value;
+    *reinterpret_cast<thread vec<V, 2>*>(&b_native) = b_value;
+    *reinterpret_cast<thread vec<T, 2>*>(&c_native) = accumulator;
+    c_native = __metal_simdgroup_matrix_8x8_multiply_accumulate(a_native, b_native, c_native, native_c_type());
+
+    return *reinterpret_cast<thread vec<T, 2>*>(&c_native);
+}
+
+} // namespace lowreg_matrix
+
+#pragma METAL internals : disable
+
+kernel void fill_scalar_kernel(
+    device float* out [[buffer(0)]],
+    constant float& value [[buffer(1)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]) {
+    if (id < threads_per_grid) out[id] = value;
+}
+
+inline void atomic_add_float(device atomic_uint* target, float value) {
+    uint expected = atomic_load_explicit(target, memory_order_relaxed);
+    uint desired;
+    do {
+        float current_float = as_type<float>(expected);
+        if (isnan(current_float) || isnan(value)) {
+            desired = as_type<uint>(NAN);
+            atomic_compare_exchange_weak_explicit(target, &expected, desired, memory_order_relaxed, memory_order_relaxed);
+            break; 
+        }
+        float desired_float = current_float + value;
+        desired = as_type<uint>(desired_float);
+    } while (!atomic_compare_exchange_weak_explicit(target, &expected, desired, memory_order_relaxed, memory_order_relaxed));
+}
+
+kernel void add_residual_forward_vec4(
+    device const float4* x [[buffer(0)]],
+    device const float4* y [[buffer(1)]],
+    device float4* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    out[gid] = x[gid] + y[gid];
+}
+
+kernel void add_residual_backward_vec4(
+    device const float4* grad_out [[buffer(0)]],
+    device float4* grad_x [[buffer(1)]],
+    device float4* grad_y [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const float4 g = grad_out[gid];
+    if (grad_x) {
+        grad_x[gid] = g;
+    }
+    if (grad_y) {
+        grad_y[gid] = g;
+    }
+}
+
+kernel void add_residual_forward(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    out[gid] = x[gid] + y[gid];
+}
+
+kernel void add_residual_backward(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_x [[buffer(1)]],
+    device float* grad_y [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    float g = grad_out[gid];
+
+    grad_x[gid] = g;
+    grad_y[gid] = g;
+}
+
+kernel void add_pos_forward(
+    device const float* x [[buffer(0)]],
+    device const float* pos [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& C [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint tc = gid % (T*C);
+    out[gid] = x[gid] + pos[tc];
+}
+
+kernel void pos_emb_grad(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_pos [[buffer(1)]],
+    constant uint& B [[buffer(2)]],
+    constant uint& T [[buffer(3)]],
+    constant uint& C [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint tc = gid;
+    uint t = tc / C;
+    uint c = tc % C;
+
+    float sum = 0;
+    for(uint b=0;b<B;b++) {
+        sum += grad_out[(b*T+t)*C+c];
+    }
+    grad_pos[tc] = sum;
+}
+
+kernel void contiguous_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_x [[buffer(1)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]) 
+{
+    if (id < threads_per_grid) {
+        if (grad_x) grad_x[id] = grad_out[id];
+    }
+}
+
+kernel void add_bias_forward(
+    device const float* x [[buffer(0)]],
+    device const float* bias [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& C [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    uint c = gid % C;
+    out[gid] = x[gid] + bias[c];
+}
+
+kernel void mul_forward_kernel(
+    device const float* x [[buffer(0)]],
+    device const float* y [[buffer(1)]],
+    device float* out     [[buffer(2)]],
+    constant uint& n0 [[buffer(3)]],
+    constant uint& n1 [[buffer(4)]],
+    constant uint& n2 [[buffer(5)]],
+    constant uint& n3 [[buffer(6)]],
+    constant uint& sx0 [[buffer(7)]],
+    constant uint& sx1 [[buffer(8)]],
+    constant uint& sx2 [[buffer(9)]],
+    constant uint& sx3 [[buffer(10)]],
+    constant uint& sy0 [[buffer(11)]],
+    constant uint& sy1 [[buffer(12)]],
+    constant uint& sy2 [[buffer(13)]],
+    constant uint& sy3 [[buffer(14)]],
+    constant uint& ndim [[buffer(15)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid) return;
+    uint shape[4] = {n0, n1, n2, n3};
+    uint sx[4] = {sx0, sx1, sx2, sx3};
+    uint sy[4] = {sy0, sy1, sy2, sy3};
+    uint linear = id, idx_x = 0, idx_y = 0;
+    for (int i = int(ndim) - 1; i >= 0; --i) {
+        uint coord = linear % shape[i];
+        idx_x += coord * sx[i];
+        idx_y += coord * sy[i];
+        linear /= shape[i];
+    }
+    out[id] = x[idx_x] * y[idx_y];
+}
+
+kernel void mul_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device const float* x        [[buffer(1)]],
+    device const float* y        [[buffer(2)]],
+    device float* grad_x         [[buffer(3)]],
+    device float* grad_y         [[buffer(4)]],
+    constant uint& n0  [[buffer(5)]],
+    constant uint& n1  [[buffer(6)]],
+    constant uint& n2  [[buffer(7)]],
+    constant uint& n3  [[buffer(8)]],
+    constant uint& sx0 [[buffer(9)]],
+    constant uint& sx1 [[buffer(10)]],
+    constant uint& sx2 [[buffer(11)]],
+    constant uint& sx3 [[buffer(12)]],
+    constant uint& sy0 [[buffer(13)]],
+    constant uint& sy1 [[buffer(14)]],
+    constant uint& sy2 [[buffer(15)]],
+    constant uint& sy3 [[buffer(16)]],
+    constant uint& ndim [[buffer(17)]],
+    constant uint& do_x [[buffer(18)]],
+    constant uint& do_y [[buffer(19)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid) return;
+    uint shape[4] = {n0, n1, n2, n3};
+    uint sx[4] = {sx0, sx1, sx2, sx3};
+    uint sy[4] = {sy0, sy1, sy2, sy3};
+    uint linear = id;
+    uint idx_x = 0;
+    uint idx_y = 0;
+    for (int i = int(ndim) - 1; i >= 0; --i) {
+        uint coord = linear % shape[i];
+        idx_x += coord * sx[i];
+        idx_y += coord * sy[i];
+        linear /= shape[i];
+    }
+    const float g = grad_out[id];
+    // dx: 训练里 x 通常与 out 同形；用 atomic 兼容广播
+    if (do_x != 0u) {
+        atomic_add_float(reinterpret_cast<device atomic_uint*>(&grad_x[idx_x]), g * y[idx_y]);
+    }
+    // dy: scalar / row 广播会多线程写同一地址，必须 atomic
+    if (do_y != 0u) {
+        atomic_add_float(reinterpret_cast<device atomic_uint*>(&grad_y[idx_y]), g * x[idx_x]);
+    }
+}
+
+kernel void mul_backward_scalar_dx(
+    device const float* grad_out [[buffer(0)]],
+    device const float* y        [[buffer(1)]],
+    device float* grad_x         [[buffer(2)]],
+    constant uint& n             [[buffer(3)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= n) {
+        return;
+    }
+
+    grad_x[id] += grad_out[id] * y[0];
+}
+
+kernel void mul_backward_scalar_dy(
+    device const float* grad_out [[buffer(0)]],
+    device const float* x        [[buffer(1)]],
+    device float* grad_y         [[buffer(2)]],
+    constant uint& n             [[buffer(3)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    // Python 端固定使用 256 个线程。
+    threadgroup float partial_sum[256];
+
+    float local_sum = 0.0f;
+
+    // 256 个线程分别处理 0,256,512... 等位置。
+    for (uint i = tid; i < n; i += tpg) {
+        local_sum += grad_out[i] * x[i];
+    }
+
+    partial_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 固定顺序的树形归约。
+    for (uint stride = tpg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partial_sum[tid] += partial_sum[tid + stride];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 只有一个线程写 grad_y，因此不需要 atomic。
+    if (tid == 0u) {
+        grad_y[0] += partial_sum[0];
+    }
+}
+
+kernel void gather_forward_kernel(
+    device const int* indices [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& C [[buffer(3)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]) 
+{
+    if (id < threads_per_grid) {
+        uint row = id / C;
+        uint col = id % C;
+        int idx = indices[row];
+        out[id] = weight[idx * C + col];
+    }
+}
+
+kernel void gather_backward_kernel(
+    device const int* indices        [[buffer(0)]],
+    device const float* grad_out     [[buffer(1)]],
+    device atomic_uint* grad_weight  [[buffer(2)]],
+    constant uint& C                 [[buffer(3)]],
+    uint id                          [[thread_position_in_grid]],
+    uint threads_per_grid            [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid || C == 0u) {
+        return;
+    }
+
+    const uint row = id / C;
+    const uint col = id - row * C;
+    const uint token = uint(indices[row]);
+    const uint destination = token * C + col;
+
+    atomic_add_float(
+        grad_weight + destination,
+        grad_out[id]
+    );
+}
+
+kernel void contiguous_forward_kernel(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint* shape [[buffer(2)]],
+    constant uint* strides [[buffer(3)]],
+    constant uint* p_ndim [[buffer(4)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid) return;
+    const uint ndim = p_ndim[0];
+    uint linear_idx = id;
+    uint strided_idx = 0;
+    for (int i = int(ndim) - 1; i >= 0; --i) {
+        const uint dim_size = shape[i];
+        const uint coord = linear_idx % dim_size;
+        strided_idx += coord * strides[i];
+        linear_idx /= dim_size;
+    }
+    out[id] = x[strided_idx];
+}
+
+kernel void fused_linear_add_forward_kernel(
+    device const float* x           [[buffer(0)]],
+    device const float* act         [[buffer(1)]],
+    device const float* w           [[buffer(2)]],
+    device const float* b           [[buffer(3)]],
+    device float* out               [[buffer(4)]],
+    constant uint& M                [[buffer(5)]],
+    constant uint& K                [[buffer(6)]],
+    constant uint& N                [[buffer(7)]],
+    constant uint& alias_x_out      [[buffer(8)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint3 thread_pos                [[thread_position_in_threadgroup]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint simd_id                    [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_count            [[threads_per_simdgroup]])
+{
+    constexpr uint kThreads = 256u;
+    constexpr uint kBM = 32u;
+    constexpr uint kBN = 64u;
+    constexpr uint kBK = 32u;
+    constexpr uint kFrag = 8u;
+
+    constexpr uint kAStride = kBK + 1u;
+    constexpr uint kWStride = kBN + 1u;
+    constexpr uint kK4PerTile = kBK / 4u;
+    constexpr uint kN4PerTile = kBN / 4u;
+
+    constexpr uint kAFloat4Count = kBM * kK4PerTile;
+    constexpr uint kWFloat4Count = kBK * kN4PerTile;
+
+    threadgroup float A_tg[kBM][kAStride];
+    threadgroup float W_tg[kBK][kWStride];
+
+    const uint tid = thread_pos.x;
+
+    if (tid >= kThreads ||
+        simd_lane_count != 32u ||
+        tg_pos.x != 0u ||
+        M == 0u ||
+        K == 0u ||
+        N == 0u) {
+        return;
+    }
+
+    (void)alias_x_out;
+
+    const uint output_base = tg_pos.y * kBN;
+    const uint row_base0 = tg_pos.z * (2u * kBM);
+    const uint row_base1 = row_base0 + kBM;
+
+    if (output_base >= N || row_base0 >= M) {
+        return;
+    }
+
+    const bool have_tile1 = row_base1 < M;
+
+    const uint matrix_row_group = simd_id >> 1u;
+    const uint matrix_col_group = simd_id & 1u;
+    const uint simd_row_base = matrix_row_group * kFrag;
+    const uint simd_col_base = matrix_col_group * 32u;
+
+    float2 accumulator0 = float2(0.0f);
+    float2 accumulator1 = float2(0.0f);
+    float2 accumulator2 = float2(0.0f);
+    float2 accumulator3 = float2(0.0f);
+
+    float2 accumulator0b = float2(0.0f);
+    float2 accumulator1b = float2(0.0f);
+    float2 accumulator2b = float2(0.0f);
+    float2 accumulator3b = float2(0.0f);
+
+    for (uint input_base = 0u;
+         input_base < K;
+         input_base += kBK) {
+
+        // W[K,N] -> W_tg[32,64].
+        // 每个 K-tile 只从 device 加载一次，供两个 M-tile 共用。
+        for (uint index = tid;
+             index < kWFloat4Count;
+             index += kThreads) {
+
+            const uint local_k = index / kN4PerTile;
+            const uint local_n4 =
+                index - local_k * kN4PerTile;
+
+            const uint global_k = input_base + local_k;
+            const uint global_n =
+                output_base + local_n4 * 4u;
+
+            float4 value = float4(0.0f);
+
+            if (global_k < K && global_n + 3u < N) {
+                value = float4(
+                    *reinterpret_cast<
+                        device const packed_float4*>(
+                            w + global_k * N + global_n
+                        )
+                );
+            } else if (global_k < K && global_n < N) {
+                #pragma unroll
+                for (uint component = 0u;
+                     component < 4u;
+                     ++component) {
+
+                    const uint n = global_n + component;
+                    if (n < N) {
+                        value[component] =
+                            w[global_k * N + n];
+                    }
+                }
+            }
+
+            const uint local_n = local_n4 * 4u;
+
+            *reinterpret_cast<
+                threadgroup packed_float4*>(
+                    &W_tg[local_k][local_n]
+                ) = packed_float4(value);
+        }
+
+        // 第一块 act[row_base0:row_base0+32, input_base:input_base+32]
+        // -> A_tg[32,32]。
+        for (uint index = tid;
+             index < kAFloat4Count;
+             index += kThreads) {
+
+            const uint local_row = index / kK4PerTile;
+            const uint local_k4 =
+                index - local_row * kK4PerTile;
+
+            const uint global_row = row_base0 + local_row;
+            const uint global_k =
+                input_base + local_k4 * 4u;
+
+            float4 value = float4(0.0f);
+
+            if (global_row < M && global_k + 3u < K) {
+                value = float4(
+                    *reinterpret_cast<
+                        device const packed_float4*>(
+                            act + global_row * K + global_k
+                        )
+                );
+            } else if (global_row < M && global_k < K) {
+                #pragma unroll
+                for (uint component = 0u;
+                     component < 4u;
+                     ++component) {
+
+                    const uint k = global_k + component;
+                    if (k < K) {
+                        value[component] =
+                            act[global_row * K + k];
+                    }
+                }
+            }
+
+            const uint local_k = local_k4 * 4u;
+
+            *reinterpret_cast<
+                threadgroup packed_float4*>(
+                    &A_tg[local_row][local_k]
+                ) = packed_float4(value);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 第一块 32x64 M-tile。
+        for (uint k_sub = 0u;
+             k_sub < kBK;
+             k_sub += kFrag) {
+
+            const float2 a_fragment =
+                lowreg_matrix::load_tg_8x8(
+                    reinterpret_cast<
+                        threadgroup const float*>(A_tg),
+                    kAStride,
+                    ushort2(
+                        ushort(simd_row_base),
+                        ushort(k_sub)
+                    ),
+                    ushort(lane)
+                );
+
+            const float2 w_fragment0 =
+                lowreg_matrix::load_tg_8x8(
+                    reinterpret_cast<
+                        threadgroup const float*>(W_tg),
+                    kWStride,
+                    ushort2(
+                        ushort(k_sub),
+                        ushort(simd_col_base)
+                    ),
+                    ushort(lane)
+                );
+
+            const float2 w_fragment1 =
+                lowreg_matrix::load_tg_8x8(
+                    reinterpret_cast<
+                        threadgroup const float*>(W_tg),
+                    kWStride,
+                    ushort2(
+                        ushort(k_sub),
+                        ushort(simd_col_base + 8u)
+                    ),
+                    ushort(lane)
+                );
+
+            const float2 w_fragment2 =
+                lowreg_matrix::load_tg_8x8(
+                    reinterpret_cast<
+                        threadgroup const float*>(W_tg),
+                    kWStride,
+                    ushort2(
+                        ushort(k_sub),
+                        ushort(simd_col_base + 16u)
+                    ),
+                    ushort(lane)
+                );
+
+            const float2 w_fragment3 =
+                lowreg_matrix::load_tg_8x8(
+                    reinterpret_cast<
+                        threadgroup const float*>(W_tg),
+                    kWStride,
+                    ushort2(
+                        ushort(k_sub),
+                        ushort(simd_col_base + 24u)
+                    ),
+                    ushort(lane)
+                );
+
+            accumulator0 =
+                lowreg_matrix::mma_8x8(
+                    a_fragment,
+                    w_fragment0,
+                    accumulator0
+                );
+
+            accumulator1 =
+                lowreg_matrix::mma_8x8(
+                    a_fragment,
+                    w_fragment1,
+                    accumulator1
+                );
+
+            accumulator2 =
+                lowreg_matrix::mma_8x8(
+                    a_fragment,
+                    w_fragment2,
+                    accumulator2
+                );
+
+            accumulator3 =
+                lowreg_matrix::mma_8x8(
+                    a_fragment,
+                    w_fragment3,
+                    accumulator3
+                );
+        }
+
+        // 所有 SG 用完第一块 A_tg 后，才能覆盖 A_tg。
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (have_tile1) {
+            // 第二块 act[row_base1:row_base1+32, ...] 覆盖 A_tg。
+            // W_tg 保持不变。
+            for (uint index = tid;
+                 index < kAFloat4Count;
+                 index += kThreads) {
+
+                const uint local_row = index / kK4PerTile;
+                const uint local_k4 =
+                    index - local_row * kK4PerTile;
+
+                const uint global_row =
+                    row_base1 + local_row;
+                const uint global_k =
+                    input_base + local_k4 * 4u;
+
+                float4 value = float4(0.0f);
+
+                if (global_row < M && global_k + 3u < K) {
+                    value = float4(
+                        *reinterpret_cast<
+                            device const packed_float4*>(
+                                act + global_row * K + global_k
+                            )
+                    );
+                } else if (global_row < M &&
+                           global_k < K) {
+
+                    #pragma unroll
+                    for (uint component = 0u;
+                         component < 4u;
+                         ++component) {
+
+                        const uint k =
+                            global_k + component;
+
+                        if (k < K) {
+                            value[component] =
+                                act[global_row * K + k];
+                        }
+                    }
+                }
+
+                const uint local_k = local_k4 * 4u;
+
+                *reinterpret_cast<
+                    threadgroup packed_float4*>(
+                        &A_tg[local_row][local_k]
+                    ) = packed_float4(value);
+            }
+
+            threadgroup_barrier(
+                mem_flags::mem_threadgroup
+            );
+
+            // 第二块 32x64 M-tile，复用同一块 W_tg。
+            for (uint k_sub = 0u;
+                 k_sub < kBK;
+                 k_sub += kFrag) {
+
+                const float2 a_fragment =
+                    lowreg_matrix::load_tg_8x8(
+                        reinterpret_cast<
+                            threadgroup const float*>(A_tg),
+                        kAStride,
+                        ushort2(
+                            ushort(simd_row_base),
+                            ushort(k_sub)
+                        ),
+                        ushort(lane)
+                    );
+
+                const float2 w_fragment0 =
+                    lowreg_matrix::load_tg_8x8(
+                        reinterpret_cast<
+                            threadgroup const float*>(W_tg),
+                        kWStride,
+                        ushort2(
+                            ushort(k_sub),
+                            ushort(simd_col_base)
+                        ),
+                        ushort(lane)
+                    );
+
+                const float2 w_fragment1 =
+                    lowreg_matrix::load_tg_8x8(
+                        reinterpret_cast<
+                            threadgroup const float*>(W_tg),
+                        kWStride,
+                        ushort2(
+                            ushort(k_sub),
+                            ushort(simd_col_base + 8u)
+                        ),
+                        ushort(lane)
+                    );
+
+                const float2 w_fragment2 =
+                    lowreg_matrix::load_tg_8x8(
+                        reinterpret_cast<
+                            threadgroup const float*>(W_tg),
+                        kWStride,
+                        ushort2(
+                            ushort(k_sub),
+                            ushort(simd_col_base + 16u)
+                        ),
+                        ushort(lane)
+                    );
+
+                const float2 w_fragment3 =
+                    lowreg_matrix::load_tg_8x8(
+                        reinterpret_cast<
+                            threadgroup const float*>(W_tg),
+                        kWStride,
+                        ushort2(
+                            ushort(k_sub),
+                            ushort(simd_col_base + 24u)
+                        ),
+                        ushort(lane)
+                    );
+
+                accumulator0b =
+                    lowreg_matrix::mma_8x8(
+                        a_fragment,
+                        w_fragment0,
+                        accumulator0b
+                    );
+
+                accumulator1b =
+                    lowreg_matrix::mma_8x8(
+                        a_fragment,
+                        w_fragment1,
+                        accumulator1b
+                    );
+
+                accumulator2b =
+                    lowreg_matrix::mma_8x8(
+                        a_fragment,
+                        w_fragment2,
+                        accumulator2b
+                    );
+
+                accumulator3b =
+                    lowreg_matrix::mma_8x8(
+                        a_fragment,
+                        w_fragment3,
+                        accumulator3b
+                    );
+            }
+
+            // 保护 W_tg/A_tg，防止下一轮 K-tile 提前覆盖。
+            threadgroup_barrier(
+                mem_flags::mem_threadgroup
+            );
+        } else {
+            threadgroup_barrier(
+                mem_flags::mem_threadgroup
+            );
+        }
+    }
+
+    // K 循环结束，A_tg 可复用。
+    // 平坦使用前 64 个 float 缓存当前 N 条带的 bias。
+    threadgroup float* bias_tg =
+        reinterpret_cast<threadgroup float*>(
+            &A_tg[0][0]
+        );
+
+    if (tid < kBN) {
+        const uint global_n = output_base + tid;
+        bias_tg[tid] =
+            global_n < N ? b[global_n] : 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ushort2 matrix_offset =
+        morton_order(ushort(lane));
+
+    const uint local_row =
+        simd_row_base + uint(matrix_offset.y);
+
+    // 第一块 32x64 的 Morton 标量 epilogue。
+    const uint global_row0 = row_base0 + local_row;
+
+    if (global_row0 < M) {
+        #pragma unroll
+        for (uint fragment_index = 0u;
+             fragment_index < 4u;
+             ++fragment_index) {
+
+            float2 accumulator = float2(0.0f);
+
+            if (fragment_index == 0u) {
+                accumulator = accumulator0;
+            } else if (fragment_index == 1u) {
+                accumulator = accumulator1;
+            } else if (fragment_index == 2u) {
+                accumulator = accumulator2;
+            } else {
+                accumulator = accumulator3;
+            }
+
+            const uint fragment_column =
+                simd_col_base +
+                uint(matrix_offset.x) +
+                fragment_index * 8u;
+
+            #pragma unroll
+            for (uint component = 0u;
+                 component < 2u;
+                 ++component) {
+
+                const uint local_n =
+                    fragment_column + component;
+                const uint global_n =
+                    output_base + local_n;
+
+                if (global_n >= N) {
+                    continue;
+                }
+
+                const uint output_index =
+                    global_row0 * N + global_n;
+
+                out[output_index] =
+                    accumulator[component] +
+                    x[output_index] +
+                    bias_tg[local_n];
+            }
+        }
+    }
+
+    // 第二块复用相同 Morton 坐标及 bias_tg。
+    if (have_tile1) {
+        const uint global_row1 =
+            row_base1 + local_row;
+
+        if (global_row1 < M) {
+            #pragma unroll
+            for (uint fragment_index = 0u;
+                 fragment_index < 4u;
+                 ++fragment_index) {
+
+                float2 accumulator = float2(0.0f);
+
+                if (fragment_index == 0u) {
+                    accumulator = accumulator0b;
+                } else if (fragment_index == 1u) {
+                    accumulator = accumulator1b;
+                } else if (fragment_index == 2u) {
+                    accumulator = accumulator2b;
+                } else {
+                    accumulator = accumulator3b;
+                }
+
+                const uint fragment_column =
+                    simd_col_base +
+                    uint(matrix_offset.x) +
+                    fragment_index * 8u;
+
+                #pragma unroll
+                for (uint component = 0u;
+                     component < 2u;
+                     ++component) {
+
+                    const uint local_n =
+                        fragment_column + component;
+                    const uint global_n =
+                        output_base + local_n;
+
+                    if (global_n >= N) {
+                        continue;
+                    }
+
+                    const uint output_index =
+                        global_row1 * N + global_n;
+
+                    out[output_index] =
+                        accumulator[component] +
+                        x[output_index] +
+                        bias_tg[local_n];
+                }
+            }
+        }
+    }
+}
+
+kernel void strided_add_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_x [[buffer(1)]],
+    constant uint* shape [[buffer(2)]],
+    constant uint* strides [[buffer(3)]],
+    constant uint* p_ndim [[buffer(4)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]) 
+{
+    if (id < threads_per_grid) {
+        uint linear_idx = id;
+        uint strided_idx = 0;
+        uint ndim = p_ndim[0];
+        
+        for (int i = ndim - 1; i >= 0; --i) {
+            uint dim_size = shape[i];
+            uint coord = linear_idx % dim_size;
+            strided_idx += coord * strides[i];
+            linear_idx /= dim_size;
+        }
+        if (grad_x) grad_x[id] = grad_out[strided_idx];
+    }
+}
+
+kernel void bias_grad_reduce(
+    device const float* grad_out [[buffer(0)]],
+    device float* grad_bias      [[buffer(1)]],
+    constant uint& rows          [[buffer(2)]],
+    constant uint& C             [[buffer(3)]],
+    constant uint& accumulate    [[buffer(4)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]],
+    uint simd_id                 [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kSimdGroups = kThreads / kSimdWidth;
+
+    constexpr uint kBN = 16u;
+    constexpr uint kVecWidth = 4u;
+    constexpr uint kVecsPerBlock = kBN / kVecWidth;
+
+    const uint col0 = tg_pos.y * kBN;
+    const uint valid_cols = min(kBN, C - col0);
+    const uint full_vecs = valid_cols / kVecWidth;
+    const uint tail_cols = valid_cols % kVecWidth;
+
+    float4 acc0 = float4(0.0f);
+    float4 acc1 = float4(0.0f);
+    float4 acc2 = float4(0.0f);
+    float4 acc3 = float4(0.0f);
+
+    for (uint row = tid; row < rows; row += kThreads) {
+        const device float* src =
+            grad_out + row * C + col0;
+
+        if (full_vecs >= 1u) {
+            acc0 += float4(
+                *reinterpret_cast<device const packed_float4*>(
+                    src + 0u));
+        }
+
+        if (full_vecs >= 2u) {
+            acc1 += float4(
+                *reinterpret_cast<device const packed_float4*>(
+                    src + 4u));
+        }
+
+        if (full_vecs >= 3u) {
+            acc2 += float4(
+                *reinterpret_cast<device const packed_float4*>(
+                    src + 8u));
+        }
+
+        if (full_vecs >= 4u) {
+            acc3 += float4(
+                *reinterpret_cast<device const packed_float4*>(
+                    src + 12u));
+        }
+
+        if (tail_cols != 0u) {
+            const device float* tail_src =
+                src + full_vecs * kVecWidth;
+
+            float4 tail = float4(0.0f);
+
+            if (tail_cols >= 1u) {
+                tail.x = tail_src[0];
+            }
+            if (tail_cols >= 2u) {
+                tail.y = tail_src[1];
+            }
+            if (tail_cols >= 3u) {
+                tail.z = tail_src[2];
+            }
+
+            if (full_vecs == 0u) {
+                acc0 += tail;
+            } else if (full_vecs == 1u) {
+                acc1 += tail;
+            } else if (full_vecs == 2u) {
+                acc2 += tail;
+            } else {
+                acc3 += tail;
+            }
+        }
+    }
+
+    const float4 simd_sum0 = float4(
+        simd_sum(acc0.x),
+        simd_sum(acc0.y),
+        simd_sum(acc0.z),
+        simd_sum(acc0.w));
+
+    const float4 simd_sum1 = float4(
+        simd_sum(acc1.x),
+        simd_sum(acc1.y),
+        simd_sum(acc1.z),
+        simd_sum(acc1.w));
+
+    const float4 simd_sum2 = float4(
+        simd_sum(acc2.x),
+        simd_sum(acc2.y),
+        simd_sum(acc2.z),
+        simd_sum(acc2.w));
+
+    const float4 simd_sum3 = float4(
+        simd_sum(acc3.x),
+        simd_sum(acc3.y),
+        simd_sum(acc3.z),
+        simd_sum(acc3.w));
+
+    threadgroup float4 tg_partial[kSimdGroups][kVecsPerBlock];
+
+    if (lane == 0u) {
+        tg_partial[simd_id][0] = simd_sum0;
+        tg_partial[simd_id][1] = simd_sum1;
+        tg_partial[simd_id][2] = simd_sum2;
+        tg_partial[simd_id][3] = simd_sum3;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float4 sums[kVecsPerBlock];
+
+        sums[0] = float4(0.0f);
+        sums[1] = float4(0.0f);
+        sums[2] = float4(0.0f);
+        sums[3] = float4(0.0f);
+
+        for (uint group = 0u; group < kSimdGroups; ++group) {
+            sums[0] += tg_partial[group][0];
+            sums[1] += tg_partial[group][1];
+            sums[2] += tg_partial[group][2];
+            sums[3] += tg_partial[group][3];
+        }
+
+        device float* dst = grad_bias + col0;
+
+        // 完整 float4：packed 读写，允许非 16 字节对齐。
+        for (uint vec = 0u; vec < full_vecs; ++vec) {
+            device packed_float4* dst4 =
+                reinterpret_cast<device packed_float4*>(
+                    dst + vec * kVecWidth);
+
+            float4 value = sums[vec];
+
+            if (accumulate != 0u) {
+                value += float4(*dst4);
+            }
+
+            *dst4 = packed_float4(value);
+        }
+
+        // 不完整尾部：只访问实际存在的 1–3 列。
+        if (tail_cols != 0u) {
+            const uint tail_base = full_vecs * kVecWidth;
+
+            for (uint i = 0u; i < tail_cols; ++i) {
+                const float value = sums[full_vecs][i];
+
+                if (accumulate != 0u) {
+                    dst[tail_base + i] += value;
+                } else {
+                    dst[tail_base + i] = value;
+                }
+            }
+        }
+    }
+}
+
+kernel void fused_rmsnorm_mlp_forward_kernel_bm16(
+    device const float* x        [[buffer(0)]],
+    device const float* w1       [[buffer(1)]],
+    device const float* b1       [[buffer(2)]],
+    device const float* w2       [[buffer(3)]],
+    device const float* b2       [[buffer(4)]],
+    device float* out            [[buffer(5)]],
+    constant uint& N             [[buffer(6)]],
+    constant uint& C             [[buffer(7)]],
+    constant uint& C4            [[buffer(8)]],
+    constant uint& eps_bits      [[buffer(9)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint3 thread_pos             [[thread_position_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]],
+    uint simd_id                 [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_count         [[threads_per_simdgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kBM = 16u;
+    constexpr uint kHiddenSuperTile = 256u;
+    constexpr uint kW1BK = 48u;
+    constexpr uint kW1BN = 128u;
+    constexpr uint kW1GroupCount = 2u;
+    constexpr uint kW1KFragmentCount = kW1BK / kFrag;
+    constexpr uint kW1AStride = kW1BK + 1u;
+    constexpr uint kW1AFloat4PerRow = kW1BK / 4u;
+    constexpr uint kW1ColumnTiles = kW1BN / kFrag;
+    constexpr uint kW1WeightFloat4PerRow = kW1BN / 4u;
+    constexpr uint kW1WeightFloat4Count = kW1BK * kW1WeightFloat4PerRow;
+    constexpr uint kW2BK = 64u;
+    constexpr uint kW2BN = 64u;
+    constexpr uint kW2OutputGroups = 2u;
+    constexpr uint kW2OutputSuperTile = kW2BN * kW2OutputGroups;
+    constexpr uint kW2KFragmentCount = kW2BK / kFrag;
+    constexpr uint kW2ColumnTiles = kW2BN / kFrag;
+    constexpr uint kW2WeightFloat4PerRow = kW2BN / 4u;
+    constexpr uint kW2WeightFloat4Count = kW2BK * kW2WeightFloat4PerRow;
+    constexpr uint kHColumnTiles = kHiddenSuperTile / kFrag;
+    constexpr uint kTileElements = kFrag * kFrag;
+    constexpr uint kArenaElements = 8192u;
+    constexpr uint kW1WeightOffset = 1024u;
+    constexpr uint kW2WeightOffset = 4096u;
+
+    threadgroup float arena[kArenaElements];
+    threadgroup float* A_tg = arena;
+    threadgroup float* W1_tg = arena + kW1WeightOffset;
+    threadgroup float* H_tg = arena;
+    threadgroup float* W2_tg = arena + kW2WeightOffset;
+
+    const uint tid = thread_pos.x;
+    if (tid >= kThreads || simd_lane_count != kSimdWidth ||
+        tg_pos.x != 0u || tg_pos.z != 0u || N == 0u || C == 0u) {
+        return;
+    }
+
+    const uint row_base = tg_pos.y * kBM;
+    if (row_base >= N) {
+        return;
+    }
+
+    const float eps = as_type<float>(eps_bits);
+    const uint stats_local_row0 = simd_id * 2u;
+    const uint stats_local_row1 = stats_local_row0 + 1u;
+    const uint stats_global_row0 = row_base + stats_local_row0;
+    const uint stats_global_row1 = stats_global_row0 + 1u;
+    const bool stats_row0_valid = stats_global_row0 < N;
+    const bool stats_row1_valid = stats_global_row1 < N;
+
+    float local_square_sum0 = 0.0f;
+    float local_square_sum1 = 0.0f;
+
+    if (stats_row0_valid) {
+        const uint x_offset = stats_global_row0 * C;
+
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float value = x[x_offset + c];
+            local_square_sum0 = fma(
+                value,
+                value,
+                local_square_sum0
+            );
+        }
+    }
+
+    if (stats_row1_valid) {
+        const uint x_offset = stats_global_row1 * C;
+
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float value = x[x_offset + c];
+            local_square_sum1 = fma(
+                value,
+                value,
+                local_square_sum1
+            );
+        }
+    }
+
+    const float inv_rms0 = stats_row0_valid
+        ? rsqrt(
+            simd_sum(local_square_sum0) / float(C) + eps
+        )
+        : 0.0f;
+
+    const float inv_rms1 = stats_row1_valid
+        ? rsqrt(
+            simd_sum(local_square_sum1) / float(C) + eps
+        )
+        : 0.0f;
+
+    const uint matrix_row_group = simd_id >> 2u;
+    const uint matrix_col_group = simd_id & 3u;
+    const uint simd_row_base = matrix_row_group * kFrag;
+    const uint w1_simd_col_base = matrix_col_group * 32u;
+    const uint w2_simd_col_base = matrix_col_group * 16u;
+    const ushort2 matrix_offset = morton_order(ushort(lane));
+    for (uint hidden_base = 0u; hidden_base < C4; hidden_base += kHiddenSuperTile) {
+        const uint tile_hidden = min(kHiddenSuperTile, C4 - hidden_base);
+        float2 w1_acc00 = float2(0.0f);
+        float2 w1_acc01 = float2(0.0f);
+        float2 w1_acc02 = float2(0.0f);
+        float2 w1_acc03 = float2(0.0f);
+        float2 w1_acc10 = float2(0.0f);
+        float2 w1_acc11 = float2(0.0f);
+        float2 w1_acc12 = float2(0.0f);
+        float2 w1_acc13 = float2(0.0f);
+
+        for (uint input_base = 0u; input_base < C; input_base += kW1BK) {
+            #pragma unroll
+            for (uint local_c4 = lane; local_c4 < kW1AFloat4PerRow; local_c4 += kSimdWidth) {
+                const uint local_c = local_c4 * 4u;
+                const uint global_c = input_base + local_c;
+
+                float4 normalized0 = float4(0.0f);
+                float4 normalized1 = float4(0.0f);
+
+                if (stats_row0_valid && global_c + 3u < C) {
+                    const float4 x_value = float4(
+                        *reinterpret_cast<device const packed_float4*>(
+                            x + stats_global_row0 * C + global_c
+                        )
+                    );
+
+                    normalized0 = x_value * float4(inv_rms0);
+                } else if (stats_row0_valid && global_c < C) {
+                    #pragma unroll
+                    for (uint component = 0u; component < 4u; ++component) {
+                        const uint c = global_c + component;
+
+                        if (c < C) {
+                            normalized0[component] =
+                                x[stats_global_row0 * C + c] * inv_rms0;
+                        }
+                    }
+                }
+
+                if (stats_row1_valid && global_c + 3u < C) {
+                    const float4 x_value = float4(
+                        *reinterpret_cast<device const packed_float4*>(
+                            x + stats_global_row1 * C + global_c
+                        )
+                    );
+
+                    normalized1 = x_value * float4(inv_rms1);
+                } else if (stats_row1_valid && global_c < C) {
+                    #pragma unroll
+                    for (uint component = 0u; component < 4u; ++component) {
+                        const uint c = global_c + component;
+
+                        if (c < C) {
+                            normalized1[component] =
+                                x[stats_global_row1 * C + c] * inv_rms1;
+                        }
+                    }
+                }
+
+                *reinterpret_cast<threadgroup packed_float4*>(
+                    A_tg +
+                    stats_local_row0 * kW1AStride +
+                    local_c
+                ) = packed_float4(normalized0);
+
+                *reinterpret_cast<threadgroup packed_float4*>(
+                    A_tg +
+                    stats_local_row1 * kW1AStride +
+                    local_c
+                ) = packed_float4(normalized1);
+            }
+
+            float2 a_fragment_cache[kW1KFragmentCount];
+            #pragma unroll
+            for (uint hidden_group = 0u; hidden_group < kW1GroupCount; ++hidden_group) {
+                const uint hidden_group_base = hidden_base + hidden_group * kW1BN;
+                for (uint index = tid; index < kW1WeightFloat4Count; index += kThreads) {
+                    const uint local_k = index / kW1WeightFloat4PerRow;
+                    const uint local_hidden4 =
+                        index -
+                        local_k *
+                        kW1WeightFloat4PerRow;
+
+                    const uint local_hidden =
+                        local_hidden4 * 4u;
+
+                    const uint global_c =
+                        input_base + local_k;
+
+                    const uint global_hidden =
+                        hidden_group_base +
+                        local_hidden;
+
+                    float4 weight =
+                        float4(0.0f);
+
+                    if (global_c < C &&
+                        global_hidden + 3u < C4) {
+
+                        weight =
+                            float4(
+                                *reinterpret_cast<
+                                    device const packed_float4*
+                                >(
+                                    w1 +
+                                    global_c * C4 +
+                                    global_hidden
+                                )
+                            );
+                    } else if (
+                        global_c < C &&
+                        global_hidden < C4
+                    ) {
+                        #pragma unroll
+                        for (uint component = 0u;
+                             component < 4u;
+                             ++component) {
+
+                            const uint h =
+                                global_hidden +
+                                component;
+
+                            if (h < C4) {
+                                weight[component] =
+                                    w1[
+                                        global_c *
+                                        C4 + h
+                                    ];
+                            }
+                        }
+                    }
+
+                    const uint tile_row =
+                        local_k / kFrag;
+
+                    const uint tile_col =
+                        local_hidden / kFrag;
+
+                    const uint in_tile_row =
+                        local_k &
+                        (kFrag - 1u);
+
+                    const uint in_tile_col =
+                        local_hidden &
+                        (kFrag - 1u);
+
+                    const uint tile_index =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col
+                        ) * kTileElements;
+
+                    const uint physical_index =
+                        tile_index +
+                        in_tile_row * kFrag +
+                        in_tile_col;
+
+                    *reinterpret_cast<
+                        threadgroup packed_float4*
+                    >(
+                        W1_tg +
+                        physical_index
+                    ) = packed_float4(weight);
+                }
+
+                threadgroup_barrier(
+                    mem_flags::mem_threadgroup
+                );
+
+                if (hidden_group == 0u) {
+                    #pragma unroll
+                    for (uint k_index = 0u;
+                         k_index < kW1KFragmentCount;
+                         ++k_index) {
+
+                        const uint k_sub =
+                            k_index * kFrag;
+
+                        a_fragment_cache[k_index] =
+                            lowreg_matrix::load_tg_8x8(
+                                A_tg,
+                                kW1AStride,
+                                ushort2(
+                                    ushort(simd_row_base),
+                                    ushort(k_sub)
+                                ),
+                                ushort(lane)
+                            );
+                    }
+                }
+
+                float2 accumulator0 =
+                    hidden_group == 0u
+                        ? w1_acc00
+                        : w1_acc10;
+
+                float2 accumulator1 =
+                    hidden_group == 0u
+                        ? w1_acc01
+                        : w1_acc11;
+
+                float2 accumulator2 =
+                    hidden_group == 0u
+                        ? w1_acc02
+                        : w1_acc12;
+
+                float2 accumulator3 =
+                    hidden_group == 0u
+                        ? w1_acc03
+                        : w1_acc13;
+
+                #pragma unroll
+                for (uint k_index = 0u;
+                     k_index < kW1KFragmentCount;
+                     ++k_index) {
+
+                    const uint tile_row =
+                        k_index;
+
+                    const uint tile_col0 =
+                        w1_simd_col_base /
+                        kFrag;
+
+                    const uint tile_col1 =
+                        tile_col0 + 1u;
+
+                    const uint tile_col2 =
+                        tile_col0 + 2u;
+
+                    const uint tile_col3 =
+                        tile_col0 + 3u;
+
+                    const uint tile_index0 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col0
+                        ) * kTileElements;
+
+                    const uint tile_index1 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col1
+                        ) * kTileElements;
+
+                    const uint tile_index2 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col2
+                        ) * kTileElements;
+
+                    const uint tile_index3 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col3
+                        ) * kTileElements;
+
+                    const float2 w_fragment0 =
+                        lowreg_matrix::load_tg_8x8(
+                            W1_tg + tile_index0,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment1 =
+                        lowreg_matrix::load_tg_8x8(
+                            W1_tg + tile_index1,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment2 =
+                        lowreg_matrix::load_tg_8x8(
+                            W1_tg + tile_index2,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment3 =
+                        lowreg_matrix::load_tg_8x8(
+                            W1_tg + tile_index3,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 a_fragment =
+                        a_fragment_cache[k_index];
+
+                    accumulator0 =
+                        lowreg_matrix::mma_8x8(
+                            a_fragment,
+                            w_fragment0,
+                            accumulator0
+                        );
+
+                    accumulator1 =
+                        lowreg_matrix::mma_8x8(
+                            a_fragment,
+                            w_fragment1,
+                            accumulator1
+                        );
+
+                    accumulator2 =
+                        lowreg_matrix::mma_8x8(
+                            a_fragment,
+                            w_fragment2,
+                            accumulator2
+                        );
+
+                    accumulator3 =
+                        lowreg_matrix::mma_8x8(
+                            a_fragment,
+                            w_fragment3,
+                            accumulator3
+                        );
+                }
+
+                if (hidden_group == 0u) {
+                    w1_acc00 = accumulator0;
+                    w1_acc01 = accumulator1;
+                    w1_acc02 = accumulator2;
+                    w1_acc03 = accumulator3;
+                } else {
+                    w1_acc10 = accumulator0;
+                    w1_acc11 = accumulator1;
+                    w1_acc12 = accumulator2;
+                    w1_acc13 = accumulator3;
+                }
+
+                threadgroup_barrier(
+                    mem_flags::mem_threadgroup
+                );
+            }
+        }
+
+        #pragma unroll
+        for (uint hidden_group = 0u;
+             hidden_group < kW1GroupCount;
+             ++hidden_group) {
+
+            #pragma unroll
+            for (uint fragment_index = 0u;
+                 fragment_index < 4u;
+                 ++fragment_index) {
+
+                float2 accumulator =
+                    float2(0.0f);
+
+                if (hidden_group == 0u) {
+                    if (fragment_index == 0u) {
+                        accumulator = w1_acc00;
+                    } else if (fragment_index == 1u) {
+                        accumulator = w1_acc01;
+                    } else if (fragment_index == 2u) {
+                        accumulator = w1_acc02;
+                    } else {
+                        accumulator = w1_acc03;
+                    }
+                } else {
+                    if (fragment_index == 0u) {
+                        accumulator = w1_acc10;
+                    } else if (fragment_index == 1u) {
+                        accumulator = w1_acc11;
+                    } else if (fragment_index == 2u) {
+                        accumulator = w1_acc12;
+                    } else {
+                        accumulator = w1_acc13;
+                    }
+                }
+
+                const uint logical_hidden =
+                    hidden_group * kW1BN +
+                    w1_simd_col_base +
+                    fragment_index * kFrag;
+
+                const uint global_hidden =
+                    hidden_base +
+                    logical_hidden +
+                    uint(matrix_offset.x);
+
+                float2 biased_accumulator = accumulator;
+
+                if (global_hidden < C4) {
+                    biased_accumulator[0] += b1[global_hidden];
+                }
+
+                if (global_hidden + 1u < C4) {
+                    biased_accumulator[1] += b1[global_hidden + 1u];
+                }
+
+                const float2 hidden_value =
+                    float2(
+                        fused_mlp_gelu_scalar(
+                            biased_accumulator[0]
+                        ),
+                        fused_mlp_gelu_scalar(
+                            biased_accumulator[1]
+                        )
+                    );
+
+                const uint h_tile_row =
+                    simd_row_base / kFrag;
+
+                const uint h_tile_col =
+                    logical_hidden / kFrag;
+
+                const uint h_tile_index =
+                    (
+                        h_tile_row *
+                        kHColumnTiles +
+                        h_tile_col
+                    ) * kTileElements;
+
+                lowreg_matrix::store_tg_8x8(
+                    H_tg + h_tile_index,
+                    kFrag,
+                    ushort2(0u, 0u),
+                    ushort(lane),
+                    hidden_value
+                );
+            }
+        }
+
+        threadgroup_barrier(
+            mem_flags::mem_threadgroup
+        );
+
+        for (uint output_super_base = 0u;
+             output_super_base < C;
+             output_super_base +=
+                kW2OutputSuperTile) {
+
+            float2 w2_acc00 =
+                float2(0.0f);
+
+            float2 w2_acc01 =
+                float2(0.0f);
+
+            float2 w2_acc10 =
+                float2(0.0f);
+
+            float2 w2_acc11 =
+                float2(0.0f);
+
+            for (uint hidden_k_base = 0u;
+                 hidden_k_base < tile_hidden;
+                 hidden_k_base += kW2BK) {
+
+                float2 h_fragment_cache[
+                    kW2KFragmentCount
+                ];
+
+                #pragma unroll
+                for (uint k_index = 0u;
+                     k_index < kW2KFragmentCount;
+                     ++k_index) {
+
+                    const uint logical_hidden =
+                        hidden_k_base +
+                        k_index * kFrag;
+
+                    const uint h_tile_row =
+                        simd_row_base / kFrag;
+
+                    const uint h_tile_col =
+                        logical_hidden / kFrag;
+
+                    const uint h_tile_index =
+                        (
+                            h_tile_row *
+                            kHColumnTiles +
+                            h_tile_col
+                        ) * kTileElements;
+
+                    h_fragment_cache[k_index] =
+                        lowreg_matrix::load_tg_8x8(
+                            H_tg + h_tile_index,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+                }
+
+                #pragma unroll
+                for (uint output_group = 0u;
+                     output_group < kW2OutputGroups;
+                     ++output_group) {
+
+                    const uint output_base =
+                        output_super_base +
+                        output_group * kW2BN;
+
+                    for (uint index = tid;
+                         index < kW2WeightFloat4Count;
+                         index += kThreads) {
+
+                        const uint local_k =
+                            index /
+                            kW2WeightFloat4PerRow;
+
+                        const uint local_output4 =
+                            index -
+                            local_k *
+                            kW2WeightFloat4PerRow;
+
+                        const uint local_output =
+                            local_output4 * 4u;
+
+                        const uint global_hidden =
+                            hidden_base +
+                            hidden_k_base +
+                            local_k;
+
+                        const uint global_output =
+                            output_base +
+                            local_output;
+
+                        float4 weight =
+                            float4(0.0f);
+
+                        if (global_hidden < C4 &&
+                            global_output + 3u < C) {
+
+                            weight =
+                                float4(
+                                    *reinterpret_cast<
+                                        device const packed_float4*
+                                    >(
+                                        w2 +
+                                        global_hidden * C +
+                                        global_output
+                                    )
+                                );
+                        } else if (
+                            global_hidden < C4 &&
+                            global_output < C
+                        ) {
+                            #pragma unroll
+                            for (uint component = 0u;
+                                 component < 4u;
+                                 ++component) {
+
+                                const uint output_c =
+                                    global_output +
+                                    component;
+
+                                if (output_c < C) {
+                                    weight[component] =
+                                        w2[
+                                            global_hidden *
+                                            C +
+                                            output_c
+                                        ];
+                                }
+                            }
+                        }
+
+                        const uint tile_row =
+                            local_k / kFrag;
+
+                        const uint tile_col =
+                            local_output / kFrag;
+
+                        const uint in_tile_row =
+                            local_k &
+                            (kFrag - 1u);
+
+                        const uint in_tile_col =
+                            local_output &
+                            (kFrag - 1u);
+
+                        const uint tile_index =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col
+                            ) * kTileElements;
+
+                        const uint physical_index =
+                            tile_index +
+                            in_tile_row * kFrag +
+                            in_tile_col;
+
+                        *reinterpret_cast<
+                            threadgroup packed_float4*
+                        >(
+                            W2_tg +
+                            physical_index
+                        ) = packed_float4(weight);
+                    }
+
+                    threadgroup_barrier(
+                        mem_flags::mem_threadgroup
+                    );
+
+                    float2 accumulator0 =
+                        output_group == 0u
+                            ? w2_acc00
+                            : w2_acc10;
+
+                    float2 accumulator1 =
+                        output_group == 0u
+                            ? w2_acc01
+                            : w2_acc11;
+
+                    #pragma unroll
+                    for (uint k_index = 0u;
+                         k_index < kW2KFragmentCount;
+                         ++k_index) {
+
+                        const uint tile_row =
+                            k_index;
+
+                        const uint tile_col0 =
+                            w2_simd_col_base /
+                            kFrag;
+
+                        const uint tile_col1 =
+                            tile_col0 + 1u;
+
+                        const uint tile_index0 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col0
+                            ) * kTileElements;
+
+                        const uint tile_index1 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col1
+                            ) * kTileElements;
+
+                        const float2 w_fragment0 =
+                            lowreg_matrix::load_tg_8x8(
+                                W2_tg + tile_index0,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 w_fragment1 =
+                            lowreg_matrix::load_tg_8x8(
+                                W2_tg + tile_index1,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 h_fragment =
+                            h_fragment_cache[k_index];
+
+                        accumulator0 =
+                            lowreg_matrix::mma_8x8(
+                                h_fragment,
+                                w_fragment0,
+                                accumulator0
+                            );
+
+                        accumulator1 =
+                            lowreg_matrix::mma_8x8(
+                                h_fragment,
+                                w_fragment1,
+                                accumulator1
+                            );
+                    }
+
+                    if (output_group == 0u) {
+                        w2_acc00 = accumulator0;
+                        w2_acc01 = accumulator1;
+                    } else {
+                        w2_acc10 = accumulator0;
+                        w2_acc11 = accumulator1;
+                    }
+
+                    threadgroup_barrier(
+                        mem_flags::mem_threadgroup
+                    );
+                }
+            }
+
+            const uint local_row =
+                simd_row_base +
+                uint(matrix_offset.y);
+
+            const uint global_row =
+                row_base + local_row;
+
+            if (global_row < N) {
+                #pragma unroll
+                for (uint output_group = 0u;
+                     output_group < kW2OutputGroups;
+                     ++output_group) {
+
+                    const uint output_base =
+                        output_super_base +
+                        output_group * kW2BN;
+
+                    #pragma unroll
+                    for (uint fragment_index = 0u;
+                         fragment_index < 2u;
+                         ++fragment_index) {
+
+                        float2 accumulator =
+                            float2(0.0f);
+
+                        if (output_group == 0u) {
+                            accumulator =
+                                fragment_index == 0u
+                                    ? w2_acc00
+                                    : w2_acc01;
+                        } else {
+                            accumulator =
+                                fragment_index == 0u
+                                    ? w2_acc10
+                                    : w2_acc11;
+                        }
+
+                        const uint fragment_col =
+                            w2_simd_col_base +
+                            fragment_index * kFrag +
+                            uint(matrix_offset.x);
+
+                        #pragma unroll
+                        for (uint component = 0u;
+                             component < 2u;
+                             ++component) {
+
+                            const uint global_output =
+                                output_base +
+                                fragment_col +
+                                component;
+
+                            if (global_output >= C) {
+                                continue;
+                            }
+
+                            const uint output_index =
+                                global_row * C +
+                                global_output;
+
+                            float result = accumulator[component];
+                            if (hidden_base != 0u) {
+                                result += out[output_index];
+                            }
+                            if (hidden_base + tile_hidden >= C4) {
+                                result += b2[global_output];
+                            }
+                            out[output_index] = result;
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void fused_rmsnorm_mlp_forward_kernel_bm32(
+    device const float* x        [[buffer(0)]],
+    device const float* w1       [[buffer(1)]],
+    device const float* b1       [[buffer(2)]],
+    device const float* w2       [[buffer(3)]],
+    device const float* b2       [[buffer(4)]],
+    device float* out            [[buffer(5)]],
+    constant uint& N             [[buffer(6)]],
+    constant uint& C             [[buffer(7)]],
+    constant uint& C4            [[buffer(8)]],
+    constant uint& eps_bits      [[buffer(9)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint3 thread_pos             [[thread_position_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]],
+    uint simd_id                 [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_count         [[threads_per_simdgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kBM = 32u;
+    constexpr uint kHiddenSuperTile = 128u;
+
+    constexpr uint kW1BK = 48u;
+    constexpr uint kW1BN = 128u;
+    constexpr uint kW1GroupCount = 1u;
+    constexpr uint kW1KFragmentCount =
+        kW1BK / kFrag;
+
+    constexpr uint kW1AStride =
+        kW1BK + 1u;
+
+    constexpr uint kW1AFloat4PerRow =
+        kW1BK / 4u;
+
+    constexpr uint kW1ColumnTiles =
+        kW1BN / kFrag;
+
+    constexpr uint kW1WeightFloat4PerRow =
+        kW1BN / 4u;
+
+    constexpr uint kW1WeightFloat4Count =
+        kW1BK *
+        kW1WeightFloat4PerRow;
+
+    constexpr uint kW2BK = 64u;
+    constexpr uint kW2BN = 64u;
+    constexpr uint kW2OutputGroups = 1u;
+
+    constexpr uint kW2OutputSuperTile =
+        kW2BN *
+        kW2OutputGroups;
+
+    constexpr uint kW2KFragmentCount =
+        kW2BK / kFrag;
+
+    constexpr uint kW2ColumnTiles =
+        kW2BN / kFrag;
+
+    constexpr uint kW2WeightFloat4PerRow =
+        kW2BN / 4u;
+
+    constexpr uint kW2WeightFloat4Count =
+        kW2BK *
+        kW2WeightFloat4PerRow;
+
+    constexpr uint kHColumnTiles =
+        kHiddenSuperTile /
+        kFrag;
+
+    constexpr uint kTileElements =
+        kFrag * kFrag;
+
+    constexpr uint kArenaElements =
+        8192u;
+
+    constexpr uint kW1WeightOffset =
+        2048u;
+
+    constexpr uint kW2WeightOffset =
+        4096u;
+
+    threadgroup float arena[
+        kArenaElements
+    ];
+
+    threadgroup float* A_tg =
+        arena;
+
+    threadgroup float* W1_tg =
+        arena +
+        kW1WeightOffset;
+
+    threadgroup float* H_tg =
+        arena;
+
+    threadgroup float* W2_tg =
+        arena +
+        kW2WeightOffset;
+
+    const uint tid =
+        thread_pos.x;
+
+    if (tid >= kThreads ||
+        simd_lane_count != kSimdWidth ||
+        tg_pos.x != 0u ||
+        tg_pos.z != 0u ||
+        N == 0u ||
+        C == 0u) {
+        return;
+    }
+
+    const uint row_base =
+        tg_pos.y * kBM;
+
+    if (row_base >= N) {
+        return;
+    }
+
+    const float eps =
+        as_type<float>(
+            eps_bits
+        );
+
+    uint stats_local_rows[4] = {
+        simd_id * 2u,
+        simd_id * 2u + 1u,
+        simd_id * 2u + 16u,
+        simd_id * 2u + 17u
+    };
+
+    uint stats_global_rows[4];
+    bool stats_rows_valid[4];
+    float inv_rms[4];
+
+    #pragma unroll
+    for (uint stats_index = 0u; stats_index < 4u; ++stats_index) {
+        const uint global_row =
+            row_base + stats_local_rows[stats_index];
+
+        stats_global_rows[stats_index] = global_row;
+
+        const bool valid = global_row < N;
+        stats_rows_valid[stats_index] = valid;
+
+        float local_square_sum = 0.0f;
+
+        if (valid) {
+            const uint x_offset = global_row * C;
+
+            for (uint c = lane; c < C; c += kSimdWidth) {
+                const float value = x[x_offset + c];
+                local_square_sum = fma(
+                    value,
+                    value,
+                    local_square_sum
+                );
+            }
+        }
+
+        inv_rms[stats_index] = valid
+            ? rsqrt(
+                simd_sum(local_square_sum) / float(C) + eps
+            )
+            : 0.0f;
+    }
+
+    const uint matrix_row_group = simd_id >> 1u;
+    const uint matrix_col_group = simd_id & 1u;
+    const uint simd_row_base = matrix_row_group * kFrag;
+    const uint w1_simd_col_base = matrix_col_group * 64u;
+    const uint w2_simd_col_base = matrix_col_group * 32u;
+    const ushort2 matrix_offset = morton_order(ushort(lane));
+    for (uint hidden_base = 0u; hidden_base < C4; hidden_base += kHiddenSuperTile) {
+        const uint tile_hidden = min(kHiddenSuperTile, C4 - hidden_base);
+
+        float2 w1_acc00 = float2(0.0f);
+        float2 w1_acc01 = float2(0.0f);
+        float2 w1_acc02 = float2(0.0f);
+        float2 w1_acc03 = float2(0.0f);
+        float2 w1_acc10 = float2(0.0f);
+        float2 w1_acc11 = float2(0.0f);
+        float2 w1_acc12 = float2(0.0f);
+        float2 w1_acc13 = float2(0.0f);
+
+        for (uint input_base = 0u; input_base < C; input_base += kW1BK) {
+            #pragma unroll
+            for (uint local_c4 = lane; local_c4 < kW1AFloat4PerRow; local_c4 += kSimdWidth) {
+                const uint local_c = local_c4 * 4u;
+                const uint global_c = input_base + local_c;
+                #pragma unroll
+                for (uint stats_index = 0u; stats_index < 4u; ++stats_index) {
+                    float4 normalized = float4(0.0f);
+
+                    if (
+                        stats_rows_valid[stats_index] &&
+                        global_c + 3u < C
+                    ) {
+                        const float4 x_value = float4(
+                            *reinterpret_cast<device const packed_float4*>(
+                                x +
+                                stats_global_rows[stats_index] * C +
+                                global_c
+                            )
+                        );
+
+                        normalized =
+                            x_value * float4(inv_rms[stats_index]);
+                    } else if (
+                        stats_rows_valid[stats_index] &&
+                        global_c < C
+                    ) {
+                        #pragma unroll
+                        for (uint component = 0u; component < 4u; ++component) {
+                            const uint c = global_c + component;
+
+                            if (c < C) {
+                                normalized[component] =
+                                    x[
+                                        stats_global_rows[stats_index] * C + c
+                                    ] * inv_rms[stats_index];
+                            }
+                        }
+                    }
+
+                    *reinterpret_cast<threadgroup packed_float4*>(
+                        A_tg +
+                        stats_local_rows[stats_index] *
+                            kW1AStride +
+                        local_c
+                    ) = packed_float4(normalized);
+                }
+            }
+
+            float2 a_fragment_cache[
+                kW1KFragmentCount
+            ];
+
+            #pragma unroll
+            for (uint hidden_group = 0u;
+                 hidden_group <
+                    kW1GroupCount;
+                 ++hidden_group) {
+
+                const uint hidden_group_base =
+                    hidden_base +
+                    hidden_group *
+                    kW1BN;
+
+                for (uint index = tid;
+                     index <
+                        kW1WeightFloat4Count;
+                     index +=
+                        kThreads) {
+
+                    const uint local_k =
+                        index /
+                        kW1WeightFloat4PerRow;
+
+                    const uint local_hidden4 =
+                        index -
+                        local_k *
+                        kW1WeightFloat4PerRow;
+
+                    const uint local_hidden =
+                        local_hidden4 *
+                        4u;
+
+                    const uint global_c =
+                        input_base +
+                        local_k;
+
+                    const uint global_hidden =
+                        hidden_group_base +
+                        local_hidden;
+
+                    float4 weight =
+                        float4(0.0f);
+
+                    if (
+                        global_c < C &&
+                        global_hidden + 3u <
+                            C4
+                    ) {
+                        weight =
+                            float4(
+                                *reinterpret_cast<
+                                    device const
+                                    packed_float4*
+                                >(
+                                    w1 +
+                                    global_c *
+                                    C4 +
+                                    global_hidden
+                                )
+                            );
+                    } else if (
+                        global_c < C &&
+                        global_hidden < C4
+                    ) {
+                        #pragma unroll
+                        for (
+                            uint component = 0u;
+                            component < 4u;
+                            ++component
+                        ) {
+                            const uint h =
+                                global_hidden +
+                                component;
+
+                            if (h < C4) {
+                                weight[
+                                    component
+                                ] =
+                                    w1[
+                                        global_c *
+                                        C4 +
+                                        h
+                                    ];
+                            }
+                        }
+                    }
+
+                    const uint tile_row =
+                        local_k /
+                        kFrag;
+
+                    const uint tile_col =
+                        local_hidden /
+                        kFrag;
+
+                    const uint in_tile_row =
+                        local_k &
+                        (kFrag - 1u);
+
+                    const uint in_tile_col =
+                        local_hidden &
+                        (kFrag - 1u);
+
+                    const uint tile_index =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col
+                        ) *
+                        kTileElements;
+
+                    const uint physical_index =
+                        tile_index +
+                        in_tile_row *
+                        kFrag +
+                        in_tile_col;
+
+                    *reinterpret_cast<
+                        threadgroup
+                        packed_float4*
+                    >(
+                        W1_tg +
+                        physical_index
+                    ) =
+                        packed_float4(
+                            weight
+                        );
+                }
+
+                threadgroup_barrier(
+                    mem_flags::
+                    mem_threadgroup
+                );
+
+                if (hidden_group == 0u) {
+                    #pragma unroll
+                    for (
+                        uint k_index = 0u;
+                        k_index <
+                            kW1KFragmentCount;
+                        ++k_index
+                    ) {
+                        const uint k_sub =
+                            k_index *
+                            kFrag;
+
+                        a_fragment_cache[
+                            k_index
+                        ] =
+                            lowreg_matrix::
+                            load_tg_8x8(
+                                A_tg,
+                                kW1AStride,
+                                ushort2(
+                                    ushort(
+                                        simd_row_base
+                                    ),
+                                    ushort(k_sub)
+                                ),
+                                ushort(lane)
+                            );
+                    }
+                }
+
+                float2 accumulator0 =
+                    w1_acc00;
+
+                float2 accumulator1 =
+                    w1_acc01;
+
+                float2 accumulator2 =
+                    w1_acc02;
+
+                float2 accumulator3 =
+                    w1_acc03;
+
+                float2 accumulator4 =
+                    w1_acc10;
+
+                float2 accumulator5 =
+                    w1_acc11;
+
+                float2 accumulator6 =
+                    w1_acc12;
+
+                float2 accumulator7 =
+                    w1_acc13;
+
+                #pragma unroll
+                for (uint k_index = 0u;
+                     k_index <
+                        kW1KFragmentCount;
+                     ++k_index) {
+
+                    const uint tile_row =
+                        k_index;
+
+                    const uint tile_col0 =
+                        w1_simd_col_base /
+                        kFrag;
+
+                    const uint tile_col1 =
+                        tile_col0 + 1u;
+
+                    const uint tile_col2 =
+                        tile_col0 + 2u;
+
+                    const uint tile_col3 =
+                        tile_col0 + 3u;
+
+                    const uint tile_col4 =
+                        tile_col0 + 4u;
+
+                    const uint tile_col5 =
+                        tile_col0 + 5u;
+
+                    const uint tile_col6 =
+                        tile_col0 + 6u;
+
+                    const uint tile_col7 =
+                        tile_col0 + 7u;
+
+                    const uint tile_index0 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col0
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index1 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col1
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index2 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col2
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index3 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col3
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index4 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col4
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index5 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col5
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index6 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col6
+                        ) *
+                        kTileElements;
+
+                    const uint tile_index7 =
+                        (
+                            tile_row *
+                            kW1ColumnTiles +
+                            tile_col7
+                        ) *
+                        kTileElements;
+
+                    const float2 w_fragment0 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index0,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment1 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index1,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment2 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index2,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment3 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index3,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment4 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index4,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment5 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index5,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment6 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index6,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 w_fragment7 =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            W1_tg +
+                            tile_index7,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+
+                    const float2 a_fragment =
+                        a_fragment_cache[
+                            k_index
+                        ];
+
+                    accumulator0 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment0,
+                            accumulator0
+                        );
+
+                    accumulator1 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment1,
+                            accumulator1
+                        );
+
+                    accumulator2 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment2,
+                            accumulator2
+                        );
+
+                    accumulator3 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment3,
+                            accumulator3
+                        );
+
+                    accumulator4 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment4,
+                            accumulator4
+                        );
+
+                    accumulator5 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment5,
+                            accumulator5
+                        );
+
+                    accumulator6 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment6,
+                            accumulator6
+                        );
+
+                    accumulator7 =
+                        lowreg_matrix::
+                        mma_8x8(
+                            a_fragment,
+                            w_fragment7,
+                            accumulator7
+                        );
+                }
+
+                w1_acc00 =
+                    accumulator0;
+
+                w1_acc01 =
+                    accumulator1;
+
+                w1_acc02 =
+                    accumulator2;
+
+                w1_acc03 =
+                    accumulator3;
+
+                w1_acc10 =
+                    accumulator4;
+
+                w1_acc11 =
+                    accumulator5;
+
+                w1_acc12 =
+                    accumulator6;
+
+                w1_acc13 =
+                    accumulator7;
+
+                threadgroup_barrier(
+                    mem_flags::
+                    mem_threadgroup
+                );
+            }
+        }
+
+        #pragma unroll
+        for (uint hidden_group = 0u;
+             hidden_group <
+                kW1GroupCount;
+             ++hidden_group) {
+
+            #pragma unroll
+            for (uint fragment_index = 0u;
+                 fragment_index < 8u;
+                 ++fragment_index) {
+
+                float2 accumulator =
+                    float2(0.0f);
+
+                if (fragment_index == 0u) {
+                    accumulator =
+                        w1_acc00;
+                } else if (
+                    fragment_index == 1u
+                ) {
+                    accumulator =
+                        w1_acc01;
+                } else if (
+                    fragment_index == 2u
+                ) {
+                    accumulator =
+                        w1_acc02;
+                } else if (
+                    fragment_index == 3u
+                ) {
+                    accumulator =
+                        w1_acc03;
+                } else if (
+                    fragment_index == 4u
+                ) {
+                    accumulator =
+                        w1_acc10;
+                } else if (
+                    fragment_index == 5u
+                ) {
+                    accumulator =
+                        w1_acc11;
+                } else if (
+                    fragment_index == 6u
+                ) {
+                    accumulator =
+                        w1_acc12;
+                } else {
+                    accumulator =
+                        w1_acc13;
+                }
+
+
+                const uint logical_hidden =
+                    hidden_group *
+                    kW1BN +
+                    w1_simd_col_base +
+                    fragment_index *
+                    kFrag;
+
+                const uint global_hidden =
+                    hidden_base +
+                    logical_hidden +
+                    uint(matrix_offset.x);
+
+                float2 biased_accumulator = accumulator;
+
+                if (global_hidden < C4) {
+                    biased_accumulator[0] += b1[global_hidden];
+                }
+
+                if (global_hidden + 1u < C4) {
+                    biased_accumulator[1] += b1[global_hidden + 1u];
+                }
+
+                const float2 hidden_value = float2(
+                    fused_mlp_gelu_scalar(biased_accumulator[0]),
+                    fused_mlp_gelu_scalar(biased_accumulator[1])
+                );
+
+                const uint h_tile_row =
+                    simd_row_base /
+                    kFrag;
+
+                const uint h_tile_col =
+                    logical_hidden /
+                    kFrag;
+
+                const uint h_tile_index =
+                    (
+                        h_tile_row *
+                        kHColumnTiles +
+                        h_tile_col
+                    ) *
+                    kTileElements;
+
+                lowreg_matrix::
+                store_tg_8x8(
+                    H_tg +
+                    h_tile_index,
+                    kFrag,
+                    ushort2(0u, 0u),
+                    ushort(lane),
+                    hidden_value
+                );
+            }
+        }
+
+        threadgroup_barrier(
+            mem_flags::
+            mem_threadgroup
+        );
+
+        for (
+            uint output_super_base = 0u;
+            output_super_base < C;
+            output_super_base +=
+                kW2OutputSuperTile
+        ) {
+            float2 w2_acc00 =
+                float2(0.0f);
+
+            float2 w2_acc01 =
+                float2(0.0f);
+
+            float2 w2_acc10 =
+                float2(0.0f);
+
+            float2 w2_acc11 =
+                float2(0.0f);
+
+            for (
+                uint hidden_k_base = 0u;
+                hidden_k_base <
+                    tile_hidden;
+                hidden_k_base +=
+                    kW2BK
+            ) {
+                float2 h_fragment_cache[
+                    kW2KFragmentCount
+                ];
+
+                #pragma unroll
+                for (uint k_index = 0u;
+                     k_index <
+                        kW2KFragmentCount;
+                     ++k_index) {
+
+                    const uint logical_hidden =
+                        hidden_k_base +
+                        k_index *
+                        kFrag;
+
+                    const uint h_tile_row =
+                        simd_row_base /
+                        kFrag;
+
+                    const uint h_tile_col =
+                        logical_hidden /
+                        kFrag;
+
+                    const uint h_tile_index =
+                        (
+                            h_tile_row *
+                            kHColumnTiles +
+                            h_tile_col
+                        ) *
+                        kTileElements;
+
+                    h_fragment_cache[
+                        k_index
+                    ] =
+                        lowreg_matrix::
+                        load_tg_8x8(
+                            H_tg +
+                            h_tile_index,
+                            kFrag,
+                            ushort2(0u, 0u),
+                            ushort(lane)
+                        );
+                }
+
+                #pragma unroll
+                for (uint output_group = 0u;
+                     output_group <
+                        kW2OutputGroups;
+                     ++output_group) {
+
+                    const uint output_base =
+                        output_super_base +
+                        output_group *
+                        kW2BN;
+
+                    for (uint index = tid;
+                         index <
+                            kW2WeightFloat4Count;
+                         index +=
+                            kThreads) {
+
+                        const uint local_k =
+                            index /
+                            kW2WeightFloat4PerRow;
+
+                        const uint local_output4 =
+                            index -
+                            local_k *
+                            kW2WeightFloat4PerRow;
+
+                        const uint local_output =
+                            local_output4 *
+                            4u;
+
+                        const uint global_hidden =
+                            hidden_base +
+                            hidden_k_base +
+                            local_k;
+
+                        const uint global_output =
+                            output_base +
+                            local_output;
+
+                        float4 weight =
+                            float4(0.0f);
+
+                        if (
+                            global_hidden < C4 &&
+                            global_output + 3u <
+                                C
+                        ) {
+                            weight =
+                                float4(
+                                    *reinterpret_cast<
+                                        device const
+                                        packed_float4*
+                                    >(
+                                        w2 +
+                                        global_hidden *
+                                        C +
+                                        global_output
+                                    )
+                                );
+                        } else if (
+                            global_hidden < C4 &&
+                            global_output < C
+                        ) {
+                            #pragma unroll
+                            for (
+                                uint component = 0u;
+                                component < 4u;
+                                ++component
+                            ) {
+                                const uint output_c =
+                                    global_output +
+                                    component;
+
+                                if (output_c < C) {
+                                    weight[
+                                        component
+                                    ] =
+                                        w2[
+                                            global_hidden *
+                                            C +
+                                            output_c
+                                        ];
+                                }
+                            }
+                        }
+
+                        const uint tile_row =
+                            local_k /
+                            kFrag;
+
+                        const uint tile_col =
+                            local_output /
+                            kFrag;
+
+                        const uint in_tile_row =
+                            local_k &
+                            (kFrag - 1u);
+
+                        const uint in_tile_col =
+                            local_output &
+                            (kFrag - 1u);
+
+                        const uint tile_index =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col
+                            ) *
+                            kTileElements;
+
+                        const uint physical_index =
+                            tile_index +
+                            in_tile_row *
+                            kFrag +
+                            in_tile_col;
+
+                        *reinterpret_cast<
+                            threadgroup
+                            packed_float4*
+                        >(
+                            W2_tg +
+                            physical_index
+                        ) =
+                            packed_float4(
+                                weight
+                            );
+                    }
+
+                    threadgroup_barrier(
+                        mem_flags::
+                        mem_threadgroup
+                    );
+
+                    float2 accumulator0 =
+                        w2_acc00;
+
+                    float2 accumulator1 =
+                        w2_acc01;
+
+                    float2 accumulator2 =
+                        w2_acc10;
+
+                    float2 accumulator3 =
+                        w2_acc11;
+
+                    #pragma unroll
+                    for (uint k_index = 0u;
+                         k_index <
+                            kW2KFragmentCount;
+                         ++k_index) {
+
+                        const uint tile_row =
+                            k_index;
+
+                        const uint tile_col0 =
+                            w2_simd_col_base /
+                            kFrag;
+
+                        const uint tile_col1 =
+                            tile_col0 + 1u;
+
+                        const uint tile_col2 =
+                            tile_col0 + 2u;
+
+                        const uint tile_col3 =
+                            tile_col0 + 3u;
+
+                        const uint tile_index0 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col0
+                            ) *
+                            kTileElements;
+
+                        const uint tile_index1 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col1
+                            ) *
+                            kTileElements;
+
+                        const uint tile_index2 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col2
+                            ) *
+                            kTileElements;
+
+                        const uint tile_index3 =
+                            (
+                                tile_row *
+                                kW2ColumnTiles +
+                                tile_col3
+                            ) *
+                            kTileElements;
+
+                        const float2 w_fragment0 =
+                            lowreg_matrix::
+                            load_tg_8x8(
+                                W2_tg +
+                                tile_index0,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 w_fragment1 =
+                            lowreg_matrix::
+                            load_tg_8x8(
+                                W2_tg +
+                                tile_index1,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 w_fragment2 =
+                            lowreg_matrix::
+                            load_tg_8x8(
+                                W2_tg +
+                                tile_index2,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 w_fragment3 =
+                            lowreg_matrix::
+                            load_tg_8x8(
+                                W2_tg +
+                                tile_index3,
+                                kFrag,
+                                ushort2(0u, 0u),
+                                ushort(lane)
+                            );
+
+                        const float2 h_fragment =
+                            h_fragment_cache[
+                                k_index
+                            ];
+
+                        accumulator0 =
+                            lowreg_matrix::
+                            mma_8x8(
+                                h_fragment,
+                                w_fragment0,
+                                accumulator0
+                            );
+
+                        accumulator1 =
+                            lowreg_matrix::
+                            mma_8x8(
+                                h_fragment,
+                                w_fragment1,
+                                accumulator1
+                            );
+
+                        accumulator2 =
+                            lowreg_matrix::
+                            mma_8x8(
+                                h_fragment,
+                                w_fragment2,
+                                accumulator2
+                            );
+
+                        accumulator3 =
+                            lowreg_matrix::
+                            mma_8x8(
+                                h_fragment,
+                                w_fragment3,
+                                accumulator3
+                            );
+                    }
+
+                    w2_acc00 =
+                        accumulator0;
+
+                    w2_acc01 =
+                        accumulator1;
+
+                    w2_acc10 =
+                        accumulator2;
+
+                    w2_acc11 =
+                        accumulator3;
+
+                    threadgroup_barrier(
+                        mem_flags::
+                        mem_threadgroup
+                    );
+                }
+            }
+
+            const uint local_row =
+                simd_row_base +
+                uint(
+                    matrix_offset.y
+                );
+
+            const uint global_row =
+                row_base +
+                local_row;
+
+            if (global_row < N) {
+                #pragma unroll
+                for (
+                    uint output_group = 0u;
+                    output_group <
+                        kW2OutputGroups;
+                    ++output_group
+                ) {
+                    const uint output_base =
+                        output_super_base +
+                        output_group *
+                        kW2BN;
+
+                    #pragma unroll
+                    for (
+                        uint fragment_index = 0u;
+                        fragment_index < 4u;
+                        ++fragment_index
+                    ) {
+                        float2 accumulator =
+                            float2(0.0f);
+
+                        if (
+                            fragment_index == 0u
+                        ) {
+                            accumulator =
+                                w2_acc00;
+                        } else if (
+                            fragment_index == 1u
+                        ) {
+                            accumulator =
+                                w2_acc01;
+                        } else if (
+                            fragment_index == 2u
+                        ) {
+                            accumulator =
+                                w2_acc10;
+                        } else {
+                            accumulator =
+                                w2_acc11;
+                        }
+
+                        const uint fragment_col =
+                            w2_simd_col_base +
+                            fragment_index *
+                            kFrag +
+                            uint(
+                                matrix_offset.x
+                            );
+
+                        const uint pair_output =
+                            output_base +
+                            fragment_col;
+
+                        if (
+                            pair_output + 1u <
+                            C
+                        ) {
+                            const uint output_index =
+                                global_row *
+                                C +
+                                pair_output;
+
+                            float2 result = accumulator;
+
+                            if (hidden_base != 0u) {
+                                result += float2(
+                                    *reinterpret_cast<device const packed_float2*>(
+                                        out + output_index
+                                    )
+                                );
+                            }
+
+                            if (hidden_base + tile_hidden >= C4) {
+                                result += float2(
+                                    *reinterpret_cast<device const packed_float2*>(
+                                        b2 + pair_output
+                                    )
+                                );
+                            }
+
+                            *reinterpret_cast<
+                                device
+                                packed_float2*
+                            >(
+                                out +
+                                output_index
+                            ) =
+                                packed_float2(
+                                    result
+                                );
+
+                            continue;
+                        }
+
+                        #pragma unroll
+                        for (
+                            uint component = 0u;
+                            component < 2u;
+                            ++component
+                        ) {
+                            const uint global_output =
+                                output_base +
+                                fragment_col +
+                                component;
+
+                            if (
+                                global_output >= C
+                            ) {
+                                continue;
+                            }
+
+                            const uint output_index =
+                                global_row *
+                                C +
+                                global_output;
+
+                            float result = accumulator[component];
+
+                            if (hidden_base != 0u) {
+                                result += out[output_index];
+                            }
+
+                            if (hidden_base + tile_hidden >= C4) {
+                                result += b2[global_output];
+                            }
+
+                            out[output_index] = result;
+                        }
+                    }
+                }
+            }
+        }
+
+        threadgroup_barrier(
+            mem_flags::
+            mem_threadgroup
+        );
+    }
+}
+
+kernel void rmsnorm_forward(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& C [[buffer(2)]],
+    constant uint& eps_bits [[buffer(3)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kMaxSimdGroups = kThreads / kSimdWidth;
+
+    if (tid >= kThreads || C == 0u) {
+        return;
+    }
+
+    const uint row = tg_id;
+    const uint base = row * C;
+    const float eps = as_type<float>(eps_bits);
+
+    threadgroup float reduce_buf[kMaxSimdGroups];
+
+    const uint vector_count = C / 4u;
+    const uint vector_end = vector_count * 4u;
+
+    device const packed_float4* x4 =
+        reinterpret_cast<device const packed_float4*>(x + base);
+
+    float local_square_sum = 0.0f;
+
+    for (
+        uint vector_index = tid;
+        vector_index < vector_count;
+        vector_index += tpg
+    ) {
+        const float4 value = float4(x4[vector_index]);
+        local_square_sum = fma(
+            value.x,
+            value.x,
+            local_square_sum
+        );
+        local_square_sum = fma(
+            value.y,
+            value.y,
+            local_square_sum
+        );
+        local_square_sum = fma(
+            value.z,
+            value.z,
+            local_square_sum
+        );
+        local_square_sum = fma(
+            value.w,
+            value.w,
+            local_square_sum
+        );
+    }
+
+    for (
+        uint c = vector_end + tid;
+        c < C;
+        c += tpg
+    ) {
+        const float value = x[base + c];
+        local_square_sum = fma(
+            value,
+            value,
+            local_square_sum
+        );
+    }
+
+    const float simd_square_sum =
+        simd_sum(local_square_sum);
+
+    if (lane == 0u) {
+        reduce_buf[simd_id] = simd_square_sum;
+    }
+
+    threadgroup_barrier(
+        mem_flags::mem_threadgroup
+    );
+
+    if (tid == 0u) {
+        float total_square_sum = 0.0f;
+        const uint simd_group_count =
+            (tpg + kSimdWidth - 1u) / kSimdWidth;
+
+        for (
+            uint group = 0u;
+            group < simd_group_count;
+            ++group
+        ) {
+            total_square_sum += reduce_buf[group];
+        }
+
+        reduce_buf[0] = rsqrt(
+            total_square_sum / float(C) + eps
+        );
+    }
+
+    threadgroup_barrier(
+        mem_flags::mem_threadgroup
+    );
+
+    const float inv_rms = reduce_buf[0];
+
+    device packed_float4* out4 =
+        reinterpret_cast<device packed_float4*>(out + base);
+
+    for (
+        uint vector_index = tid;
+        vector_index < vector_count;
+        vector_index += tpg
+    ) {
+        const float4 value = float4(x4[vector_index]);
+        out4[vector_index] = packed_float4(
+            value * inv_rms
+        );
+    }
+
+    for (
+        uint c = vector_end + tid;
+        c < C;
+        c += tpg
+    ) {
+        out[base + c] =
+            x[base + c] * inv_rms;
+    }
+}
+
+kernel void layernorm_forward(
+    device const float* x [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& C [[buffer(4)]],
+    constant uint& eps_bits [[buffer(5)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    const uint row = tg_id;
+    const uint offset = row * C;
+    const float eps = as_type<float>(eps_bits);      // ← 新增：从 bits 还原 eps
+    threadgroup float2 reduce_buf[256];  // 复用，存储 mean 和 inv_std
+
+    // ------------------------------------------------------------
+    // 第一遍：计算均值 mean = sum(x) / C
+    // ------------------------------------------------------------
+    float sum_x = 0.0f;
+    uint i = tid * 4;
+    for (; i + 4 <= C; i += tpg * 4) {
+        float4 v = float4(x[offset + i], x[offset + i + 1], x[offset + i + 2], x[offset + i + 3]);
+        sum_x += v.x + v.y + v.z + v.w;
+    }
+    // 处理剩余元素（非 4 倍数部分）
+    uint rem = C - (C / 4) * 4;
+    uint base = C - rem;
+    for (uint j = tid; j < rem; j += tpg) {
+        sum_x += x[offset + base + j];
+    }
+
+    // 线程组内归约 sum_x（使用 SIMD shuffle 和 threadgroup 共享）
+    sum_x = simd_sum(sum_x);
+    if (tid % 32 == 0) {
+        reduce_buf[tid / 32].x = sum_x;   // 每个 SIMD 组的总和存到 .x
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 汇总所有 SIMD 组的和，并计算均值
+    if (tid == 0) {
+        float total = 0.0f;
+        uint simd_groups = (tpg + 31) / 32;
+        for (uint s = 0; s < simd_groups; ++s) {
+            total += reduce_buf[s].x;
+        }
+        float mean = total / (float)C;
+        reduce_buf[0].x = mean;   // 存储均值
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = reduce_buf[0].x;
+
+    // ------------------------------------------------------------
+    // 第二遍：计算方差 var = sum((x - mean)^2) / C  （两遍算法，数值稳定）
+    // ------------------------------------------------------------
+    float sum_sq_diff = 0.0f;
+    i = tid * 4;
+    for (; i + 4 <= C; i += tpg * 4) {
+        float4 v = float4(x[offset + i], x[offset + i + 1], x[offset + i + 2], x[offset + i + 3]);
+        float4 diff = v - float4(mean);
+        sum_sq_diff += dot(diff, diff);
+    }
+    rem = C - (C / 4) * 4;
+    base = C - rem;
+    for (uint j = tid; j < rem; j += tpg) {
+        float v = x[offset + base + j];
+        float diff = v - mean;
+        sum_sq_diff += diff * diff;
+    }
+
+    sum_sq_diff = simd_sum(sum_sq_diff);
+    if (tid % 32 == 0) {
+        reduce_buf[tid / 32].x = sum_sq_diff;   // 复用 .x
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total_sq = 0.0f;
+        uint simd_groups = (tpg + 31) / 32;
+        for (uint s = 0; s < simd_groups; ++s) {
+            total_sq += reduce_buf[s].x;
+        }
+        float var = total_sq / (float)C;
+        float inv_std = rsqrt(var + eps);
+        reduce_buf[0].y = inv_std;   // 存储 inv_std
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_std = reduce_buf[0].y;
+
+    // ------------------------------------------------------------
+    // 第三遍：归一化输出
+    // ------------------------------------------------------------
+    i = tid * 4;
+    for (; i + 4 <= C; i += tpg * 4) {
+        float4 v = float4(x[offset + i], x[offset + i + 1], x[offset + i + 2], x[offset + i + 3]);
+        float4 w = float4(weight[i], weight[i + 1], weight[i + 2], weight[i + 3]);
+        float4 b = float4(bias[i], bias[i + 1], bias[i + 2], bias[i + 3]);
+        float4 result = (v - float4(mean)) * float4(inv_std) * w + b;
+        out[offset + i]     = result.x;
+        out[offset + i + 1] = result.y;
+        out[offset + i + 2] = result.z;
+        out[offset + i + 3] = result.w;
+    }
+    rem = C - (C / 4) * 4;
+    base = C - rem;
+    for (uint j = tid; j < rem; j += tpg) {
+        uint idx = base + j;
+        float v = x[offset + idx];
+        out[offset + idx] = (v - mean) * inv_std * weight[idx] + bias[idx];
+    }
+}
+
+kernel void layernorm_backward_kernel(
+    device const float* x      [[buffer(0)]],
+    device const float* dy     [[buffer(1)]],
+    device const float* gamma  [[buffer(2)]],
+    device float* dx           [[buffer(3)]],
+    device atomic_uint* dgamma [[buffer(4)]],
+    device atomic_uint* dbeta  [[buffer(5)]],
+    constant uint& B_T         [[buffer(6)]],
+    constant uint& C           [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]], 
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]])
+{
+    if (row >= B_T) return;
+    uint base = row * C;
+    threadgroup float buf1[1024];
+    threadgroup float buf2[1024];
+
+    float local_sum = 0.0f;
+    for (uint i = tid; i < C; i += tpg) {
+        local_sum += x[base + i];
+    }
+    buf1[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) buf1[tid] += buf1[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean = buf1[0] / (float)C;
+
+    float local_var = 0.0f;
+    for (uint i = tid; i < C; i += tpg) {
+        float diff = x[base + i] - mean;
+        local_var += diff * diff;
+    }
+    buf1[tid] = local_var;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) buf1[tid] += buf1[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rsqrt_var = rsqrt((buf1[0] / (float)C) + 1e-5f);
+
+    float local_dy = 0.0f;
+    float local_dy_xhat = 0.0f;
+    for (uint i = tid; i < C; i += tpg) {
+        float xhat = (x[base + i] - mean) * rsqrt_var;
+        float dy_i = dy[base + i];
+        float dyg = dy_i * gamma[i];
+        
+        local_dy += dyg;
+        local_dy_xhat += dyg * xhat;
+    }
+    buf1[tid] = local_dy;
+    buf2[tid] = local_dy_xhat;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint s = tpg / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            buf1[tid] += buf1[tid + s];
+            buf2[tid] += buf2[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float mean_dy = buf1[0] / (float)C;
+    float mean_dy_xhat = buf2[0] / (float)C;
+
+    for (uint i = tid; i < C; i += tpg) {
+        float xhat = (x[base + i] - mean) * rsqrt_var;
+        float dy_i = dy[base + i];
+        if (dx) {
+            float dyg = dy_i * gamma[i];
+            dx[base + i] = rsqrt_var * (dyg - mean_dy - xhat * mean_dy_xhat);
+        }
+        
+        if (dgamma) {
+            atomic_add_float(&dgamma[i], dy_i * xhat);
+        }
+        if (dbeta) {
+            atomic_add_float(&dbeta[i], dy_i);
+        }
+    }
+}
+
+kernel void gelu_add_bias_kernel(
+    device const float* h1 [[buffer(0)]],
+    device const float* b1 [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& total [[buffer(3)]],
+    constant uint& C4 [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint c = gid % C4;
+    float val = h1[gid] + b1[c];
+    float x_cube = val * val * val;
+    float inner = clamp(sqrt(2.0f/M_PI_F)*(val + 0.044715f*x_cube), -20.0f, 20.0f);
+    out[gid] = 0.5f * val * (1.0f + fast::tanh(inner));
+}
+
+kernel void gelu_backward_bias_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device const float* h1 [[buffer(1)]],
+    device const float* b1 [[buffer(2)]],
+    device float* grad_in [[buffer(3)]],
+    constant uint& total [[buffer(4)]],
+    constant uint& C4 [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= total) return;
+    uint c = gid % C4;
+    float val = h1[gid] + b1[c];
+    float x_sq = val * val;
+    float x_cube = x_sq * val;
+    float inner = sqrt(2.0f/M_PI_F)*(val + 0.044715f*x_cube);
+    float tanh_inner = fast::tanh(clamp(inner, -20.0f, 20.0f));
+    
+    float left = 0.5f * (1.0f + tanh_inner);
+    float right = 0.5f * val * (1.0f - tanh_inner * tanh_inner) * sqrt(2.0f/M_PI_F) * (1.0f + 3.0f * 0.044715f * x_sq);
+    grad_in[gid] = grad_out[gid] * (left + right);
+}
+
+kernel void gelu_forward_kernel(
+    device const float* x [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid) return;
+    const float val = x[id];
+    const float x_cube = val * val * val;
+    const float inner = clamp(sqrt(2.0f / M_PI_F) * (val + 0.044715f * x_cube), -20.0f, 20.0f);
+    out[id] = 0.5f * val * (1.0f + fast::tanh(inner));
+}
+
+kernel void gelu_backward_kernel(
+    device const float* grad_out [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* grad_x [[buffer(2)]],
+    uint id [[thread_position_in_grid]],
+    uint threads_per_grid [[threads_per_grid]]
+) {
+    if (id >= threads_per_grid) return;
+    const float val = x[id];
+    const float x_sq = val * val;
+    const float x_cube = x_sq * val;
+    const float inner = sqrt(2.0f / M_PI_F) * (val + 0.044715f * x_cube);
+    const float tanh_inner = fast::tanh(clamp(inner, -20.0f, 20.0f));
+    const float left = 0.5f * (1.0f + tanh_inner);
+    const float right = 0.5f * val * (1.0f - tanh_inner * tanh_inner)
+        * sqrt(2.0f / M_PI_F) * (1.0f + 3.0f * 0.044715f * x_sq);
+    // 与 CPU cpu_gelu_backward 一致：累加
+    grad_x[id] = grad_out[id] * (left + right);
+}
+
+kernel void swiglu_forward_kernel(
+    device const float* gu [[buffer(0)]],
+    device float* hidden [[buffer(1)]],
+    constant uint& N [[buffer(2)]],
+    constant uint& H [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint VEC = 4u;
+    const uint vectors_per_row = (H + VEC - 1u) / VEC;
+    const uint row = gid / vectors_per_row;
+    const uint vec_id = gid % vectors_per_row;
+    const uint col = vec_id * VEC;
+
+    if (row >= N || col >= H) {
+        return;
+    }
+
+    const uint gu_base = row * (2u * H);
+    const uint hidden_base = row * H;
+    const uint remain = H - col;
+    const uint lanes = min(VEC, remain);
+
+    float4 gate = float4(0.0f);
+    float4 up = float4(0.0f);
+
+    for (uint i = 0u; i < lanes; ++i) {
+        gate[i] = gu[gu_base + col + i];
+        up[i] = gu[gu_base + H + col + i];
+    }
+
+    const float4 sigmoid_gate =
+        1.0f / (1.0f + exp(-gate));
+
+    const float4 result =
+        gate * sigmoid_gate * up;
+
+    for (uint i = 0u; i < lanes; ++i) {
+        hidden[hidden_base + col + i] = result[i];
+    }
+}
+
+kernel void swiglu_backward_inplace_kernel(
+    device float* gu [[buffer(0)]],
+    device const float* dhidden [[buffer(1)]],
+    constant uint& N [[buffer(2)]],
+    constant uint& H [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    const uint VEC = 4u;
+    const uint vectors_per_row = (H + VEC - 1u) / VEC;
+    const uint row = gid / vectors_per_row;
+    const uint vec_id = gid % vectors_per_row;
+    const uint col = vec_id * VEC;
+
+    if (row >= N || col >= H) {
+        return;
+    }
+
+    const uint gu_base = row * (2u * H);
+    const uint hidden_base = row * H;
+    const uint remain = H - col;
+    const uint lanes = min(VEC, remain);
+
+    float4 gate = float4(0.0f);
+    float4 up = float4(0.0f);
+    float4 d_hidden = float4(0.0f);
+
+    for (uint i = 0u; i < lanes; ++i) {
+        gate[i] = gu[gu_base + col + i];
+        up[i] = gu[gu_base + H + col + i];
+        d_hidden[i] = dhidden[hidden_base + col + i];
+    }
+
+    const float4 sigmoid_gate =
+        1.0f / (1.0f + exp(-gate));
+
+    const float4 silu_gate =
+        gate * sigmoid_gate;
+
+    const float4 dsilu_dgate =
+        sigmoid_gate *
+        (1.0f + gate * (1.0f - sigmoid_gate));
+
+    const float4 d_gate =
+        d_hidden * up * dsilu_dgate;
+
+    const float4 d_up =
+        d_hidden * silu_gate;
+
+    // 每个线程负责同一组 gate/up 元素，
+    // 先读取原始 gate/up，再写回 dgate/dup，
+    // 不会发生线程间写冲突。
+    for (uint i = 0u; i < lanes; ++i) {
+        gu[gu_base + col + i] = d_gate[i];
+        gu[gu_base + H + col + i] = d_up[i];
+    }
+}
+
+METAL_FUNC static float2 fa_qkv_load_weight_pair_checked_bm16(
+    device const float* src,
+    uint row,
+    uint col,
+    uint C
+) {
+    float2 result = float2(0.0f);
+
+    if (row >= C || col >= C) {
+        return result;
+    }
+
+    if (col + 1u < C) {
+        return float2(
+            *reinterpret_cast<device const packed_float2*>(
+                src + row * C + col
+            )
+        );
+    }
+
+    result.x = src[row * C + col];
+    return result;
+}
+
+METAL_FUNC static float2 fa_qkv_load_bias_pair_bm16(
+    device const float* bias,
+    uint channel,
+    uint C
+) {
+    if (channel + 1u < C) {
+        return float2(
+            *reinterpret_cast<device const packed_float2*>(
+                bias + channel
+            )
+        );
+    }
+
+    float2 result = float2(0.0f);
+
+    if (channel < C) {
+        result.x = bias[channel];
+    }
+
+    return result;
+}
+
+METAL_FUNC static void fa_qkv_fill_z_tile_16x64(
+    threadgroup float* dst,
+    device const float* x,
+    uint C,
+    uint input_base,
+    uint simd_id,
+    uint lane,
+    float inv_rms0,
+    float inv_rms1,
+    uint global_row0,
+    uint global_row1,
+    bool row0_valid,
+    bool row1_valid
+) {
+    constexpr uint kBK = 64u;
+    constexpr uint kZStride = kBK + 1u;
+    const uint local_c = lane * 2u;
+    const uint global_c = input_base + local_c;
+    const uint local_row0 = simd_id * 2u;
+    const uint local_row1 = local_row0 + 1u;
+
+    float2 z0 = float2(0.0f);
+    float2 z1 = float2(0.0f);
+    if (row0_valid && global_c < C) {
+        float2 x0 = float2(0.0f);
+        if (global_c + 1u < C) {
+            x0 = float2(*reinterpret_cast<device const packed_float2*>(x + global_row0 * C + global_c));
+        } else {
+            x0.x = x[global_row0 * C + global_c];
+        }
+        z0 = fma(x0, float2(inv_rms0), 0.0);
+    }
+
+    if (row1_valid && global_c < C) {
+        float2 x1 = float2(0.0f);
+        if (global_c + 1u < C) {
+            x1 = float2(*reinterpret_cast<device const packed_float2*>(x + global_row1 * C + global_c));
+        } else {
+            x1.x = x[global_row1 * C + global_c];
+        }
+        z1 = fma(x1, float2(inv_rms1), 0.0);
+    }
+    *reinterpret_cast<threadgroup packed_float2*>(dst + local_row0 * kZStride + local_c) = packed_float2(z0);
+    *reinterpret_cast<threadgroup packed_float2*>(dst + local_row1 * kZStride + local_c) = packed_float2(z1);
+}
+
+METAL_FUNC static void fa_qkv_store_pair_bm16(
+    device float* q_cache,
+    device float* k_cache,
+    device float* v_cache,
+    float2 q_value,
+    float2 k_value,
+    float2 v_value,
+    float2 q_bias,
+    float2 k_bias,
+    float2 v_bias,
+    uint b,
+    uint t,
+    uint T,
+    uint H,
+    uint D,
+    uint h0,
+    uint d0,
+    bool second_valid,
+    bool same_head
+) {
+    q_value += q_bias;
+    k_value += k_bias;
+    v_value += v_bias;
+
+    const uint cache_index0 =
+        ((b * H + h0) * T + t) * D + d0;
+
+    if (second_valid && same_head) {
+        *reinterpret_cast<device packed_float2*>(
+            q_cache + cache_index0
+        ) = packed_float2(q_value);
+
+        *reinterpret_cast<device packed_float2*>(
+            k_cache + cache_index0
+        ) = packed_float2(k_value);
+
+        *reinterpret_cast<device packed_float2*>(
+            v_cache + cache_index0
+        ) = packed_float2(v_value);
+
+        return;
+    }
+
+    q_cache[cache_index0] = q_value.x;
+    k_cache[cache_index0] = k_value.x;
+    v_cache[cache_index0] = v_value.x;
+
+    if (second_valid) {
+        const uint h1 = h0 + 1u;
+
+        const uint cache_index1 =
+            ((b * H + h1) * T + t) * D;
+
+        q_cache[cache_index1] = q_value.y;
+        k_cache[cache_index1] = k_value.y;
+        v_cache[cache_index1] = v_value.y;
+    }
+}
+
+kernel void fused_rms_fa_qkv(
+    device const float* x             [[buffer(0)]],
+    device const float* wq            [[buffer(1)]],
+    device const float* bq            [[buffer(2)]],
+    device const float* wk            [[buffer(3)]],
+    device const float* bk            [[buffer(4)]],
+    device const float* wv            [[buffer(5)]],
+    device const float* bv            [[buffer(6)]],
+    device float* q_cache             [[buffer(7)]],
+    device float* k_cache             [[buffer(8)]],
+    device float* v_cache             [[buffer(9)]],
+    constant uint& B                  [[buffer(10)]],
+    constant uint& T                  [[buffer(11)]],
+    constant uint& C                  [[buffer(12)]],
+    constant uint& H                  [[buffer(13)]],
+    constant uint& eps_bits           [[buffer(14)]],
+    uint3 tg_pos                      [[threadgroup_position_in_grid]],
+    uint3 thread_pos                 [[thread_position_in_threadgroup]],
+    uint lane                         [[thread_index_in_simdgroup]],
+    uint simd_id                      [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kBM = 16u;
+    constexpr uint kBK = 64u;
+    constexpr uint kOutputSuperTile = 128u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kZStride = kBK + 1u;
+
+    threadgroup float Z_tg[kBM][kZStride];
+    const uint tid = thread_pos.x;
+
+    if (tid >= kThreads || tg_pos.x != 0u || tg_pos.z != 0u ||
+        B == 0u || T == 0u || C == 0u || H == 0u || (C & 3u) != 0u || C % H != 0u) {
+        return;
+    }
+
+    const uint D = C / H;
+    if (D == 0u || D > 128u) {
+        return;
+    }
+
+    const uint token_count = B * T;
+    const uint row_base = tg_pos.y * kBM;
+
+    if (row_base >= token_count) {
+        return;
+    }
+
+    const float eps = as_type<float>(eps_bits);
+    const uint stats_local_row0 = simd_id * 2u;
+    const uint stats_local_row1 = stats_local_row0 + 1u;
+
+    const uint stats_global_row0 = row_base + stats_local_row0;
+    const uint stats_global_row1 = row_base + stats_local_row1;
+    const bool stats_row0_valid = stats_global_row0 < token_count;
+    const bool stats_row1_valid = stats_global_row1 < token_count;
+
+    float local_square_sum0 = 0.0f;
+    float local_square_sum1 = 0.0f;
+    if (stats_row0_valid) {
+        const uint x_base0 = stats_global_row0 * C;
+        for (uint channel = lane; channel < C; channel += kSimdWidth) {
+            local_square_sum0 = fma(x[x_base0 + channel], x[x_base0 + channel], local_square_sum0);
+        }
+    }
+    if (stats_row1_valid) {
+        const uint x_base1 = stats_global_row1 * C;
+        for (uint channel = lane; channel < C; channel += kSimdWidth) {
+            local_square_sum1 = fma(x[x_base1 + channel], x[x_base1 + channel], local_square_sum1);
+        }
+    }
+
+    const float inv_rms0 = stats_row0_valid ? rsqrt(simd_sum(local_square_sum0) / float(C) + eps) : 0.0f;
+    const float inv_rms1 = stats_row1_valid ? rsqrt(simd_sum(local_square_sum1) / float(C) + eps) : 0.0f;
+    const ushort2 matrix_offset = morton_order(ushort(lane));
+    const uint matrix_x = uint(matrix_offset.x);
+    const uint matrix_y = uint(matrix_offset.y);
+    const uint simd_col_base = simd_id * 16u;
+    const uint output_local_row0 = matrix_y;
+    const uint output_local_row1 = 8u + matrix_y;
+    const uint output_global_row0 = row_base + output_local_row0;
+    const uint output_global_row1 = row_base + output_local_row1;
+    const bool output_row0_valid = output_global_row0 < token_count;
+    const bool output_row1_valid = output_global_row1 < token_count;
+
+    uint output_b0 = 0u;
+    uint output_t0 = 0u;
+    uint output_b1 = 0u;
+    uint output_t1 = 0u;
+    if (output_row0_valid) {
+        output_b0 = output_global_row0 / T;
+        output_t0 = output_global_row0 - output_b0 * T;
+    }
+    if (output_row1_valid) {
+        output_b1 = output_global_row1 / T;
+        output_t1 = output_global_row1 - output_b1 * T;
+    }
+
+    fa_qkv_fill_z_tile_16x64(&Z_tg[0][0], x, C, 0u, simd_id, lane, inv_rms0, inv_rms1,
+        stats_global_row0, stats_global_row1, stats_row0_valid, stats_row1_valid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint output_base = 0u; output_base < C; output_base += kOutputSuperTile) {
+        float2 q_r0_c0 = float2(0.0f);
+        float2 q_r0_c1 = float2(0.0f);
+        float2 q_r1_c0 = float2(0.0f);
+        float2 q_r1_c1 = float2(0.0f);
+
+        float2 k_r0_c0 = float2(0.0f);
+        float2 k_r0_c1 = float2(0.0f);
+        float2 k_r1_c0 = float2(0.0f);
+        float2 k_r1_c1 = float2(0.0f);
+
+        float2 v_r0_c0 = float2(0.0f);
+        float2 v_r0_c1 = float2(0.0f);
+        float2 v_r1_c0 = float2(0.0f);
+        float2 v_r1_c1 = float2(0.0f);
+
+        const uint weight_col0 = output_base + simd_col_base + matrix_x;
+        const uint weight_col1 = weight_col0 + 8u;
+        const bool full_output_tile = output_base + simd_col_base + 16u <= C;
+        for (uint input_base = 0u; input_base < C; input_base += kBK) {
+            threadgroup const float* z_tile = &Z_tg[0][0];
+            const bool full_input_tile = input_base + kBK <= C;
+            const bool full_weight_tile = full_input_tile && full_output_tile;
+            uint z_offset0 = matrix_y * kZStride + matrix_x;
+            uint z_offset1 = (8u + matrix_y) * kZStride + matrix_x;
+            uint weight_row = input_base + matrix_y;
+            uint weight_offset = weight_row * C + weight_col0;
+            const uint weight_k_step = kFrag * C;
+            for (uint k_sub = 0u; k_sub < kBK; k_sub += kFrag) {
+                const float2 z_fragment0 = float2(*reinterpret_cast<threadgroup const packed_float2*>(z_tile + z_offset0));
+                const float2 z_fragment1 = float2(*reinterpret_cast<threadgroup const packed_float2*>(z_tile + z_offset1));
+                float2 wq_fragment0;
+                float2 wq_fragment1;
+
+                if (full_weight_tile) {
+                    wq_fragment0 = float2(*reinterpret_cast<device const packed_float2*>(wq + weight_offset));
+                    wq_fragment1 = float2(*reinterpret_cast<device const packed_float2*>(wq + weight_offset + 8u));
+                } else {
+                    wq_fragment0 = fa_qkv_load_weight_pair_checked_bm16(wq, weight_row, weight_col0, C);
+                    wq_fragment1 = fa_qkv_load_weight_pair_checked_bm16(wq, weight_row, weight_col1, C);
+                }
+                q_r0_c0 = lowreg_matrix::mma_8x8(z_fragment0, wq_fragment0, q_r0_c0);
+                q_r1_c0 = lowreg_matrix::mma_8x8(z_fragment1, wq_fragment0, q_r1_c0);
+                q_r0_c1 = lowreg_matrix::mma_8x8(z_fragment0, wq_fragment1, q_r0_c1);
+                q_r1_c1 = lowreg_matrix::mma_8x8(z_fragment1, wq_fragment1, q_r1_c1);
+
+                float2 wk_fragment0;
+                float2 wk_fragment1;
+                if (full_weight_tile) {
+                    wk_fragment0 = float2(*reinterpret_cast<device const packed_float2*>(wk + weight_offset));
+                    wk_fragment1 = float2(*reinterpret_cast<device const packed_float2*>(wk + weight_offset + 8u));
+                } else {
+                    wk_fragment0 = fa_qkv_load_weight_pair_checked_bm16(wk, weight_row, weight_col0, C);
+                    wk_fragment1 = fa_qkv_load_weight_pair_checked_bm16(wk, weight_row, weight_col1, C);
+                }
+                k_r0_c0 = lowreg_matrix::mma_8x8(z_fragment0, wk_fragment0, k_r0_c0);
+                k_r1_c0 = lowreg_matrix::mma_8x8(z_fragment1, wk_fragment0, k_r1_c0);
+                k_r0_c1 = lowreg_matrix::mma_8x8(z_fragment0, wk_fragment1, k_r0_c1);
+                k_r1_c1 = lowreg_matrix::mma_8x8(z_fragment1, wk_fragment1, k_r1_c1);
+
+                float2 wv_fragment0;
+                float2 wv_fragment1;
+                if (full_weight_tile) {
+                    wv_fragment0 = float2(*reinterpret_cast<device const packed_float2*>(wv + weight_offset));
+                    wv_fragment1 = float2(*reinterpret_cast<device const packed_float2*>(wv + weight_offset + 8u));
+                } else {
+                    wv_fragment0 = fa_qkv_load_weight_pair_checked_bm16(wv, weight_row, weight_col0, C);
+                    wv_fragment1 = fa_qkv_load_weight_pair_checked_bm16(wv, weight_row, weight_col1, C);
+                }
+                v_r0_c0 = lowreg_matrix::mma_8x8(z_fragment0, wv_fragment0, v_r0_c0);
+                v_r1_c0 = lowreg_matrix::mma_8x8(z_fragment1, wv_fragment0, v_r1_c0);
+                v_r0_c1 = lowreg_matrix::mma_8x8(z_fragment0, wv_fragment1, v_r0_c1);
+                v_r1_c1 = lowreg_matrix::mma_8x8(z_fragment1, wv_fragment1, v_r1_c1);
+                z_offset0 += kFrag;
+                z_offset1 += kFrag;
+                weight_row += kFrag;
+                weight_offset += weight_k_step;
+            }
+
+            const bool has_next_input = input_base + kBK < C;
+            const bool has_next_output = output_base + kOutputSuperTile < C;
+            const bool has_next_task = has_next_input || has_next_output;
+            if (has_next_task) {
+                const uint next_input_base = has_next_input ? input_base + kBK : 0u;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                fa_qkv_fill_z_tile_16x64(&Z_tg[0][0], x, C, next_input_base, simd_id, lane, inv_rms0, inv_rms1,
+                    stats_global_row0, stats_global_row1, stats_row0_valid, stats_row1_valid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        const uint output_channel0 = output_base + simd_col_base + matrix_x;
+        const uint output_channel1 = output_channel0 + 8u;
+        const bool pair0_first_valid = output_channel0 < C;
+        const bool pair0_second_valid =
+            output_channel0 + 1u < C;
+
+        const bool pair1_first_valid =
+            output_channel1 < C;
+
+        const bool pair1_second_valid =
+            output_channel1 + 1u < C;
+
+        uint pair0_h = 0u;
+        uint pair0_d = 0u;
+        bool pair0_same_head = false;
+
+        uint pair1_h = 0u;
+        uint pair1_d = 0u;
+        bool pair1_same_head = false;
+
+        if (pair0_first_valid) {
+            pair0_h = output_channel0 / D;
+            pair0_d =
+                output_channel0 - pair0_h * D;
+
+            pair0_same_head =
+                pair0_second_valid &&
+                pair0_d + 1u < D;
+        }
+
+        if (pair1_first_valid) {
+            pair1_h = output_channel1 / D;
+            pair1_d =
+                output_channel1 - pair1_h * D;
+
+            pair1_same_head =
+                pair1_second_valid &&
+                pair1_d + 1u < D;
+        }
+
+        const float2 bq0 =
+            fa_qkv_load_bias_pair_bm16(
+                bq,
+                output_channel0,
+                C
+            );
+
+        const float2 bk0 =
+            fa_qkv_load_bias_pair_bm16(
+                bk,
+                output_channel0,
+                C
+            );
+
+        const float2 bv0 =
+            fa_qkv_load_bias_pair_bm16(
+                bv,
+                output_channel0,
+                C
+            );
+
+        const float2 bq1 =
+            fa_qkv_load_bias_pair_bm16(
+                bq,
+                output_channel1,
+                C
+            );
+
+        const float2 bk1 =
+            fa_qkv_load_bias_pair_bm16(
+                bk,
+                output_channel1,
+                C
+            );
+
+        const float2 bv1 =
+            fa_qkv_load_bias_pair_bm16(
+                bv,
+                output_channel1,
+                C
+            );
+
+        if (output_row0_valid) {
+            if (pair0_first_valid) {
+                fa_qkv_store_pair_bm16(
+                    q_cache,
+                    k_cache,
+                    v_cache,
+
+                    q_r0_c0,
+                    k_r0_c0,
+                    v_r0_c0,
+
+                    bq0,
+                    bk0,
+                    bv0,
+
+                    output_b0,
+                    output_t0,
+                    T,
+                    H,
+                    D,
+
+                    pair0_h,
+                    pair0_d,
+
+                    pair0_second_valid,
+                    pair0_same_head
+                );
+            }
+
+            if (pair1_first_valid) {
+                fa_qkv_store_pair_bm16(
+                    q_cache,
+                    k_cache,
+                    v_cache,
+
+                    q_r0_c1,
+                    k_r0_c1,
+                    v_r0_c1,
+
+                    bq1,
+                    bk1,
+                    bv1,
+
+                    output_b0,
+                    output_t0,
+                    T,
+                    H,
+                    D,
+
+                    pair1_h,
+                    pair1_d,
+
+                    pair1_second_valid,
+                    pair1_same_head
+                );
+            }
+        }
+
+        if (output_row1_valid) {
+            if (pair0_first_valid) {
+                fa_qkv_store_pair_bm16(
+                    q_cache,
+                    k_cache,
+                    v_cache,
+
+                    q_r1_c0,
+                    k_r1_c0,
+                    v_r1_c0,
+
+                    bq0,
+                    bk0,
+                    bv0,
+
+                    output_b1,
+                    output_t1,
+                    T,
+                    H,
+                    D,
+
+                    pair0_h,
+                    pair0_d,
+
+                    pair0_second_valid,
+                    pair0_same_head
+                );
+            }
+
+            if (pair1_first_valid) {
+                fa_qkv_store_pair_bm16(
+                    q_cache,
+                    k_cache,
+                    v_cache,
+
+                    q_r1_c1,
+                    k_r1_c1,
+                    v_r1_c1,
+
+                    bq1,
+                    bk1,
+                    bv1,
+
+                    output_b1,
+                    output_t1,
+                    T,
+                    H,
+                    D,
+
+                    pair1_h,
+                    pair1_d,
+
+                    pair1_second_valid,
+                    pair1_same_head
+                );
+            }
+        }
+    }
+}
+
+kernel void fused_fa_from_qkv(
+    device const float* q_cache     [[buffer(0)]],
+    device const float* k_cache     [[buffer(1)]],
+    device const float* v_cache     [[buffer(2)]],
+    device float* out               [[buffer(3)]],
+    device float* lse_out           [[buffer(4)]],
+    constant uint& B                [[buffer(5)]],
+    constant uint& H                [[buffer(6)]],
+    constant uint& T                [[buffer(7)]],
+    constant uint& C                [[buffer(8)]],
+    constant uint& is_causal_int    [[buffer(9)]],
+    constant uint& write_lse        [[buffer(10)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint3 thread_pos                [[thread_position_in_threadgroup]],
+    uint3 threads_per_tg            [[threads_per_threadgroup]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint simd_id                    [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_count            [[threads_per_simdgroup]]
+) {
+    constexpr uint kBQ = 8u;
+    constexpr uint kBK = 32u;
+    constexpr uint kBD = 64u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kThreads = 128u;
+    constexpr uint kSimdGroups = 4u;
+    constexpr uint kMaxHeadDim = 128u;
+    // Keep Q in up to two 64-wide sub-tiles. This preserves the compact
+    // stride for D<=64 while still covering every D<=128 configuration.
+    constexpr uint kQStride = kBD + 1u;
+    constexpr uint kKTStride = kFrag + 1u;
+    constexpr uint kPStride = kBK + 1u;
+    constexpr uint kQChunkCount = kBQ * kQStride;
+    constexpr uint kQChunks = kMaxHeadDim / kBD;
+    constexpr uint kQCount = kQChunks * kQChunkCount;
+    constexpr uint kKTGroupCount = kBD * kKTStride;
+    constexpr uint kKTCount = kSimdGroups * kKTGroupCount;
+    constexpr uint kTileScratchCount = kQCount + kKTCount;
+    constexpr uint kFloat4 = 4u;
+    threadgroup float tile_scratch[kTileScratchCount];
+    threadgroup float P_tg[kBQ][kPStride];
+    threadgroup float running_max_tg[kBQ];
+    threadgroup float running_sum_tg[kBQ];
+    threadgroup float alpha_tg[kBQ];
+    const uint tid = thread_pos.x;
+
+    // 所有线程必须根据统一条件退出，避免barrier死锁。
+    if (threads_per_tg.x != kThreads || threads_per_tg.y != 1u || threads_per_tg.z != 1u || 
+        simd_lane_count != 32u || tg_pos.x != 0u || B == 0u ||  H == 0u || T == 0u || C == 0u || (C % H) != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    if (D == 0u || D > kMaxHeadDim) {
+        return;
+    }
+    const uint bh = tg_pos.z;
+    if (bh >= B * H) {
+        return;
+    }
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint query_base = tg_pos.y * kBQ;
+    if (query_base >= T) {
+        return;
+    }
+    const bool is_causal = is_causal_int != 0u;
+    const float score_scale = rsqrt(float(D));
+    float2 output_accumulator0 = float2(0.0f);
+    float2 output_accumulator1 = float2(0.0f);
+    float2 output_accumulator2 = float2(0.0f);
+    float2 output_accumulator3 = float2(0.0f);
+    if (tid < kBQ) {
+        running_max_tg[tid] = -INFINITY;
+        running_sum_tg[tid] = 0.0f;
+        alpha_tg[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float* Q_all = tile_scratch;
+    threadgroup float* KT_all = tile_scratch + kQCount;
+
+    // Q is invariant across all key blocks.  Keep it in the Q half of
+    // tile_scratch and load it once; the K half is reused by V below.
+    // Write each active 64-wide sub-tile, including zero padding. The MMA
+    // loop always consumes a complete 64-wide slice.
+    const uint q_chunks = (D + kBD - 1u) / kBD;
+    constexpr uint kQFloat4PerChunk = kBD / kFloat4;
+    for (uint index = tid; index < q_chunks * kBQ * kQFloat4PerChunk; index += kThreads) {
+        const uint chunk = index / (kBQ * kQFloat4PerChunk);
+        const uint chunk_index = index - chunk * kBQ * kQFloat4PerChunk;
+        const uint local_q = chunk_index / kQFloat4PerChunk;
+        const uint local_d = (chunk_index - local_q * kQFloat4PerChunk) * kFloat4;
+        const uint query = query_base + local_q;
+        const uint global_d = chunk * kBD + local_d;
+        float4 value = float4(0.0f);
+        if (query < T && global_d + 3u < D) {
+            const uint q_index = (bh * T + query) * D + global_d;
+            value = float4(*reinterpret_cast<device const packed_float4*>(q_cache + q_index));
+        } else if (query < T && global_d < D) {
+            #pragma unroll
+            for (uint component = 0u; component < 4u; ++component) {
+                if (global_d + component < D) {
+                    value[component] = q_cache[(bh * T + query) * D + global_d + component];
+                }
+            }
+        }
+        threadgroup float* Q_tg = Q_all + chunk * kQChunkCount;
+        Q_tg[local_q * kQStride + local_d + 0u] = value[0];
+        Q_tg[local_q * kQStride + local_d + 1u] = value[1];
+        Q_tg[local_q * kQStride + local_d + 2u] = value[2];
+        Q_tg[local_q * kQStride + local_d + 3u] = value[3];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint key_limit = is_causal ? min(T, query_base + kBQ) : T;
+    for (uint key_base = 0u; key_base < key_limit; key_base += kBK) {
+        // QK^T
+        float2 score_accumulator = float2(0.0f);
+        for (uint d_base = 0u; d_base < D; d_base += kBD) {
+            threadgroup float* Q_tg = Q_all + (d_base / kBD) * kQChunkCount;
+
+            // Only a later slice needs protection before reusing KT_tg.
+            if (d_base != 0u) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            // 加载K并转置：device K：[key,D] KT_tg：[D,32]
+            threadgroup float* KT_tg = KT_all + simd_id * kKTGroupCount;
+            for (uint index = lane; index < (kFrag * kBD) / kFloat4; index += 32u) {
+                const uint local_key = index / (kBD / kFloat4);
+                const uint local_d = (index - local_key * (kBD / kFloat4)) * kFloat4;
+                const uint key = key_base + simd_id * kFrag + local_key;
+                const uint global_d = d_base + local_d;
+                float4 value = float4(0.0f);
+                if (key < T && global_d + 3u < D) {
+                    const uint k_index = (bh * T + key) * D + global_d;
+                    value = float4(*reinterpret_cast<device const packed_float4*>(k_cache + k_index));
+                } else if (key < T && global_d < D) {
+                    #pragma unroll
+                    for (uint component = 0u; component < 4u; ++component) {
+                        if (global_d + component < D) {
+                            value[component] = k_cache[(bh * T + key) * D + global_d + component];
+                        }
+                    }
+                }
+                KT_tg[(local_d + 0u) * kKTStride + local_key] = value[0];
+                KT_tg[(local_d + 1u) * kKTStride + local_key] = value[1];
+                KT_tg[(local_d + 2u) * kKTStride + local_key] = value[2];
+                KT_tg[(local_d + 3u) * kKTStride + local_key] = value[3];
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            #pragma unroll
+            for (uint d_sub = 0u; d_sub < kBD; d_sub += kFrag) {
+                const float2 q_fragment = lowreg_matrix::load_tg_8x8(Q_tg,
+                        kQStride, ushort2(ushort(0u), ushort(d_sub)), ushort(lane));
+                const float2 k_fragment = lowreg_matrix::load_tg_8x8(KT_tg,
+                        kKTStride, ushort2(ushort(d_sub), ushort(0u)), ushort(lane));
+                score_accumulator = lowreg_matrix::mma_8x8(q_fragment, k_fragment, score_accumulator);
+            }
+        }
+
+        // Scale和causal mask
+        const ushort2 score_offset = morton_order(ushort(lane));
+        const uint local_q = uint(score_offset.y);
+        const uint local_key0 = simd_id * kFrag + uint(score_offset.x);
+        const uint local_key1 = local_key0 + 1u;
+        const uint query = query_base + local_q;
+        const uint key0 = key_base + local_key0;
+        const uint key1 = key_base + local_key1;
+        const bool valid0 = query < T && key0 < T && (!is_causal || key0 <= query);
+        const bool valid1 = query < T && key1 < T && (!is_causal || key1 <= query);
+        P_tg[local_q][local_key0] = valid0 ? score_accumulator[0] * score_scale : -INFINITY;
+        P_tg[local_q][local_key1] = valid1 ? score_accumulator[1] * score_scale : -INFINITY;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 32-key block online softmax
+        const uint row_half = lane >> 4u;
+        const uint half_lane = lane & 15u;
+        const uint softmax_row = simd_id * 2u + row_half;
+        const uint probability_col0 = half_lane;
+        const uint probability_col1 = half_lane + 16u;
+        const float score0 = P_tg[softmax_row][probability_col0];
+        const float score1 = P_tg[softmax_row][probability_col1];
+        float local_max = max(score0, score1);
+        local_max = max(local_max, simd_shuffle_down(local_max, ushort(8u)));
+        local_max = max(local_max, simd_shuffle_down(local_max, ushort(4u)));
+        local_max = max(local_max, simd_shuffle_down(local_max, ushort(2u)));
+        local_max = max(local_max, simd_shuffle_down(local_max, ushort(1u)));
+
+        const ushort leader_lane = ushort(row_half * 16u);
+        const float tile_max = simd_shuffle(local_max, leader_lane);
+        const float old_max = running_max_tg[softmax_row];
+        const float new_max = max(old_max, tile_max);
+        const float old_scale = isfinite(old_max) ? exp(old_max - new_max) : 0.0f;
+        const float probability0 = isfinite(score0) ? exp(score0 - new_max) : 0.0f;
+        const float probability1 = isfinite(score1) ? exp(score1 - new_max) : 0.0f;
+        float local_probability_sum = probability0 + probability1;
+        local_probability_sum += simd_shuffle_down(local_probability_sum, ushort(8u));
+        local_probability_sum += simd_shuffle_down(local_probability_sum, ushort(4u));
+        local_probability_sum += simd_shuffle_down(local_probability_sum, ushort(2u));
+        local_probability_sum += simd_shuffle_down(local_probability_sum, ushort(1u));
+        const float tile_probability_sum = simd_shuffle(local_probability_sum, leader_lane);
+        P_tg[softmax_row][probability_col0] = probability0;
+        P_tg[softmax_row][probability_col1] = probability1;
+
+        if (half_lane == 0u) {
+            running_max_tg[softmax_row] = new_max;
+            running_sum_tg[softmax_row] = running_sum_tg[softmax_row] * old_scale + tile_probability_sum;
+            alpha_tg[softmax_row] = old_scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 对旧的输出numerator进行online-softmax缩放。
+        const ushort2 output_offset = morton_order(ushort(lane));
+        const uint output_local_q = uint(output_offset.y);
+        const float output_old_scale = alpha_tg[output_local_q];
+        output_accumulator0 *= output_old_scale;
+        output_accumulator1 *= output_old_scale;
+        output_accumulator2 *= output_old_scale;
+        output_accumulator3 *= output_old_scale;
+
+        // P × V.  Load only the two V fragments consumed by this lane
+        // directly into registers.  This avoids a shared V tile and the
+        // cross-threadgroup overwrite race between successive key tiles.
+        for (uint d_base = 0u; d_base < D; d_base += kBD) {
+            const ushort2 v_offset = morton_order(ushort(lane));
+            const uint v_key = key_base + uint(v_offset.y);
+            const uint v_col0 = d_base + simd_id * kFrag + uint(v_offset.x);
+            const uint v_col1 = d_base + (simd_id + kSimdGroups) * kFrag + uint(v_offset.x);
+            float2 block_accumulator0;
+            float2 block_accumulator1;
+            if (d_base == 0u) {
+                block_accumulator0 = output_accumulator0;
+                block_accumulator1 = output_accumulator1;
+            } else {
+                block_accumulator0 = output_accumulator2;
+                block_accumulator1 = output_accumulator3;
+            }
+
+            constexpr uint kVSubtiles = kBK / kFrag;
+            float2 v_fragments0[kVSubtiles];
+            float2 v_fragments1[kVSubtiles];
+            #pragma unroll
+            for (uint sub = 0u; sub < kVSubtiles; ++sub) {
+                float2 v_fragment0 = float2(0.0f);
+                float2 v_fragment1 = float2(0.0f);
+                const uint key = v_key + sub * kFrag;
+                if (key < T && v_col0 + 1u < D) {
+                    const uint v_index = (bh * T + key) * D + v_col0;
+                    v_fragment0 = float2(*reinterpret_cast<device const packed_float2*>(v_cache + v_index));
+                } else if (key < T && v_col0 < D) {
+                    v_fragment0[0] = v_cache[(bh * T + key) * D + v_col0];
+                    if (v_col0 + 1u < D) v_fragment0[1] = v_cache[(bh * T + key) * D + v_col0 + 1u];
+                }
+                if (key < T && v_col1 + 1u < D) {
+                    const uint v_index = (bh * T + key) * D + v_col1;
+                    v_fragment1 = float2(*reinterpret_cast<device const packed_float2*>(v_cache + v_index));
+                } else if (key < T && v_col1 < D) {
+                    v_fragment1[0] = v_cache[(bh * T + key) * D + v_col1];
+                    if (v_col1 + 1u < D) v_fragment1[1] = v_cache[(bh * T + key) * D + v_col1 + 1u];
+                }
+                v_fragments0[sub] = v_fragment0;
+                v_fragments1[sub] = v_fragment1;
+            }
+            #pragma unroll
+            for (uint sub = 0u; sub < kVSubtiles; ++sub) {
+                const uint key_sub = sub * kFrag;
+                const float2 probability_fragment = lowreg_matrix::load_tg_8x8(reinterpret_cast<threadgroup const float*>(P_tg),
+                        kPStride, ushort2(ushort(0u), ushort(key_sub)), ushort(lane));
+                const float2 v_fragment0 = v_fragments0[sub];
+                const float2 v_fragment1 = v_fragments1[sub];
+                block_accumulator0 = lowreg_matrix::mma_8x8(probability_fragment, v_fragment0, block_accumulator0);
+                block_accumulator1 = lowreg_matrix::mma_8x8(probability_fragment, v_fragment1, block_accumulator1);
+            }
+            if (d_base == 0u) {
+                output_accumulator0 = block_accumulator0;
+                output_accumulator1 = block_accumulator1;
+            } else {
+                output_accumulator2 = block_accumulator0;
+                output_accumulator3 = block_accumulator1;
+            }
+        }
+
+        // P_tg is reused by the next key tile.  All SIMD groups must finish
+        // their current P×V reads before any group overwrites P_tg.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // 最终归一化并写入[B,T,C]
+    const ushort2 final_offset = morton_order(ushort(lane));
+    const uint final_local_q = uint(final_offset.y);
+    const uint final_query = query_base + final_local_q;
+    if (final_query < T) {
+        const float denominator = running_sum_tg[final_local_q];
+        const float inverse_sum = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+        const uint pair_offset = uint(final_offset.x);
+        if (write_lse != 0u && simd_id == 0u && pair_offset == 0u) {
+            lse_out[bh * T + final_query] = denominator > 0.0f ? running_max_tg[final_local_q] + log(denominator) : 0.0f;
+        }
+        const uint output_row_base = (b * T + final_query) * C + h * D;
+        const uint d00 = simd_id * kFrag + pair_offset;
+        if (d00 < D) {
+            out[output_row_base + d00] = output_accumulator0[0] * inverse_sum;
+        }
+        if (d00 + 1u < D) {
+            out[output_row_base + d00 + 1u] = output_accumulator0[1] * inverse_sum;
+        }
+        const uint d01 = (simd_id + kSimdGroups) * kFrag + pair_offset;
+        if (d01 < D) {
+            out[output_row_base + d01] = output_accumulator1[0] * inverse_sum;
+        }
+        if (d01 + 1u < D) {
+            out[output_row_base + d01 + 1u] = output_accumulator1[1] * inverse_sum;
+        }
+
+        const uint d10 = kBD + simd_id * kFrag + pair_offset;
+        if (d10 < D) {
+            out[output_row_base + d10] = output_accumulator2[0] * inverse_sum;
+        }
+        if (d10 + 1u < D) {
+            out[output_row_base + d10 + 1u] = output_accumulator2[1] * inverse_sum;
+        }
+        const uint d11 = kBD + (simd_id + kSimdGroups) * kFrag + pair_offset;
+        if (d11 < D) {
+            out[output_row_base + d11] = output_accumulator3[0] * inverse_sum;
+        }
+        if (d11 + 1u < D) {
+            out[output_row_base + d11 + 1u] = output_accumulator3[1] * inverse_sum;
+        }
+    }
+}
+
+template <uint kMaxD, uint kVectorsPerLane>
+METAL_FUNC static void fused_fa_from_qkv_blocked_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device float* out,
+    device float* lse_out,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint write_lse,
+    uint3 tg_pos,
+    uint lane
+) {
+    if (tg_pos.x != 0u || B == 0u || H == 0u ||
+        T == 0u || C == 0u || C % H != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    if (D == 0u || D > kMaxD) {
+        return;
+    }
+    const uint query = tg_pos.y;
+    const uint bh = tg_pos.z;
+    if (query >= T || bh >= B * H) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const bool is_causal = is_causal_int != 0u;
+    const float scale = rsqrt(float(D));
+    const uint cache_head_base = bh * T * D;
+    const uint q_base = cache_head_base + query * D;
+    const uint out_base = (b * T + query) * C + h * D;
+    const uint vector_count = D / 2u;
+    const uint vector_end = vector_count * 2u;
+    const bool tail_lane = (D & 1u) != 0u && lane == 0u;
+    thread float2 q_register[kVectorsPerLane];
+    thread float2 output_accumulator[kVectorsPerLane];
+    float q_tail = 0.0f;
+    float output_tail = 0.0f;
+
+    #pragma unroll
+    for (uint slot = 0u; slot < kVectorsPerLane; ++slot) {
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index * 2u;
+            q_register[slot] = float2(*reinterpret_cast<device const packed_float2*>(q_cache + q_base + d));
+        } else {
+            q_register[slot] = float2(0.0f);
+        }
+        output_accumulator[slot] = float2(0.0f);
+    }
+
+    if (tail_lane) {
+        q_tail = q_cache[q_base + vector_end];
+    }
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    const uint key_limit = is_causal ? min(T, query + 1u) : T;
+
+    for (uint key = 0u; key < key_limit; ++key) {
+        const uint key_base = cache_head_base + key * D;
+        float local_score = 0.0f;
+
+        #pragma unroll
+        for (uint slot = 0u; slot < kVectorsPerLane; ++slot) {
+            const uint vector_index = lane + slot * 32u;
+            if (vector_index < vector_count) {
+                const uint d = vector_index * 2u;
+                const float2 k_value = float2(*reinterpret_cast<device const packed_float2*>(k_cache + key_base + d));
+                local_score += dot(q_register[slot], k_value);
+            }
+        }
+
+        if (tail_lane) {
+            local_score += q_tail * k_cache[key_base + vector_end];
+        }
+
+        const float score = simd_sum(local_score) * scale;
+        const float new_max = max(running_max, score);
+        const float previous_scale = isfinite(running_max) ? exp(running_max - new_max) : 0.0f;
+        const float probability = exp(score - new_max);
+        running_sum = running_sum * previous_scale + probability;
+        #pragma unroll
+        for (uint slot = 0u; slot < kVectorsPerLane; ++slot) {
+            const uint vector_index = lane + slot * 32u;
+            if (vector_index < vector_count) {
+                const uint d = vector_index * 2u;
+                const float2 v_value = float2(*reinterpret_cast<device const packed_float2*>(v_cache + key_base + d));
+                output_accumulator[slot] = fma(v_value, float2(probability), output_accumulator[slot] * float2(previous_scale));
+            }
+        }
+
+        if (tail_lane) {
+            output_tail = fma(probability, v_cache[key_base + vector_end], output_tail * previous_scale);
+        }
+        running_max = new_max;
+    }
+
+    const float inverse_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+
+    #pragma unroll
+    for (uint slot = 0u; slot < kVectorsPerLane; ++slot) {
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index * 2u;
+            const float2 result = output_accumulator[slot] * float2(inverse_sum);
+            *reinterpret_cast<device packed_float2*>(out + out_base + d) = packed_float2(result);
+        }
+    }
+
+    if (tail_lane) {
+        out[out_base + vector_end] = output_tail * inverse_sum;
+    }
+    if (write_lse != 0u && lane == 0u) {
+        lse_out[bh * T + query] = running_sum > 0.0f ? running_max + log(running_sum) : 0.0f;
+    }
+}
+
+kernel void fused_fa_bwd_prepare(
+    device const float* o_btc        [[buffer(0)]],
+    device const float* do_btc       [[buffer(1)]],
+    device float* d_val              [[buffer(2)]],
+    constant uint& B                 [[buffer(3)]],
+    constant uint& H                 [[buffer(4)]],
+    constant uint& T                 [[buffer(5)]],
+    constant uint& C                 [[buffer(6)]],
+    uint3 tg_pos                     [[threadgroup_position_in_grid]],
+    uint lane                        [[thread_index_in_simdgroup]],
+    uint simd_id                     [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kQueriesPerTG = 4u;
+    constexpr uint kVectorWidth = 2u;
+    constexpr uint kMaxHeadDim = 512u;
+    constexpr uint kMaxVectorCount = kMaxHeadDim / kVectorWidth;
+    constexpr uint kMaxVectorsPerLane = (kMaxVectorCount + kSimdWidth - 1u) / kSimdWidth;
+
+    if (tg_pos.x != 0u || B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) {
+        return;
+    }
+
+    const uint query = tg_pos.y * kQueriesPerTG + simd_id;
+    const uint bh = tg_pos.z;
+    if (query >= T || bh >= B * H) {
+        return;
+    }
+
+    const uint D = C / H;
+    if (D == 0u || D > kMaxHeadDim) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint output_base = (b * T + query) * C + h * D;
+    const uint stats_index = bh * T + query;
+    const uint vector_count = D / kVectorWidth;
+    const uint vector_end = vector_count * kVectorWidth;
+    const bool tail_lane = (vector_end != D) && lane == 0u;
+
+    // D_i = dot(O_i, dO_i)
+    float local_di = 0.0f;
+    #pragma unroll
+    for (uint slot = 0u; slot < kMaxVectorsPerLane; ++slot) {
+        const uint vector_index = lane + slot * kSimdWidth;
+        if (vector_index < vector_count) {
+            const uint d = vector_index * kVectorWidth;
+            const float2 o_value = float2(*reinterpret_cast<device const packed_float2*>(o_btc + output_base + d));
+            const float2 do_value = float2(*reinterpret_cast<device const packed_float2*>(do_btc + output_base + d));
+            local_di += dot(o_value, do_value);
+        }
+    }
+
+    if (tail_lane) {
+        local_di += o_btc[output_base + vector_end] * do_btc[output_base + vector_end];
+    }
+
+    const float di = simd_sum(local_di);
+    if (lane == 0u) {
+        d_val[stats_index] = di;
+    }
+}
+
+template <uint kSimdGroups, uint kBQ, uint kBK, uint kDTile>
+METAL_FUNC static void fused_fa_bwd_dq_tiled64_unified_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device const float* dO,
+    device float* dQ,
+    device const float* lse,
+    device const float* d_val,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint3 thread_pos,
+    uint3 threads_per_tg,
+    uint lane,
+    uint sg,
+    uint simd_lane_count,
+    threadgroup float* Ks,
+    threadgroup float* Vs
+) {
+    constexpr uint kFrag = 8u;
+    constexpr uint kKVStride = kDTile + 4u;
+    constexpr uint kKSub = kBK / kFrag;
+    constexpr uint kDSub = kDTile / kFrag;
+    constexpr float kLog2E = 1.4426950408889634f;
+
+    const uint expected_threads = kSimdGroups * 32u;
+    if (threads_per_tg.x != expected_threads || threads_per_tg.y != 1u ||
+        threads_per_tg.z != 1u || simd_lane_count != 32u ||
+        B == 0u || H == 0u || T == 0u || C == 0u || C % H != 0u) {
+        return;
+    }
+
+    const uint D = C / H;
+    const uint bh = tg_pos.z;
+    if (D == 0u || D > 128u || bh >= B * H) {
+        return;
+    }
+
+    const uint d_chunks = (D + kDTile - 1u) / kDTile;
+    const uint output_chunk = tg_pos.x;
+    if (output_chunk >= d_chunks) {
+        return;
+    }
+
+    const uint query_block = tg_pos.y * kBQ;
+    if (query_block >= T) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint head_base = bh * T * D;
+    const uint stat_base = bh * T;
+    const bool is_causal = is_causal_int != 0u;
+    const uint key_limit = is_causal ? min(T, query_block + kBQ) : T;
+    const float scale = rsqrt(float(D));
+    const float scale_log2e = scale * kLog2E;
+    const uint query_frag_base = query_block + sg * kFrag;
+    const ushort2 frag_offset = morton_order(ushort(lane));
+
+    thread float2 dq_accum[kDSub];
+    #pragma unroll
+    for (uint i = 0u; i < kDSub; ++i) {
+        dq_accum[i] = float2(0.0f);
+    }
+
+    for (uint key_start = 0u; key_start < key_limit; key_start += kBK) {
+        thread float2 score_frag[kKSub];
+        thread float2 dp_frag[kKSub];
+        #pragma unroll
+        for (uint key_sub = 0u; key_sub < kKSub; ++key_sub) {
+            score_frag[key_sub] = float2(0.0f);
+            dp_frag[key_sub] = float2(0.0f);
+        }
+
+        // Visit every D tile exactly once, but schedule this threadgroup's
+        // output tile last.  That leaves its K tile resident for dS*K below.
+        for (uint pass = 0u; pass < d_chunks; ++pass) {
+            const uint d_chunk = pass + (pass >= output_chunk ? 1u : 0u);
+            const uint scheduled_chunk = pass + 1u == d_chunks
+                ? output_chunk : d_chunk;
+            const uint d_base = scheduled_chunk * kDTile;
+            const uint pair_count = kBK * (kDTile / 2u);
+
+            for (uint pair = thread_pos.x; pair < pair_count;
+                 pair += expected_threads) {
+                const uint local_key = pair / (kDTile / 2u);
+                const uint local_d = (pair - local_key * (kDTile / 2u)) << 1u;
+                const uint key = key_start + local_key;
+                const uint d = d_base + local_d;
+                float2 kv = float2(0.0f);
+                float2 vv = float2(0.0f);
+                if (key < key_limit && d + 1u < D) {
+                    const uint src = head_base + key * D + d;
+                    kv = float2(*reinterpret_cast<device const packed_float2*>(
+                        k_cache + src));
+                    vv = float2(*reinterpret_cast<device const packed_float2*>(
+                        v_cache + src));
+                } else if (key < key_limit && d < D) {
+                    const uint src = head_base + key * D + d;
+                    kv[0] = k_cache[src];
+                    vv[0] = v_cache[src];
+                }
+                *reinterpret_cast<threadgroup packed_float2*>(
+                    Ks + local_key * kKVStride + local_d) = packed_float2(kv);
+                *reinterpret_cast<threadgroup packed_float2*>(
+                    Vs + local_key * kKVStride + local_d) = packed_float2(vv);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint d_index = 0u; d_index < kDSub; ++d_index) {
+                const uint global_d = d_base + d_index * kFrag;
+                const uint q_row = query_frag_base + uint(frag_offset.y);
+                const uint q_col = global_d + uint(frag_offset.x);
+                float2 q_frag = float2(0.0f);
+                float2 do_frag = float2(0.0f);
+                if (q_row < T && q_col + 1u < D) {
+                    q_frag = float2(*reinterpret_cast<device const packed_float2*>(
+                        q_cache + head_base + q_row * D + q_col));
+                    do_frag = float2(*reinterpret_cast<device const packed_float2*>(
+                        dO + (b * T + q_row) * C + h * D + q_col));
+                } else if (q_row < T && q_col < D) {
+                    q_frag[0] = q_cache[head_base + q_row * D + q_col];
+                    do_frag[0] = dO[(b * T + q_row) * C + h * D + q_col];
+                }
+
+                #pragma unroll
+                for (uint key_sub = 0u; key_sub < kKSub; ++key_sub) {
+                    const ushort2 origin = ushort2(
+                        ushort(d_index * kFrag), ushort(key_sub * kFrag));
+                    const float2 k_transposed = lowreg_matrix::load_tg_8x8(
+                        Ks, kKVStride, origin, ushort(lane), true);
+                    const float2 v_transposed = lowreg_matrix::load_tg_8x8(
+                        Vs, kKVStride, origin, ushort(lane), true);
+                    score_frag[key_sub] = lowreg_matrix::mma_8x8(
+                        q_frag, k_transposed, score_frag[key_sub]);
+                    dp_frag[key_sub] = lowreg_matrix::mma_8x8(
+                        do_frag, v_transposed, dp_frag[key_sub]);
+                }
+            }
+
+            // All SIMD groups must finish reading this tile before another
+            // pass overwrites it.  No barrier is needed after the last pass:
+            // that tile is intentionally retained for the output MMA.
+            if (pass + 1u < d_chunks) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        const uint query = query_frag_base + uint(frag_offset.y);
+        const bool query_valid = query < T;
+        const float row_lse_log2 = query_valid
+            ? lse[stat_base + query] * kLog2E : 0.0f;
+        const float row_d = query_valid ? d_val[stat_base + query] : 0.0f;
+
+        #pragma unroll
+        for (uint key_sub = 0u; key_sub < kKSub; ++key_sub) {
+            const uint key0 = key_start + key_sub * kFrag + uint(frag_offset.x);
+            const uint key1 = key0 + 1u;
+            const bool valid0 = query_valid && key0 < key_limit &&
+                (!is_causal || key0 <= query);
+            const bool valid1 = query_valid && key1 < key_limit &&
+                (!is_causal || key1 <= query);
+            const float p0 = valid0
+                ? exp2(score_frag[key_sub][0] * scale_log2e - row_lse_log2)
+                : 0.0f;
+            const float p1 = valid1
+                ? exp2(score_frag[key_sub][1] * scale_log2e - row_lse_log2)
+                : 0.0f;
+            score_frag[key_sub] = float2(
+                scale * p0 * (dp_frag[key_sub][0] - row_d),
+                scale * p1 * (dp_frag[key_sub][1] - row_d));
+        }
+
+        #pragma unroll
+        for (uint d_index = 0u; d_index < kDSub; ++d_index) {
+            #pragma unroll
+            for (uint key_sub = 0u; key_sub < kKSub; ++key_sub) {
+                const ushort2 origin = ushort2(
+                    ushort(key_sub * kFrag), ushort(d_index * kFrag));
+                const float2 k_frag = lowreg_matrix::load_tg_8x8(
+                    Ks, kKVStride, origin, ushort(lane));
+                dq_accum[d_index] = lowreg_matrix::mma_8x8(
+                    score_frag[key_sub], k_frag, dq_accum[d_index]);
+            }
+        }
+
+        if (key_start + kBK < key_limit) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const uint query = query_frag_base + uint(frag_offset.y);
+    if (query < T) {
+        #pragma unroll
+        for (uint d_index = 0u; d_index < kDSub; ++d_index) {
+            const uint d_col = output_chunk * kDTile + d_index * kFrag
+                + uint(frag_offset.x);
+            if (d_col >= D) {
+                continue;
+            }
+            const uint out_base = (b * T + query) * C + h * D + d_col;
+            if (d_col + 1u < D) {
+                *reinterpret_cast<device packed_float2*>(dQ + out_base) =
+                    packed_float2(dq_accum[d_index]);
+            } else {
+                dQ[out_base] = dq_accum[d_index][0];
+            }
+        }
+    }
+}
+
+#define DECLARE_FA_DQ_UNIFIED_COMPAT_KERNEL(NAME)                              \
+kernel void NAME(                                                              \
+    device const float* q [[buffer(0)]],                                       \
+    device const float* k [[buffer(1)]],                                       \
+    device const float* v [[buffer(2)]],                                       \
+    device const float* dO [[buffer(3)]],                                      \
+    device float* dQ [[buffer(4)]],                                            \
+    device const float* lse [[buffer(5)]],                                     \
+    device const float* d_val [[buffer(6)]],                                   \
+    constant uint& B [[buffer(7)]],                                            \
+    constant uint& H [[buffer(8)]],                                            \
+    constant uint& T [[buffer(9)]],                                            \
+    constant uint& C [[buffer(10)]],                                           \
+    constant uint& causal [[buffer(11)]],                                      \
+    uint3 tg_pos [[threadgroup_position_in_grid]],                             \
+    uint3 thread_pos [[thread_position_in_threadgroup]],                       \
+    uint3 threads_per_tg [[threads_per_threadgroup]],                          \
+    uint lane [[thread_index_in_simdgroup]],                                   \
+    uint sg [[simdgroup_index_in_threadgroup]],                                \
+    uint simd_lane_count [[threads_per_simdgroup]]) {                          \
+    constexpr uint kKVStride = 68u;                                            \
+    threadgroup float Ks[32u * kKVStride];                                     \
+    threadgroup float Vs[32u * kKVStride];                                     \
+    fused_fa_bwd_dq_tiled64_unified_impl<4u, 32u, 32u, 64u>(                  \
+        q, k, v, dO, dQ, lse, d_val, B, H, T, C, causal,                      \
+        tg_pos, thread_pos, threads_per_tg, lane, sg, simd_lane_count,         \
+        Ks, Vs);                                                               \
+}
+
+// Compatibility names are intentionally preserved for the supported range.
+// Both aliases call the same implementation; D>128 is rejected above.
+DECLARE_FA_DQ_UNIFIED_COMPAT_KERNEL(fused_fa_bwd_dq_block64)
+DECLARE_FA_DQ_UNIFIED_COMPAT_KERNEL(fused_fa_bwd_dq_block128)
+
+#undef DECLARE_FA_DQ_UNIFIED_COMPAT_KERNEL
+
+template <uint kMaxD, uint kSlots>
+METAL_FUNC static void fused_fa_bwd_dkv_large_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device const float* dO,
+    device float* dK,
+    device float* dV,
+    device const float* lse,
+    device const float* d_val,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint lane
+) {
+    if (tg_pos.x != 0u || B == 0u || H == 0u ||
+        T == 0u || C == 0u || C % H != 0u) {
+        return;
+    }
+
+    const uint D = C / H;
+    if (D == 0u || D > kMaxD) {
+        return;
+    }
+
+    const uint key = tg_pos.y;
+    const uint bh = tg_pos.z;
+    if (key >= T || bh >= B * H) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint cache_head_base = bh * T * D;
+    const uint kv_base = cache_head_base + key * D;
+    const uint output_base = (b * T + key) * C + h * D;
+    const bool is_causal = is_causal_int != 0u;
+    const uint query_begin = is_causal ? key : 0u;
+    const float scale = rsqrt(float(D));
+
+    thread float dk_accum[kSlots];
+    thread float dv_accum[kSlots];
+
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        dk_accum[slot] = 0.0f;
+        dv_accum[slot] = 0.0f;
+    }
+
+    for (uint query = query_begin; query < T; ++query) {
+        const uint q_base = cache_head_base + query * D;
+        const uint do_base = (b * T + query) * C + h * D;
+        const uint stat_index = bh * T + query;
+
+        float local_score = 0.0f;
+        float local_dp = 0.0f;
+
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            const uint d = lane + slot * 32u;
+            if (d < D) {
+                local_score = fma(
+                    q_cache[q_base + d],
+                    k_cache[kv_base + d],
+                    local_score
+                );
+                local_dp = fma(
+                    dO[do_base + d],
+                    v_cache[kv_base + d],
+                    local_dp
+                );
+            }
+        }
+
+        const float score = simd_sum(local_score) * scale;
+        const float dp = simd_sum(local_dp);
+        const float probability = exp(score - lse[stat_index]);
+        const float ds =
+            scale * probability * (dp - d_val[stat_index]);
+
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            const uint d = lane + slot * 32u;
+            if (d < D) {
+                dk_accum[slot] = fma(
+                    ds,
+                    q_cache[q_base + d],
+                    dk_accum[slot]
+                );
+                dv_accum[slot] = fma(
+                    probability,
+                    dO[do_base + d],
+                    dv_accum[slot]
+                );
+            }
+        }
+    }
+
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        const uint d = lane + slot * 32u;
+        if (d < D) {
+            dK[output_base + d] = dk_accum[slot];
+            dV[output_base + d] = dv_accum[slot];
+        }
+    }
+}
+
+template <uint kSlots, uint kMaxD>
+METAL_FUNC static void fused_fa_bwd_dkv_packed_even_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device const float* dO,
+    device float* dK,
+    device float* dV,
+    device const float* lse,
+    device const float* d_val,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint lane
+) {
+    if (tg_pos.x != 0u || B == 0u || H == 0u || T == 0u ||
+        C == 0u || C % H != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    const uint key = tg_pos.y;
+    const uint bh = tg_pos.z;
+    if (D == 0u || D > kMaxD || (D & 1u) != 0u || key >= T || bh >= B * H) {
+        return;
+    }
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint head_base = bh * T * D;
+    const uint kv_base = head_base + key * D;
+    const uint out_base = (b * T + key) * C + h * D;
+    const uint vector_count = D >> 1u;
+    const uint query_begin = is_causal_int != 0u ? key : 0u;
+    const float scale = rsqrt(float(D));
+
+    thread float2 kv[kSlots];
+    thread float2 vv[kSlots];
+    thread float2 dkv[kSlots];
+    thread float2 dvv[kSlots];
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        kv[slot] = float2(0.0f);
+        vv[slot] = float2(0.0f);
+        dkv[slot] = float2(0.0f);
+        dvv[slot] = float2(0.0f);
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index << 1u;
+            kv[slot] = float2(*reinterpret_cast<device const packed_float2*>(k_cache + kv_base + d));
+            vv[slot] = float2(*reinterpret_cast<device const packed_float2*>(v_cache + kv_base + d));
+        }
+    }
+    for (uint query = query_begin; query < T; ++query) {
+        const uint q_base = head_base + query * D;
+        const uint do_base = (b * T + query) * C + h * D;
+        float local_score = 0.0f;
+        float local_dp = 0.0f;
+        thread float2 qv[kSlots];
+        thread float2 dov[kSlots];
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            qv[slot] = float2(0.0f);
+            dov[slot] = float2(0.0f);
+            const uint vector_index = lane + slot * 32u;
+            if (vector_index < vector_count) {
+                const uint d = vector_index << 1u;
+                qv[slot] = float2(*reinterpret_cast<device const packed_float2*>(q_cache + q_base + d));
+                dov[slot] = float2(*reinterpret_cast<device const packed_float2*>(dO + do_base + d));
+                local_score += dot(qv[slot], kv[slot]);
+                local_dp += dot(dov[slot], vv[slot]);
+            }
+        }
+        const float score = simd_sum(local_score) * scale;
+        const float dp = simd_sum(local_dp);
+        const uint stat_index = bh * T + query;
+        const float probability = exp(score - lse[stat_index]);
+        const float ds = scale * probability * (dp - d_val[stat_index]);
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            dkv[slot] = fma(float2(ds), qv[slot], dkv[slot]);
+            dvv[slot] = fma(float2(probability), dov[slot], dvv[slot]);
+        }
+    }
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index << 1u;
+            *reinterpret_cast<device packed_float2*>(dK + out_base + d) = packed_float2(dkv[slot]);
+            *reinterpret_cast<device packed_float2*>(dV + out_base + d) = packed_float2(dvv[slot]);
+        }
+    }
+}
+
+template <uint kSlots, uint kMaxD>
+METAL_FUNC static void fused_fa_bwd_dkv_packed_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device const float* dO,
+    device float* dK,
+    device float* dV,
+    device const float* lse,
+    device const float* d_val,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint lane
+) {
+    if (tg_pos.x != 0u || B == 0u || H == 0u || T == 0u ||
+        C == 0u || C % H != 0u) {
+        return;
+    }
+
+    const uint D = C / H;
+    const uint key = tg_pos.y;
+    const uint bh = tg_pos.z;
+    if (D == 0u || D > kMaxD || key >= T || bh >= B * H) {
+        return;
+    }
+    if ((D & 1u) == 0u) {
+        fused_fa_bwd_dkv_packed_even_impl<kSlots, kMaxD>(
+            q_cache, k_cache, v_cache, dO, dK, dV, lse, d_val,
+            B, H, T, C, is_causal_int, tg_pos, lane);
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint head_base = bh * T * D;
+    const uint kv_base = head_base + key * D;
+    const uint out_base = (b * T + key) * C + h * D;
+    const uint vector_count = D >> 1u;
+    const uint vector_end = vector_count << 1u;
+    const bool tail_lane = vector_end != D && lane == 0u;
+    const uint query_begin = is_causal_int != 0u ? key : 0u;
+    const float scale = rsqrt(float(D));
+
+    thread float2 kv[kSlots];
+    thread float2 vv[kSlots];
+    thread float2 dkv[kSlots];
+    thread float2 dvv[kSlots];
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        kv[slot] = float2(0.0f);
+        vv[slot] = float2(0.0f);
+        dkv[slot] = float2(0.0f);
+        dvv[slot] = float2(0.0f);
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index << 1u;
+            kv[slot] = float2(*reinterpret_cast<device const packed_float2*>(k_cache + kv_base + d));
+            vv[slot] = float2(*reinterpret_cast<device const packed_float2*>(v_cache + kv_base + d));
+        }
+    }
+    const float k_tail = tail_lane ? k_cache[kv_base + vector_end] : 0.0f;
+    const float v_tail = tail_lane ? v_cache[kv_base + vector_end] : 0.0f;
+    float dk_tail = 0.0f;
+    float dv_tail = 0.0f;
+
+    for (uint query = query_begin; query < T; ++query) {
+        const uint q_base = head_base + query * D;
+        const uint do_base = (b * T + query) * C + h * D;
+        float local_score = 0.0f;
+        float local_dp = 0.0f;
+        thread float2 qv[kSlots];
+        thread float2 dov[kSlots];
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            qv[slot] = float2(0.0f);
+            dov[slot] = float2(0.0f);
+            const uint vector_index = lane + slot * 32u;
+            if (vector_index < vector_count) {
+                const uint d = vector_index << 1u;
+                qv[slot] = float2(*reinterpret_cast<device const packed_float2*>(q_cache + q_base + d));
+                dov[slot] = float2(*reinterpret_cast<device const packed_float2*>(dO + do_base + d));
+                local_score += dot(qv[slot], kv[slot]);
+                local_dp += dot(dov[slot], vv[slot]);
+            }
+        }
+        float q_tail = 0.0f;
+        float do_tail = 0.0f;
+        if (tail_lane) {
+            q_tail = q_cache[q_base + vector_end];
+            do_tail = dO[do_base + vector_end];
+            local_score = fma(q_tail, k_tail, local_score);
+            local_dp = fma(do_tail, v_tail, local_dp);
+        }
+        const float score = simd_sum(local_score) * scale;
+        const float dp = simd_sum(local_dp);
+        const uint stat_index = bh * T + query;
+        const float probability = exp(score - lse[stat_index]);
+        const float ds = scale * probability * (dp - d_val[stat_index]);
+        #pragma unroll
+        for (uint slot = 0u; slot < kSlots; ++slot) {
+            dkv[slot] = fma(float2(ds), qv[slot], dkv[slot]);
+            dvv[slot] = fma(float2(probability), dov[slot], dvv[slot]);
+        }
+        if (tail_lane) {
+            dk_tail = fma(ds, q_tail, dk_tail);
+            dv_tail = fma(probability, do_tail, dv_tail);
+        }
+    }
+
+    #pragma unroll
+    for (uint slot = 0u; slot < kSlots; ++slot) {
+        const uint vector_index = lane + slot * 32u;
+        if (vector_index < vector_count) {
+            const uint d = vector_index << 1u;
+            *reinterpret_cast<device packed_float2*>(dK + out_base + d) = packed_float2(dkv[slot]);
+            *reinterpret_cast<device packed_float2*>(dV + out_base + d) = packed_float2(dvv[slot]);
+        }
+    }
+    if (tail_lane) {
+        dK[out_base + vector_end] = dk_tail;
+        dV[out_base + vector_end] = dv_tail;
+    }
+}
+
+kernel void fused_fa_bwd_dkv_block128(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device const float* dO [[buffer(3)]],
+    device float* dK [[buffer(4)]],
+    device float* dV [[buffer(5)]],
+    device const float* lse [[buffer(6)]],
+    device const float* d_val [[buffer(7)]],
+    constant uint& B [[buffer(8)]],
+    constant uint& H [[buffer(9)]],
+    constant uint& T [[buffer(10)]],
+    constant uint& C [[buffer(11)]],
+    constant uint& causal [[buffer(12)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    fused_fa_bwd_dkv_packed_impl<2u, 128u>(
+        q, k, v, dO, dK, dV, lse, d_val,
+        B, H, T, C, causal, tg_pos, lane);
+}
+
+// load_device_8x8_pair 假设行列共用一个 extent，[T][D] 的 K/V cache 需要分离的边界。
+METAL_FUNC static float2 load_device_frag_8x8(
+    device const float* src,
+    uint row_stride,
+    uint row_base,
+    uint col_base,
+    uint row_extent,
+    uint col_extent,
+    ushort lane
+) {
+    const ushort2 offset = morton_order(lane);
+    const uint row = row_base + uint(offset.y);
+    const uint col = col_base + uint(offset.x);
+    if (row >= row_extent || col >= col_extent) {
+        return float2(0.0f);
+    }
+    if (col + 1u < col_extent) {
+        return float2(
+            *reinterpret_cast<device const packed_float2*>(
+                src + row * row_stride + col
+            )
+        );
+    }
+    return float2(src[row * row_stride + col], 0.0f);
+}
+
+kernel void fused_fa_bwd_dkv_mma64(
+    device const float* q_cache      [[buffer(0)]],
+    device const float* k_cache      [[buffer(1)]],
+    device const float* v_cache      [[buffer(2)]],
+    device const float* dO           [[buffer(3)]],
+    device float* dK                 [[buffer(4)]],
+    device float* dV                 [[buffer(5)]],
+    device const float* lse          [[buffer(6)]],
+    device const float* d_val        [[buffer(7)]],
+    constant uint& B                 [[buffer(8)]],
+    constant uint& H                 [[buffer(9)]],
+    constant uint& T                 [[buffer(10)]],
+    constant uint& C                 [[buffer(11)]],
+    constant uint& is_causal_int     [[buffer(12)]],
+    uint3 tg_pos                     [[threadgroup_position_in_grid]],
+    uint3 thread_pos                 [[thread_position_in_threadgroup]],
+    uint3 threads_per_tg             [[threads_per_threadgroup]],
+    uint lane                        [[thread_index_in_simdgroup]],
+    uint sg                          [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_count             [[threads_per_simdgroup]]
+) {
+    constexpr uint kFrag = 8u;
+    constexpr uint kSimdGroups = 4u;
+    constexpr uint kThreads = kSimdGroups * 32u;
+    constexpr uint kBK = kSimdGroups * kFrag;
+    constexpr uint kBQ = 16u;
+    constexpr uint kQSub = kBQ / kFrag;
+    constexpr uint kMaxD = 64u;
+    constexpr uint kDSub = kMaxD / kFrag;
+    constexpr uint kQStride = kMaxD + 4u;
+    // 输出的 d 方向按 grid.x 切成 kDChunks 份，每份自己重算一遍 S/dP。
+    // kDChunks=1 表示不切分，但 d_out_base 仍然要走 tg_pos.x 算出来：这个偏移
+    // 是性能承重的，不要把它常量折叠成 0。编译器一旦知道它恒为 0，就会把
+    // dK/dV 循环里 8 组 threadgroup 载入聚簇到一起预取，多出的 16 个同时活跃
+    // 的值刚好把寄存器推过上面那道悬崖，实测从 18.6ms 掉到 30.7ms。
+    // 复测方法见 /tmp/fa_exp/bench_dkv.py（对 float64 numpy 参考验数 + 轮转交错
+    // 计时），若哪天升级 Xcode 后这里变慢，先查是不是这个偏移被折叠了。
+    constexpr uint kDChunks = 1u;
+    constexpr uint kDOutSub = (kDSub + kDChunks - 1u) / kDChunks;
+
+    threadgroup float Qs[kBQ * kQStride];
+    threadgroup float dOs[kBQ * kQStride];
+    threadgroup float lse_tile[kBQ];
+    threadgroup float dval_tile[kBQ];
+
+    // 所有线程必须根据统一条件退出，避免barrier死锁。
+    if (threads_per_tg.x != kThreads || threads_per_tg.y != 1u ||
+        threads_per_tg.z != 1u || simd_lane_count != 32u ||
+        tg_pos.x >= kDChunks ||
+        B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    if (D == 0u || D > kMaxD) {
+        return;
+    }
+    const uint bh = tg_pos.z;
+    const uint key_block = tg_pos.y * kBK;
+    if (bh >= B * H || key_block >= T) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint head_base = bh * T * D;
+    const uint stat_base = bh * T;
+    const bool is_causal = is_causal_int != 0u;
+    const float scale = rsqrt(float(D));
+    const float scale_log2e = scale * 1.4426950408889634f;
+    constexpr uint d_padded = kMaxD;
+    const uint key_frag_base = key_block + sg * kFrag;
+    const ushort2 frag_offset = morton_order(ushort(lane));
+    const uint key_row = key_frag_base + uint(frag_offset.y);
+    const uint d_out_base = tg_pos.x * kDOutSub;
+
+    // K/V 在整个内核生命周期内不变，常驻寄存器。
+    thread float2 k_frag[kDSub];
+    thread float2 v_frag[kDSub];
+    thread float2 dk_accum[kDOutSub];
+    thread float2 dv_accum[kDOutSub];
+
+    #pragma unroll
+    for (uint i = 0u; i < kDOutSub; ++i) {
+        dk_accum[i] = float2(0.0f);
+        dv_accum[i] = float2(0.0f);
+    }
+    #pragma unroll
+    for (uint d_index = 0u; d_index < kDSub; ++d_index) {
+        k_frag[d_index] = float2(0.0f);
+        v_frag[d_index] = float2(0.0f);
+        k_frag[d_index] = load_device_frag_8x8(k_cache + head_base, D,
+            key_frag_base, d_index * kFrag, T, D, ushort(lane));
+        v_frag[d_index] = load_device_frag_8x8(v_cache + head_base, D,
+            key_frag_base, d_index * kFrag, T, D, ushort(lane));
+    }
+
+    const uint query_begin = is_causal ? key_block : 0u;
+
+    uint q_start = query_begin;
+    uint q_tile_base = head_base + q_start * D;
+    uint do_tile_base = (b * T + q_start) * C + h * D;
+    uint stat_tile_base = stat_base + q_start;
+    for (; q_start < T; q_start += kBQ,
+         q_tile_base += kBQ * D,
+         do_tile_base += kBQ * C,
+         stat_tile_base += kBQ) {
+        // 上一轮的 tile 读取必须先完成才能覆盖。
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint local_q = sg; local_q < kBQ; local_q += kSimdGroups) {
+            const uint query = q_start + local_q;
+            const bool row_valid = query < T;
+            const uint q_row = q_tile_base + local_q * D;
+            const uint do_row = do_tile_base + local_q * C;
+            for (uint d = lane; d < d_padded; d += 32u) {
+                float q_value = 0.0f;
+                float do_value = 0.0f;
+                if (row_valid && d < D) {
+                    q_value = q_cache[q_row + d];
+                    do_value = dO[do_row + d];
+                }
+                Qs[local_q * kQStride + d] = q_value;
+                dOs[local_q * kQStride + d] = do_value;
+            }
+        }
+        if (thread_pos.x < kBQ) {
+            const uint query = q_start + thread_pos.x;
+            lse_tile[thread_pos.x] = query < T
+                ? lse[stat_tile_base + thread_pos.x] * 1.4426950408889634f
+                : 0.0f;
+            dval_tile[thread_pos.x] =
+                query < T ? d_val[stat_tile_base + thread_pos.x] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // S^T 与 dP^T：A 取常驻的 K/V，B 取转置读出的 Q^T/dO^T。
+        // d 在外层，一个 d 步里 kQSub 组 score/dp 互不依赖。
+        thread float2 score_frag[kQSub];
+        thread float2 dp_frag[kQSub];
+        #pragma unroll
+        for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+            score_frag[q_sub] = float2(0.0f);
+            dp_frag[q_sub] = float2(0.0f);
+        }
+        #pragma unroll
+        for (uint d_index = 0u; d_index < kDSub; ++d_index) {
+            #pragma unroll
+            for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+                const ushort2 origin = ushort2(
+                    ushort(d_index * kFrag), ushort(q_sub * kFrag));
+                const float2 q_transposed = lowreg_matrix::load_tg_8x8(
+                    Qs, kQStride, origin, ushort(lane), true);
+                const float2 do_transposed = lowreg_matrix::load_tg_8x8(
+                    dOs, kQStride, origin, ushort(lane), true);
+                score_frag[q_sub] = lowreg_matrix::mma_8x8(
+                    k_frag[d_index], q_transposed, score_frag[q_sub]);
+                dp_frag[q_sub] = lowreg_matrix::mma_8x8(
+                    v_frag[d_index], do_transposed, dp_frag[q_sub]);
+            }
+        }
+
+        #pragma unroll
+        for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+            // P = exp(S/sqrt(D) - LSE)，dS = P * (dP - D_i) / sqrt(D)。
+            // 无效列（越界或被 causal 屏蔽）直接置零，零值会自然传播到 dK/dV。
+            const uint q_local0 = q_sub * kFrag + uint(frag_offset.x);
+            const uint q_local1 = q_local0 + 1u;
+            const uint query0 = q_start + q_local0;
+            const uint query1 = q_start + q_local1;
+            const bool valid0 = query0 < T && (!is_causal || query0 >= key_row);
+            const bool valid1 = query1 < T && (!is_causal || query1 >= key_row);
+            const float lse0 = lse_tile[q_local0];
+            const float lse1 = lse_tile[q_local1];
+            const float dval0 = dval_tile[q_local0];
+            const float dval1 = dval_tile[q_local1];
+            const float p0 = valid0 ? exp2(score_frag[q_sub][0] * scale_log2e - lse0)
+                                    : 0.0f;
+            const float p1 = valid1 ? exp2(score_frag[q_sub][1] * scale_log2e - lse1)
+                                    : 0.0f;
+            const float2 prob_frag = float2(p0, p1);
+            const float2 dscore_frag = float2(
+                scale * p0 * (dp_frag[q_sub][0] - dval0),
+                scale * p1 * (dp_frag[q_sub][1] - dval1));
+
+            // dK/dV：A 取刚算出的 dS/P，B 取同一份 tile 的非转置读法。
+            // d 在内层，dk_accum[i]/dv_accum[i] 之间互不依赖。
+            #pragma unroll
+            for (uint i = 0u; i < kDOutSub; ++i) {
+                const uint d_index = d_out_base + i;
+                const ushort2 origin = ushort2(
+                    ushort(q_sub * kFrag), ushort(d_index * kFrag));
+                const float2 q_value = lowreg_matrix::load_tg_8x8(
+                    Qs, kQStride, origin, ushort(lane));
+                const float2 do_value = lowreg_matrix::load_tg_8x8(
+                    dOs, kQStride, origin, ushort(lane));
+                dk_accum[i] = lowreg_matrix::mma_8x8(
+                    dscore_frag, q_value, dk_accum[i]);
+                dv_accum[i] = lowreg_matrix::mma_8x8(
+                    prob_frag, do_value, dv_accum[i]);
+            }
+        }
+    }
+
+    // 每个 key 只属于一个 threadgroup，所以直接覆盖写。
+    if (key_row < T) {
+        #pragma unroll
+        for (uint i = 0u; i < kDOutSub; ++i) {
+            const uint d_index = d_out_base + i;
+            const uint d_col = d_index * kFrag + uint(frag_offset.x);
+            if (d_col >= D) {
+                continue;
+            }
+            const uint out_base = (b * T + key_row) * C + h * D + d_col;
+            if (d_col + 1u < D) {
+                *reinterpret_cast<device packed_float2*>(dK + out_base) =
+                    packed_float2(dk_accum[i]);
+                *reinterpret_cast<device packed_float2*>(dV + out_base) =
+                    packed_float2(dv_accum[i]);
+            } else {
+                dK[out_base] = dk_accum[i][0];
+                dV[out_base] = dv_accum[i][0];
+            }
+        }
+    }
+}
+
+template <uint kMaxD, uint kSimdGroups, uint kBQ, uint kDOutChunks>
+METAL_FUNC static void fused_fa_bwd_dkv_mma_tiled_impl(
+    device const float* q_cache,
+    device const float* k_cache,
+    device const float* v_cache,
+    device const float* dO,
+    device float* dK,
+    device float* dV,
+    device const float* lse,
+    device const float* d_val,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint3 thread_pos,
+    uint3 threads_per_tg,
+    uint lane,
+    uint sg,
+    uint simd_lane_count,
+    threadgroup float* Qs,
+    threadgroup float* dOs,
+    threadgroup float* lse_tile,
+    threadgroup float* dval_tile
+) {
+    constexpr uint kFrag = 8u;
+    constexpr uint kDTile = 64u;
+    constexpr uint kDSubPerTile = kDTile / kFrag;
+    constexpr uint kQSub = kBQ / kFrag;
+    constexpr uint kThreads = kSimdGroups * 32u;
+    constexpr uint kBK = kSimdGroups * kFrag;
+    constexpr uint kQStride = kDTile + 4u;
+    constexpr uint kMaxChunks = (kMaxD + kDTile - 1u) / kDTile;
+    constexpr uint kDOutSub = kDOutChunks * kDSubPerTile;
+    static_assert((kBQ % kFrag) == 0u, "kBQ must be a multiple of 8");
+    static_assert(kDOutChunks > 0u, "at least one output D tile is required");
+
+    if (threads_per_tg.x != kThreads || threads_per_tg.y != 1u ||
+        threads_per_tg.z != 1u || simd_lane_count != 32u ||
+        B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    if (D == 0u || D > kMaxD) {
+        return;
+    }
+    const uint d_chunks = (D + kDTile - 1u) / kDTile;
+    const uint output_chunk_base = tg_pos.x * kDOutChunks;
+    if (output_chunk_base >= d_chunks) {
+        return;
+    }
+
+    const uint bh = tg_pos.z;
+    const uint key_block = tg_pos.y * kBK;
+    if (bh >= B * H || key_block >= T) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const uint head_base = bh * T * D;
+    const uint stat_base = bh * T;
+    const bool is_causal = is_causal_int != 0u;
+    const float scale = rsqrt(float(D));
+    const float scale_log2e = scale * 1.4426950408889634f;
+    const uint key_frag_base = key_block + sg * kFrag;
+    const ushort2 frag_offset = morton_order(ushort(lane));
+    const uint key_row = key_frag_base + uint(frag_offset.y);
+
+    // Each float2 accumulator is one lane's portion of an 8x8 output fragment.
+    // kDOutChunks=1 consumes 32 floats/thread for dK+dV; =2 consumes 64.
+    thread float2 dk_accum[kDOutSub];
+    thread float2 dv_accum[kDOutSub];
+    #pragma unroll
+    for (uint i = 0u; i < kDOutSub; ++i) {
+        dk_accum[i] = float2(0.0f);
+        dv_accum[i] = float2(0.0f);
+    }
+
+    const uint query_begin = is_causal ? key_block : 0u;
+    uint q_start = query_begin;
+    uint q_tile_base = head_base + q_start * D;
+    uint do_tile_base = (b * T + q_start) * C + h * D;
+    uint stat_tile_base = stat_base + q_start;
+
+    for (; q_start < T; q_start += kBQ,
+         q_tile_base += kBQ * D,
+         do_tile_base += kBQ * C,
+         stat_tile_base += kBQ) {
+        // Protect the shared tile from the previous query iteration.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (thread_pos.x < kBQ) {
+            const uint query = q_start + thread_pos.x;
+            lse_tile[thread_pos.x] = query < T
+                ? lse[stat_tile_base + thread_pos.x] * 1.4426950408889634f
+                : 0.0f;
+            dval_tile[thread_pos.x] = query < T
+                ? d_val[stat_tile_base + thread_pos.x]
+                : 0.0f;
+        }
+
+        thread float2 score_frag[kQSub];
+        thread float2 dp_frag[kQSub];
+        #pragma unroll
+        for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+            score_frag[q_sub] = float2(0.0f);
+            dp_frag[q_sub] = float2(0.0f);
+        }
+
+        // Pass 1: stream all 64-column D tiles to form complete score and dP.
+        for (uint d_chunk = 0u; d_chunk < kMaxChunks; ++d_chunk) {
+            if (d_chunk >= d_chunks) {
+                break;
+            }
+            if (d_chunk != 0u) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            const uint d_base = d_chunk * kDTile;
+            for (uint local_q = sg; local_q < kBQ; local_q += kSimdGroups) {
+                const uint query = q_start + local_q;
+                const bool row_valid = query < T;
+                const uint q_row = q_tile_base + local_q * D;
+                const uint do_row = do_tile_base + local_q * C;
+                for (uint local_d = lane; local_d < kDTile; local_d += 32u) {
+                    const uint d = d_base + local_d;
+                    float q_value = 0.0f;
+                    float do_value = 0.0f;
+                    if (row_valid && d < D) {
+                        q_value = q_cache[q_row + d];
+                        do_value = dO[do_row + d];
+                    }
+                    Qs[local_q * kQStride + local_d] = q_value;
+                    dOs[local_q * kQStride + local_d] = do_value;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Stream one K/V fragment at a time.  Keeping all eight fragments
+            // live would add 32 floats/thread and reduce occupancy for out=2.
+            #pragma unroll
+            for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
+                const uint global_d = d_base + d_index * kFrag;
+                const float2 k_frag = load_device_frag_8x8(
+                    k_cache + head_base, D, key_frag_base, global_d,
+                    T, D, ushort(lane));
+                const float2 v_frag = load_device_frag_8x8(
+                    v_cache + head_base, D, key_frag_base, global_d,
+                    T, D, ushort(lane));
+                #pragma unroll
+                for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+                    const ushort2 origin = ushort2(
+                        ushort(d_index * kFrag), ushort(q_sub * kFrag));
+                    const float2 q_transposed = lowreg_matrix::load_tg_8x8(
+                        Qs, kQStride, origin, ushort(lane), true);
+                    const float2 do_transposed = lowreg_matrix::load_tg_8x8(
+                        dOs, kQStride, origin, ushort(lane), true);
+                    score_frag[q_sub] = lowreg_matrix::mma_8x8(
+                        k_frag, q_transposed, score_frag[q_sub]);
+                    dp_frag[q_sub] = lowreg_matrix::mma_8x8(
+                        v_frag, do_transposed, dp_frag[q_sub]);
+                }
+            }
+        }
+
+        // Reuse score/dP registers for P/dS so no additional fragment arrays
+        // become live alongside the output accumulators.
+        #pragma unroll
+        for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+            const uint q_local0 = q_sub * kFrag + uint(frag_offset.x);
+            const uint q_local1 = q_local0 + 1u;
+            const uint query0 = q_start + q_local0;
+            const uint query1 = q_start + q_local1;
+            const bool valid0 = query0 < T && (!is_causal || query0 >= key_row);
+            const bool valid1 = query1 < T && (!is_causal || query1 >= key_row);
+            const float p0 = valid0
+                ? exp2(score_frag[q_sub][0] * scale_log2e - lse_tile[q_local0])
+                : 0.0f;
+            const float p1 = valid1
+                ? exp2(score_frag[q_sub][1] * scale_log2e - lse_tile[q_local1])
+                : 0.0f;
+            const float dp0 = dp_frag[q_sub][0];
+            const float dp1 = dp_frag[q_sub][1];
+            score_frag[q_sub] = float2(p0, p1);
+            dp_frag[q_sub] = float2(
+                scale * p0 * (dp0 - dval_tile[q_local0]),
+                scale * p1 * (dp1 - dval_tile[q_local1]));
+        }
+
+        // Pass 2: reload only this threadgroup's output D tiles and accumulate.
+        #pragma unroll
+        for (uint out_chunk = 0u; out_chunk < kDOutChunks; ++out_chunk) {
+            const uint d_chunk = output_chunk_base + out_chunk;
+            if (d_chunk >= d_chunks) {
+                break;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint d_base = d_chunk * kDTile;
+            for (uint local_q = sg; local_q < kBQ; local_q += kSimdGroups) {
+                const uint query = q_start + local_q;
+                const bool row_valid = query < T;
+                const uint q_row = q_tile_base + local_q * D;
+                const uint do_row = do_tile_base + local_q * C;
+                for (uint local_d = lane; local_d < kDTile; local_d += 32u) {
+                    const uint d = d_base + local_d;
+                    float q_value = 0.0f;
+                    float do_value = 0.0f;
+                    if (row_valid && d < D) {
+                        q_value = q_cache[q_row + d];
+                        do_value = dO[do_row + d];
+                    }
+                    Qs[local_q * kQStride + local_d] = q_value;
+                    dOs[local_q * kQStride + local_d] = do_value;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
+                #pragma unroll
+                for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
+                    const ushort2 origin = ushort2(
+                        ushort(q_sub * kFrag), ushort(d_index * kFrag));
+                    const float2 q_value = lowreg_matrix::load_tg_8x8(
+                        Qs, kQStride, origin, ushort(lane));
+                    const float2 do_value = lowreg_matrix::load_tg_8x8(
+                        dOs, kQStride, origin, ushort(lane));
+                    const uint accum_index = out_chunk * kDSubPerTile + d_index;
+                    dk_accum[accum_index] = lowreg_matrix::mma_8x8(
+                        dp_frag[q_sub], q_value, dk_accum[accum_index]);
+                    dv_accum[accum_index] = lowreg_matrix::mma_8x8(
+                        score_frag[q_sub], do_value, dv_accum[accum_index]);
+                }
+            }
+        }
+    }
+
+    if (key_row < T) {
+        #pragma unroll
+        for (uint out_chunk = 0u; out_chunk < kDOutChunks; ++out_chunk) {
+            const uint d_chunk = output_chunk_base + out_chunk;
+            if (d_chunk >= d_chunks) {
+                break;
+            }
+            #pragma unroll
+            for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
+                const uint d_col = d_chunk * kDTile + d_index * kFrag
+                    + uint(frag_offset.x);
+                if (d_col >= D) {
+                    continue;
+                }
+                const uint accum_index = out_chunk * kDSubPerTile + d_index;
+                const uint out_base = (b * T + key_row) * C + h * D + d_col;
+                if (d_col + 1u < D) {
+                    *reinterpret_cast<device packed_float2*>(dK + out_base) =
+                        packed_float2(dk_accum[accum_index]);
+                    *reinterpret_cast<device packed_float2*>(dV + out_base) =
+                        packed_float2(dv_accum[accum_index]);
+                } else {
+                    dK[out_base] = dk_accum[accum_index][0];
+                    dV[out_base] = dv_accum[accum_index][0];
+                }
+            }
+        }
+    }
+}
+
+#define DECLARE_FA_DKV_MMA_TILED_KERNEL(NAME, MAX_D, SIMD_GROUPS, BQ, OUT_CHUNKS) \
+kernel void NAME(                                                               \
+    device const float* q [[buffer(0)]],                                        \
+    device const float* k [[buffer(1)]],                                        \
+    device const float* v [[buffer(2)]],                                        \
+    device const float* dO [[buffer(3)]],                                       \
+    device float* dK [[buffer(4)]],                                             \
+    device float* dV [[buffer(5)]],                                             \
+    device const float* lse [[buffer(6)]],                                      \
+    device const float* d_val [[buffer(7)]],                                    \
+    constant uint& B [[buffer(8)]],                                             \
+    constant uint& H [[buffer(9)]],                                             \
+    constant uint& T [[buffer(10)]],                                            \
+    constant uint& C [[buffer(11)]],                                            \
+    constant uint& causal [[buffer(12)]],                                       \
+    uint3 tg_pos [[threadgroup_position_in_grid]],                              \
+    uint3 thread_pos [[thread_position_in_threadgroup]],                        \
+    uint3 threads_per_tg [[threads_per_threadgroup]],                           \
+    uint lane [[thread_index_in_simdgroup]],                                    \
+    uint sg [[simdgroup_index_in_threadgroup]],                                 \
+    uint simd_lane_count [[threads_per_simdgroup]]) {                           \
+    constexpr uint kQStride = 68u;                                              \
+    threadgroup float Qs[(BQ) * kQStride];                                      \
+    threadgroup float dOs[(BQ) * kQStride];                                     \
+    threadgroup float lse_tile[(BQ)];                                           \
+    threadgroup float dval_tile[(BQ)];                                          \
+    fused_fa_bwd_dkv_mma_tiled_impl<MAX_D, SIMD_GROUPS, BQ, OUT_CHUNKS>(        \
+        q, k, v, dO, dK, dV, lse, d_val, B, H, T, C, causal,                   \
+        tg_pos, thread_pos, threads_per_tg, lane, sg, simd_lane_count,          \
+        Qs, dOs, lse_tile, dval_tile);                                          \
+}
+
+// Selected Apple M1 configurations.  D=128 only needs one output group;
+// D=256/512 select BQ and SIMD-group count from sequence length in backend.py.
+DECLARE_FA_DKV_MMA_TILED_KERNEL(fused_fa_bwd_dkv_mma128_q24_o2_sg4, 128u, 4u, 24u, 2u)
+
+#undef DECLARE_FA_DKV_MMA_TILED_KERNEL
+
+#define DECLARE_FA_DKV_LARGE_KERNEL(NAME, MAX_D, SLOTS)                  \
+kernel void NAME(                                                       \
+    device const float* q [[buffer(0)]],                                \
+    device const float* k [[buffer(1)]],                                \
+    device const float* v [[buffer(2)]],                                \
+    device const float* dO [[buffer(3)]],                               \
+    device float* dK [[buffer(4)]],                                     \
+    device float* dV [[buffer(5)]],                                     \
+    device const float* lse [[buffer(6)]],                              \
+    device const float* d_val [[buffer(7)]],                            \
+    constant uint& B [[buffer(8)]],                                     \
+    constant uint& H [[buffer(9)]],                                     \
+    constant uint& T [[buffer(10)]],                                    \
+    constant uint& C [[buffer(11)]],                                    \
+    constant uint& causal [[buffer(12)]],                               \
+    uint3 tg_pos [[threadgroup_position_in_grid]],                      \
+    uint lane [[thread_index_in_simdgroup]]) {                          \
+    fused_fa_bwd_dkv_large_impl<MAX_D, SLOTS>(                          \
+        q, k, v, dO, dK, dV, lse, d_val,                               \
+        B, H, T, C, causal, tg_pos, lane);                              \
+}
+
+#undef DECLARE_FA_DKV_LARGE_KERNEL
+
+kernel void fused_rms_recompute(
+    device const float* x          [[buffer(0)]],
+    device float* z                [[buffer(1)]],
+    device float* inv_rms_out      [[buffer(2)]],
+    constant uint& B               [[buffer(3)]],
+    constant uint& T               [[buffer(4)]],
+    constant uint& C               [[buffer(5)]],
+    constant uint& eps_bits        [[buffer(6)]],
+    uint3 tg_pos                   [[threadgroup_position_in_grid]],
+    uint lane                      [[thread_index_in_simdgroup]],
+    uint simd_id                   [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kTokensPerTG = 4u;
+    constexpr uint kVectorWidth = 4u;
+
+    if (tg_pos.x != 0u || C == 0u) {
+        return;
+    }
+
+    const uint token = tg_pos.y * kTokensPerTG + simd_id;
+    const uint token_count = B * T;
+
+    if (token >= token_count) {
+        return;
+    }
+
+    const float eps = as_type<float>(eps_bits);
+    const uint base = token * C;
+    const uint vector_count = C / kVectorWidth;
+    const uint vector_end = vector_count * kVectorWidth;
+    device const packed_float4* x4 = reinterpret_cast<device const packed_float4*>(x + base);
+
+    // Pass 1: sum(x^2)
+    float local_square_sum = 0.0f;
+    for (uint vector_index = lane; vector_index < vector_count; vector_index += kSimdWidth) {
+        const float4 value = float4(x4[vector_index]);
+        local_square_sum += dot(value, value);
+    }
+    for (uint c = vector_end + lane; c < C; c += kSimdWidth) {
+        const float value = x[base + c];
+        local_square_sum = fma(value, value, local_square_sum);
+    }
+
+    const float mean_square = simd_sum(local_square_sum) / float(C);
+    const float inv_rms = rsqrt(mean_square + eps);
+
+    if (lane == 0u) {
+        inv_rms_out[token] = inv_rms;
+    }
+
+    // Pass 2: z = x * inv_rms
+    device packed_float4* z4 = reinterpret_cast<device packed_float4*>(z + base);
+    for (uint vector_index = lane; vector_index < vector_count; vector_index += kSimdWidth) {
+        const float4 value = float4(x4[vector_index]);
+        z4[vector_index] = packed_float4(value * float4(inv_rms));
+    }
+
+    for (uint c = vector_end + lane; c < C; c += kSimdWidth) {
+        z[base + c] = x[base + c] * inv_rms;
+    }
+}
+
+kernel void mlp_backward_dx(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C_out [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kBM = 128u;
+    constexpr uint kBN = 64u;
+    constexpr uint kBK = 32u;
+    constexpr uint kThreads = 512u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kATileCols = kBK / kFrag;
+    constexpr uint kBTileCols = kBN / kFrag;
+    constexpr uint kTileElements = kFrag * kFrag;
+    constexpr uint kFloat4PerBK = kBK / 4u;
+
+    // 128 * 32 * 4 = 16 KiB
+    threadgroup float A_tg[kBM * kBK];
+    // 32 * 64 * 4 = 8 KiB
+    threadgroup float BT_tg[kBK * kBN];
+    const uint row_block = tg_pos.y * kBM;
+    const uint col_block = tg_pos.x * kBN;
+    // 每个simdgroup计算一个8x64输出子块。
+    const uint simd_row_base = simd_id * kFrag;
+
+    float2 acc0 = float2(0.0f);
+    float2 acc1 = float2(0.0f);
+    float2 acc2 = float2(0.0f);
+    float2 acc3 = float2(0.0f);
+    float2 acc4 = float2(0.0f);
+    float2 acc5 = float2(0.0f);
+    float2 acc6 = float2(0.0f);
+    float2 acc7 = float2(0.0f);
+
+    for (uint k_base = 0u; k_base < K; k_base += kBK) {
+        // --------------------------------------------------------
+        // A tile: [BM, BK]
+        // 写入8x8 tile-major布局，使后续simdgroup matrix加载连续。
+        // --------------------------------------------------------
+        constexpr uint kAFloat4Count = kBM * kFloat4PerBK;
+        for (uint idx = tid; idx < kAFloat4Count; idx += kThreads) {
+            const uint local_row = idx / kFloat4PerBK;
+            const uint local_k = (idx - local_row * kFloat4PerBK) * 4u;
+            const uint global_row = row_block + local_row;
+            const uint global_k = k_base + local_k;
+
+            float4 value = float4(0.0f);
+            if (global_row < M && global_k + 3u < K) {
+                value = float4(*reinterpret_cast<device const packed_float4*>(A + global_row * K + global_k));
+            } else if (global_row < M && global_k < K) {
+                #pragma unroll
+                for (uint component = 0u; component < 4u; ++component) {
+                    if (global_k + component < K) {
+                        value[component] = A[global_row * K + global_k + component];
+                    }
+                }
+            }
+
+            const uint tile_index = ((local_row / kFrag) * kATileCols + local_k / kFrag) * kTileElements;
+            const uint physical = tile_index + (local_row & 7u) * kFrag + (local_k & 7u);
+            *reinterpret_cast<threadgroup packed_float4*>(A_tg + physical) = packed_float4(value);
+        }
+
+        // --------------------------------------------------------
+        // B tile: B的全局布局为 [N, K]。内核逻辑上使用B^T，但不生成B的转置buffer。
+        // threadgroup内写为 [BK, BN] tile-major布局。
+        // --------------------------------------------------------
+        constexpr uint kBFloat4Count = kBN * kFloat4PerBK;
+        for (uint idx = tid; idx < kBFloat4Count; idx += kThreads) {
+            const uint local_col = idx / kFloat4PerBK;
+            const uint local_k = (idx - local_col * kFloat4PerBK) * 4u;
+            const uint global_col = col_block + local_col;
+            const uint global_k = k_base + local_k;
+
+            float4 value = float4(0.0f);
+            if (global_col < N && global_k + 3u < K) {
+                value = float4(*reinterpret_cast<device const packed_float4*>(B + global_col * K + global_k));
+            } else if (global_col < N && global_k < K) {
+                #pragma unroll
+                for (uint component = 0u; component < 4u; ++component) {
+                    if (global_k + component < K) {
+                        value[component] = B[global_col * K + global_k + component];
+                    }
+                }
+            }
+
+            #pragma unroll
+            for (uint component = 0u; component < 4u; ++component) {
+                const uint k = local_k + component;
+                const uint tile_index = ((k / kFrag) * kBTileCols + local_col / kFrag) * kTileElements;
+                const uint physical = tile_index + (k & 7u) * kFrag + (local_col & 7u);
+                BT_tg[physical] = value[component];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // --------------------------------------------------------
+        // 每个simdgroup计算8x64结果：1个A fragment 8个B fragments
+        // --------------------------------------------------------
+
+        #pragma unroll
+        for (uint k_tile = 0u; k_tile < kATileCols; ++k_tile) {
+            const float2 a = lowreg_matrix::load_tg_8x8(A_tg + (simd_id * kATileCols + k_tile) *
+                    kTileElements, kFrag, ushort2(0u), ushort(lane));
+            const uint b_base = k_tile * kBTileCols;
+            const float2 b0 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 0u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b1 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 1u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b2 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 2u) * kTileElements, 
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b3 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 3u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b4 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 4u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b5 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 5u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b6 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 6u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+            const float2 b7 = lowreg_matrix::load_tg_8x8(BT_tg + (b_base + 7u) * kTileElements,
+                    kFrag, ushort2(0u), ushort(lane));
+
+            acc0 = lowreg_matrix::mma_8x8(a, b0, acc0);
+            acc1 = lowreg_matrix::mma_8x8(a, b1, acc1);
+            acc2 = lowreg_matrix::mma_8x8(a, b2, acc2);
+            acc3 = lowreg_matrix::mma_8x8(a, b3, acc3);
+            acc4 = lowreg_matrix::mma_8x8(a, b4, acc4);
+            acc5 = lowreg_matrix::mma_8x8(a, b5, acc5);
+            acc6 = lowreg_matrix::mma_8x8(a, b6, acc6);
+            acc7 = lowreg_matrix::mma_8x8(a, b7, acc7);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ------------------------------------------------------------
+    // 写回 [M, N]
+    // ------------------------------------------------------------
+    const ushort2 offset = morton_order(ushort(lane));
+    const uint global_row = row_block + simd_row_base + uint(offset.y);
+    const uint local_col = uint(offset.x);
+
+    if (global_row < M) {
+        const float2 results[8] = {acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7};
+        #pragma unroll
+        for (uint fragment_idx = 0u; fragment_idx < 8u; ++fragment_idx) {
+            const uint global_col = col_block + local_col + fragment_idx * kFrag;
+            if (global_col < N) {
+                C_out[global_row * N + global_col] = results[fragment_idx][0];
+            }
+            if (global_col + 1u < N) {
+                C_out[global_row * N + global_col + 1u] = results[fragment_idx][1];
+            }
+        }
+    }
+}
+
+kernel void rope_qk_inplace(
+    device float* q           [[buffer(0)]],
+    device float* k           [[buffer(1)]],
+    device const float* cos   [[buffer(2)]],
+    device const float* sin   [[buffer(3)]],
+    constant uint& B          [[buffer(4)]],
+    constant uint& H          [[buffer(5)]],
+    constant uint& T          [[buffer(6)]],
+    constant uint& D          [[buffer(7)]],
+    constant uint& mode       [[buffer(8)]],
+    uint3 gid                 [[thread_position_in_grid]]
+) {
+    const uint j = gid.x;
+    const uint t = gid.y;
+    const uint bh = gid.z;
+    const uint half_D = D >> 1u;
+
+    if (
+        H == 0u ||
+        j >= half_D ||
+        t >= T ||
+        bh >= B * H
+    ) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+
+    const uint bhtd_base =
+        (bh * T + t) * D;
+
+    const uint bthd_base =
+        ((b * T + t) * H + h) * D;
+
+    // mode 0: Q/K 都是 BHTD
+    // mode 1: Q/K 都是 BTHD
+    // mode 2: Q 是 BTHD，K 是 BHTD
+    const uint q_base =
+        mode == 0u ? bhtd_base : bthd_base;
+
+    const uint k_base =
+        mode == 1u ? bthd_base : bhtd_base;
+
+    const uint q0_index = q_base + j;
+    const uint q1_index = q0_index + half_D;
+    const uint k0_index = k_base + j;
+    const uint k1_index = k0_index + half_D;
+
+    const uint rope_index = t * half_D + j;
+    const float c = cos[rope_index];
+
+    // mode 1 是 backward，使用 R^T，即 sin 取反。
+    const float s =
+        mode == 1u
+        ? -sin[rope_index]
+        : sin[rope_index];
+
+    const float q0 = q[q0_index];
+    const float q1 = q[q1_index];
+    const float k0 = k[k0_index];
+    const float k1 = k[k1_index];
+
+    q[q0_index] = fma(q0, c, q1 * s);
+    q[q1_index] = fma(-q0, s, q1 * c);
+
+    k[k0_index] = fma(k0, c, k1 * s);
+    k[k1_index] = fma(-k0, s, k1 * c);
+}
+
+kernel void fused_rmsnorm_bwd_dx(
+    device const float* x          [[buffer(0)]],
+    device const float* dY         [[buffer(1)]],
+    device const float* inv_rms_in [[buffer(2)]],
+    device float* dX               [[buffer(3)]],
+    constant uint& BT              [[buffer(4)]],
+    constant uint& C               [[buffer(5)]],
+    uint3 tg_pos                   [[threadgroup_position_in_grid]],
+    uint3 thread_pos               [[thread_position_in_threadgroup]]
+) {
+    constexpr uint kThreads = 32u;
+    const uint tid = thread_pos.x;
+    if (tid >= kThreads || tg_pos.x != 0u) {
+        return;
+    }
+
+    const uint row = tg_pos.y;
+    if (row >= BT || C == 0u) {
+        return;
+    }
+
+    const uint base = row * C;
+    const float inv_rms = inv_rms_in[row];
+    float local_dot = 0.0f;
+    for (uint c = tid; c < C; c += kThreads) {
+        const float x_hat = x[base + c] * inv_rms;
+        local_dot = fma(dY[base + c], x_hat, local_dot);
+    }
+
+    const float mean_dy_xhat = simd_sum(local_dot) / float(C);
+    for (uint c = tid; c < C; c += kThreads) {
+        const float x_hat = x[base + c] * inv_rms;
+        const float dx = inv_rms * (dY[base + c] - x_hat * mean_dy_xhat);
+        dX[base + c] += dx;
+    }
+}
+
+kernel void fused_qkv_bias_grad(
+    device const float* dQ           [[buffer(0)]],
+    device const float* dK           [[buffer(1)]],
+    device const float* dV           [[buffer(2)]],
+    device float* dbq                [[buffer(3)]],
+    device float* dbk                [[buffer(4)]],
+    device float* dbv                [[buffer(5)]],
+    constant uint& rows              [[buffer(6)]],  // BT
+    constant uint& C                 [[buffer(7)]],
+    constant uint& accumulate        [[buffer(8)]],
+    uint3 tg_pos     [[threadgroup_position_in_grid]],
+    uint3 thread_pos [[thread_position_in_threadgroup]]
+) {
+    constexpr uint kThreads = 128;
+    constexpr uint kChannelTile = 4;
+    const uint tid = thread_pos.x;
+    if (tid >= kThreads || tg_pos.x != 0) {
+        return;
+    }
+    if (rows == 0 || C == 0) {
+        return;
+    }
+    const uint c_base = tg_pos.y * kChannelTile;
+    if (c_base >= C) {
+        return;
+    }
+    const uint tile = min(kChannelTile, C - c_base);
+    // 每线程：对本 tile 的每个 channel 做 BT 跨步累加
+    // 同一 row 上连续读 dQ/dK/dV，提高缓存局部性
+    float sum_q[kChannelTile];
+    float sum_k[kChannelTile];
+    float sum_v[kChannelTile];
+    for (uint i = 0; i < kChannelTile; ++i) {
+        sum_q[i] = 0.0f;
+        sum_k[i] = 0.0f;
+        sum_v[i] = 0.0f;
+    }
+    for (uint row = tid; row < rows; row += kThreads) {
+        const uint base = row * C + c_base;
+        for (uint i = 0; i < tile; ++i) {
+            sum_q[i] += dQ[base + i];
+            sum_k[i] += dK[base + i];
+            sum_v[i] += dV[base + i];
+        }
+    }
+    // threadgroup tree reduction（按 channel 串行做 3 次，缓冲可复用）
+    threadgroup float reduce_buf[kThreads];
+    for (uint i = 0; i < tile; ++i) {
+        // ---- dbq ----
+        reduce_buf[tid] = sum_q[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = kThreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buf[tid] += reduce_buf[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0 && dbq) {
+            dbq[c_base + i] = accumulate ? dbq[c_base + i] + reduce_buf[0] : reduce_buf[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- dbk ----
+        reduce_buf[tid] = sum_k[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = kThreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buf[tid] += reduce_buf[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0 && dbk) {
+            dbk[c_base + i] = accumulate ? dbk[c_base + i] + reduce_buf[0] : reduce_buf[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // ---- dbv ----
+        reduce_buf[tid] = sum_v[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = kThreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                reduce_buf[tid] += reduce_buf[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0 && dbv) {
+            dbv[c_base + i] = accumulate ? dbv[c_base + i] + reduce_buf[0] : reduce_buf[0];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// 仅供 fused_ln_fa_project_kv 使用。
+// 前置条件：ptr 已包含 morton 偏移，且 8 字节对齐
+//（tile 基址 16 字节对齐 + stride 为偶数 + 列基址为偶数，三者由调用方保证）。
+// 语义与 lowreg_matrix::load_tg_8x8 的非转置路径完全一致：返回 (v[col], v[col+1])。
+METAL_FUNC static float2 tg_load_frag2(threadgroup const float* ptr) {
+    return *reinterpret_cast<threadgroup const float2*>(ptr);
+}
+
+kernel void fused_rms_fa_project_kv(
+    device const float* x           [[buffer(0)]],
+    device const float* wq          [[buffer(1)]],
+    device const float* bq          [[buffer(2)]],
+    device const float* wk          [[buffer(3)]],
+    device const float* bk          [[buffer(4)]],
+    device const float* wv          [[buffer(5)]],
+    device const float* bv          [[buffer(6)]],
+    device float* q_out             [[buffer(7)]],
+    device float* k_cache           [[buffer(8)]],
+    device float* v_cache           [[buffer(9)]],
+    constant uint& B                [[buffer(10)]],
+    constant uint& T                [[buffer(11)]],
+    constant uint& C                [[buffer(12)]],
+    constant uint& H                [[buffer(13)]],
+    constant uint& eps_bits         [[buffer(14)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint3 thread_pos                [[thread_position_in_threadgroup]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint simd_id                    [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kThreads = 512u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kBM = 32u;
+    constexpr uint kBN = 64u;
+    constexpr uint kBK = 16u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kXStride = 20u;
+    constexpr uint kWStride = 68u;
+    constexpr uint kRowsPerSimd = 2u;
+    constexpr uint kC4PerBK = kBK / 4u;
+    constexpr uint kN4PerTile = kBN / 4u;
+    constexpr uint kXFloat4Count = kBM * kC4PerBK;
+    constexpr uint kWFloat4Count = kBK * kN4PerTile;
+
+    threadgroup float X_tg[kBM][kXStride];
+    threadgroup float Wk_tg[kBK][kWStride];
+    threadgroup float Wv_tg[kBK][kWStride];
+    threadgroup float Wq_tg[kBK][kWStride];
+    threadgroup float inv_rms_tg[kBM];
+
+    const uint tid = thread_pos.x;
+
+    if (tid >= kThreads || tg_pos.x != 0u || tg_pos.z != 0u ||
+        B == 0u || T == 0u || C == 0u || H == 0u || (C & 3u) != 0u || (C % H) != 0u) {
+        return;
+    }
+
+    const uint token_count = B * T;
+    const uint D = C / H;
+    if (D == 0u) {
+        return;
+    }
+    const uint row_base = tg_pos.y * kBM;
+    if (row_base >= token_count) {
+        return;
+    }
+
+    const float eps = as_type<float>(eps_bits);
+    // LayerNorm statistics: one pass for sum and sum_sq.
+    const uint stats_local_row0 = simd_id * kRowsPerSimd;
+    const uint stats_local_row1 = stats_local_row0 + 1u;
+    const uint stats_global_row0 = row_base + stats_local_row0;
+    const uint stats_global_row1 = row_base + stats_local_row1;
+    const bool stats_row0_valid = stats_global_row0 < token_count;
+    const bool stats_row1_valid = stats_global_row1 < token_count;
+    const uint stats_x_base0 = stats_global_row0 * C;
+    const uint stats_x_base1 = stats_global_row1 * C;
+    float local_square_sum0 = 0.0f;
+    float local_square_sum1 = 0.0f;
+
+    if (stats_row0_valid) {
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float value = x[stats_x_base0 + c];
+            local_square_sum0 = fma(value, value, local_square_sum0);
+        }
+    }
+    if (stats_row1_valid) {
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float value = x[stats_x_base1 + c];
+            local_square_sum1 = fma(value, value, local_square_sum1);
+        }
+    }
+
+    const float inv_rms0 = stats_row0_valid ? rsqrt(simd_sum(local_square_sum0) / float(C) + eps) : 0.0f;
+    const float inv_rms1 = stats_row1_valid ? rsqrt(simd_sum(local_square_sum1) / float(C) + eps) : 0.0f;
+    if (lane == 0u) {
+        inv_rms_tg[stats_local_row0] = inv_rms0;
+        inv_rms_tg[stats_local_row1] = inv_rms1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Original 32x64 SIMD mapping.
+    const uint matrix_row_group = simd_id >> 2u;
+    const uint matrix_col_group = simd_id & 3u;
+    const uint simd_row_base = matrix_row_group * kFrag;
+    const uint simd_col_base = matrix_col_group * 16u;
+    const ushort2 frag = morton_order(ushort(lane));
+    threadgroup const float* const x_frag_base = reinterpret_cast<threadgroup const float*>(X_tg) 
+        + (simd_row_base + uint(frag.y)) * kXStride + uint(frag.x);
+    const uint w_frag_disp = uint(frag.y) * kWStride + simd_col_base + uint(frag.x);
+    threadgroup const float* const wk_frag_base = reinterpret_cast<threadgroup const float*>(Wk_tg) + w_frag_disp;
+    threadgroup const float* const wv_frag_base = reinterpret_cast<threadgroup const float*>(Wv_tg) + w_frag_disp;
+    threadgroup const float* const wq_frag_base = reinterpret_cast<threadgroup const float*>(Wq_tg) + w_frag_disp;
+
+    // Output remains outermost.
+    for (uint output_base = 0u; output_base < C; output_base += kBN) {
+        float2 q_accumulator0 = float2(0.0f);
+        float2 q_accumulator1 = float2(0.0f);
+        float2 k_accumulator0 = float2(0.0f);
+        float2 k_accumulator1 = float2(0.0f);
+        float2 v_accumulator0 = float2(0.0f);
+        float2 v_accumulator1 = float2(0.0f);
+
+        // BK=16 input tiles.
+        for (uint input_base = 0u; input_base < C; input_base += kBK) {
+            // X_norm: 32x16 = 128 packed_float4 values.
+            if (tid < kXFloat4Count) {
+                const uint local_row = tid / kC4PerBK;
+                const uint local_c4 = tid - local_row * kC4PerBK;
+                const uint global_row = row_base + local_row;
+                const uint global_c = input_base + local_c4 * 4u;
+                float4 normalized = float4(0.0f);
+
+                if (global_row < token_count && global_c < C) {
+                    const float4 x_value = float4(*reinterpret_cast<device const packed_float4*>(x + global_row * C + global_c));
+                    const float inv_rms = inv_rms_tg[local_row];
+                    normalized = x_value * float4(inv_rms);
+                }
+
+                const uint local_c = local_c4 * 4u;
+                *reinterpret_cast<threadgroup packed_float4*>(&X_tg[local_row][local_c]) = packed_float4(normalized);
+            }
+
+            // Wq/Wk/Wv: 16x64 = 256 packed_float4 values.
+            if (tid < kWFloat4Count) {
+                const uint local_k = tid / kN4PerTile;
+                const uint local_n4 = tid - local_k * kN4PerTile;
+                const uint global_k = input_base + local_k;
+                const uint global_output = output_base + local_n4 * 4u;
+                const uint local_output = local_n4 * 4u;
+                float4 wk_value = float4(0.0f);
+                float4 wv_value = float4(0.0f);
+                float4 wq_value = float4(0.0f);
+
+                if (global_k < C && global_output < C) {
+                    wk_value = float4(*reinterpret_cast<device const packed_float4*>(wk + global_k * C + global_output));
+                    wv_value = float4(*reinterpret_cast<device const packed_float4*>(wv + global_k * C + global_output));
+                    wq_value = float4(*reinterpret_cast<device const packed_float4*>(wq + global_k * C + global_output));
+                }
+                *reinterpret_cast<threadgroup packed_float4*>(&Wk_tg[local_k][local_output]) = packed_float4(wk_value);
+                *reinterpret_cast<threadgroup packed_float4*>(&Wv_tg[local_k][local_output]) = packed_float4(wv_value);
+                *reinterpret_cast<threadgroup packed_float4*>(&Wq_tg[local_k][local_output]) = packed_float4(wq_value);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Fused K/V/Q MMA.
+            #pragma unroll
+            for (uint k_sub = 0u; k_sub < kBK; k_sub += kFrag) {
+                const uint w_row_disp = k_sub * kWStride;
+                const float2 x_fragment  = tg_load_frag2(x_frag_base + k_sub);
+                const float2 wk_fragment0 = tg_load_frag2(wk_frag_base + w_row_disp);
+                const float2 wk_fragment1 = tg_load_frag2(wk_frag_base + w_row_disp + kFrag);
+                k_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wk_fragment0, k_accumulator0);
+                k_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wk_fragment1, k_accumulator1);
+
+                const float2 wv_fragment0 = tg_load_frag2(wv_frag_base + w_row_disp);
+                const float2 wv_fragment1 = tg_load_frag2(wv_frag_base + w_row_disp + kFrag);
+                v_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wv_fragment0, v_accumulator0);
+                v_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wv_fragment1, v_accumulator1);
+
+                const float2 wq_fragment0 = tg_load_frag2(wq_frag_base + w_row_disp);
+                const float2 wq_fragment1 = tg_load_frag2(wq_frag_base + w_row_disp + kFrag);
+                q_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wq_fragment0, q_accumulator0);
+                q_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wq_fragment1, q_accumulator1);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Original scalar Q/K/V epilogue.
+        const ushort2 matrix_offset = morton_order(ushort(lane));
+        const uint local_row = simd_row_base + uint(matrix_offset.y);
+        const uint global_row = row_base + local_row;
+
+        if (global_row < token_count) {
+            const uint b = global_row / T;
+            const uint t = global_row - b * T;
+
+            #pragma unroll
+            for (uint fragment_index = 0u; fragment_index < 2u; ++fragment_index) {
+                const float2 q_value = fragment_index == 0u ? q_accumulator0 : q_accumulator1;
+                const float2 k_value = fragment_index == 0u ? k_accumulator0 : k_accumulator1;
+                const float2 v_value = fragment_index == 0u ? v_accumulator0 : v_accumulator1;
+                const uint fragment_column = simd_col_base + uint(matrix_offset.x) + fragment_index * 8u;
+
+                #pragma unroll
+                for (uint component = 0u; component < 2u; ++component) {
+                    const uint output_channel = output_base + fragment_column + component;
+                    if (output_channel < C) {
+                        q_out[global_row * C + output_channel] = q_value[component] + bq[output_channel];
+                        const uint h = output_channel / D;
+                        const uint d = output_channel - h * D;
+                        const uint cache_index = ((b * H + h) * T + t) * D + d;
+
+                        k_cache[cache_index] = k_value[component] + bk[output_channel];
+                        v_cache[cache_index] = v_value[component] + bv[output_channel];
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <uint kDChunks>
+METAL_FUNC static void fa_br32_load_q(
+    device const float* q,
+    threadgroup float* Q_tg,
+    uint b,
+    uint h,
+    uint query_base,
+    uint T,
+    uint C,
+    uint D,
+    uint tid
+) {
+    constexpr uint kBQ = 32u;
+    constexpr uint kBD = 64u;
+    constexpr uint kQStride = 65u;
+    constexpr uint kVecPerRow = kBD / 4u;
+    constexpr uint kThreads = 256u;
+    constexpr uint kVectors = kDChunks * kBQ * kVecPerRow;
+
+    for (uint index = tid; index < kVectors; index += kThreads) {
+        const uint chunk = index / (kBQ * kVecPerRow);
+        const uint chunk_index = index - chunk * kBQ * kVecPerRow;
+        const uint local_q = chunk_index / kVecPerRow;
+        const uint vector_index = chunk_index - local_q * kVecPerRow;
+        const uint local_d = vector_index * 4u;
+        const uint global_d = chunk * kBD + local_d;
+        const uint query = query_base + local_q;
+        float4 value = float4(0.0f);
+
+        if (query < T && global_d < D) {
+            const uint src = (b * T + query) * C + h * D + global_d;
+            if (global_d + 3u < D) {
+                value = float4(*reinterpret_cast<device const packed_float4*>(q + src));
+            } else {
+                if (global_d < D) {
+                    value.x = q[src];
+                }
+                if (global_d + 1u < D) {
+                    value.y = q[src + 1u];
+                }
+                if (global_d + 2u < D) {
+                    value.z = q[src + 2u];
+                }
+            }
+        }
+        const uint dst = chunk * kBQ * kQStride + local_q * kQStride + local_d;
+        *reinterpret_cast<threadgroup packed_float4*>(Q_tg + dst) = packed_float4(value);
+    }
+}
+
+METAL_FUNC static void fa_br32_load_k_transposed(
+    device const float* k_cache,
+    threadgroup float* KV_tg,
+    uint head_base,
+    uint key_base,
+    uint valid_keys,
+    uint d_base,
+    uint D,
+    uint tid
+) {
+    constexpr uint kBK = 32u;
+    constexpr uint kBD = 64u;
+    constexpr uint kKStride = 33u;
+    constexpr uint kVecPerRow = kBD / 4u;
+    constexpr uint kVectors = kBK * kVecPerRow;
+    constexpr uint kThreads = 256u;
+
+    for (uint index = tid; index < kVectors; index += kThreads) {
+        const uint local_key = index / kVecPerRow;
+        const uint vector_index = index - local_key * kVecPerRow;
+        const uint local_d = vector_index * 4u;
+        const uint global_d = d_base + local_d;
+        float4 value = float4(0.0f);
+
+        if (local_key < valid_keys && global_d < D) {
+            const uint src = head_base + (key_base + local_key) * D + global_d;
+
+            if (global_d + 3u < D) {
+                value = float4(*reinterpret_cast<device const packed_float4*>(k_cache + src));
+            } else {
+                if (global_d < D) {
+                    value.x = k_cache[src];
+                }
+                if (global_d + 1u < D) {
+                    value.y = k_cache[src + 1u];
+                }
+                if (global_d + 2u < D) {
+                    value.z = k_cache[src + 2u];
+                }
+            }
+        }
+        // KV_tg is K^T: [64, 33].
+        KV_tg[(local_d + 0u) * kKStride + local_key] = value.x;
+        KV_tg[(local_d + 1u) * kKStride + local_key] = value.y;
+        KV_tg[(local_d + 2u) * kKStride + local_key] = value.z;
+        KV_tg[(local_d + 3u) * kKStride + local_key] = value.w;
+    }
+}
+
+METAL_FUNC static void fa_br32_load_v_row_major(
+    device const float* v_cache,
+    threadgroup float* KV_tg,
+    uint head_base,
+    uint key_base,
+    uint valid_keys,
+    uint d_base,
+    uint D,
+    uint tid
+) {
+    constexpr uint kBK = 32u;
+    constexpr uint kBD = 64u;
+    constexpr uint kVStride = 65u;
+    constexpr uint kVecPerRow = kBD / 4u;
+    constexpr uint kVectors = kBK * kVecPerRow;
+    constexpr uint kThreads = 256u;
+
+    for (uint index = tid; index < kVectors; index += kThreads) {
+        const uint local_key = index / kVecPerRow;
+        const uint vector_index = index - local_key * kVecPerRow;
+        const uint local_d = vector_index * 4u;
+        const uint global_d = d_base + local_d;
+        float4 value = float4(0.0f);
+        if (local_key < valid_keys && global_d < D) {
+            const uint src = head_base + (key_base + local_key) * D + global_d;
+            if (global_d + 3u < D) {
+                value = float4(*reinterpret_cast<device const packed_float4*>(v_cache + src));
+            } else {
+                if (global_d < D) {
+                    value.x = v_cache[src];
+                }
+                if (global_d + 1u < D) {
+                    value.y = v_cache[src + 1u];
+                }
+                if (global_d + 2u < D) {
+                    value.z = v_cache[src + 2u];
+                }
+            }
+        }
+        const uint dst = local_key * kVStride + local_d;
+        *reinterpret_cast<threadgroup packed_float4*>(KV_tg + dst) = packed_float4(value);
+    }
+}
+
+METAL_FUNC static void fa_br32_store_score_fragment(
+    threadgroup float* P_tg,
+    float2 score,
+    uint q_group,
+    uint key_group,
+    uint query_base,
+    uint key_base,
+    uint key_limit,
+    uint T,
+    bool is_causal,
+    float scale,
+    ushort lane
+) {
+    constexpr uint kFrag = 8u;
+    constexpr uint kPStride = 33u;
+    const ushort2 offset = morton_order(lane);
+    const uint local_q = q_group * kFrag + uint(offset.y);
+    const uint query = query_base + local_q;
+    const uint key0 = key_base + key_group * kFrag + uint(offset.x);
+    const uint key1 = key0 + 1u;
+    const bool valid_query = query < T;
+    const bool valid0 = valid_query && key0 < key_limit && (!is_causal || key0 <= query);
+    const bool valid1 = valid_query && key1 < key_limit && (!is_causal || key1 <= query);
+    float2 masked_score;
+    masked_score.x = valid0 ? score.x * scale : -INFINITY;
+    masked_score.y = valid1 ? score.y * scale : -INFINITY;
+    lowreg_matrix::store_tg_8x8(P_tg, kPStride,
+        ushort2(ushort(q_group * kFrag), ushort(key_group * kFrag)), lane, masked_score);
+}
+
+METAL_FUNC static void fa_br32_softmax(
+    threadgroup float* P_tg,
+    threadgroup float* stats_tg,
+    uint sg,
+    uint lane
+) {
+    constexpr uint kBQ = 32u;
+    constexpr uint kPStride = 33u;
+    // stats layout:
+    //   [0 * 32 + row] = running_max, in log2 domain
+    //   [1 * 32 + row] = running_sum
+    //   [2 * 32 + row] = alpha
+    #pragma unroll
+    for (uint row_pass = 0u; row_pass < 4u; ++row_pass) {
+        const uint row = sg + row_pass * 8u;
+        const float score = P_tg[row * kPStride + lane];
+        const float tile_max = simd_max(score);
+        const float old_max = stats_tg[0u * kBQ + row];
+        const float old_sum = stats_tg[1u * kBQ + row];
+        const bool tile_has_value = tile_max != -INFINITY;
+        const float new_max = tile_has_value ? max(old_max, tile_max) : old_max;
+        const float alpha = old_sum > 0.0f ? exp(old_max - new_max) : 0.0f;
+        const float probability = tile_has_value && score != -INFINITY ? exp(score - new_max) : 0.0f;
+        const float tile_sum = simd_sum(probability);
+        const float new_sum = old_sum * alpha + tile_sum;
+        P_tg[row * kPStride + lane] = probability;
+        if (lane == 0u) {
+            stats_tg[0u * kBQ + row] = new_max;
+            stats_tg[1u * kBQ + row] = new_sum;
+            stats_tg[2u * kBQ + row] = alpha;
+        }
+    }
+}
+
+template <uint kDChunks>
+METAL_FUNC static void fused_rms_fa_forward_br32_impl(
+    device float* q_out,
+    device const float* k_cache,
+    device const float* v_cache,
+    uint B,
+    uint H,
+    uint T,
+    uint C,
+    uint is_causal_int,
+    uint3 tg_pos,
+    uint3 threads_per_tg,
+    uint tid,
+    uint lane_u32,
+    uint sg,
+    threadgroup float* Q_tg,
+    threadgroup float* KV_tg,
+    threadgroup float* P_tg,
+    threadgroup float* stats_tg
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdGroups = 8u;
+    constexpr uint kBQ = 32u;
+    constexpr uint kBK = 32u;
+    constexpr uint kBD = 64u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kQGroups = kBQ / kFrag; // 4
+    constexpr uint kDSub = kBD / kFrag;    // 8
+    constexpr uint kQStride = 65u;
+    constexpr uint kKStride = 33u;
+    constexpr uint kVStride = 65u;
+    constexpr uint kPStride = 33u;
+    constexpr float kLog2E = 1.4426950408889634074f;
+
+    if (threads_per_tg.x != kThreads || threads_per_tg.y != 1u || threads_per_tg.z != 1u || tg_pos.x != 0u ||
+        B == 0u || H == 0u || T == 0u || C == 0u || C % H != 0u) {
+        return;
+    }
+
+    const uint D = C / H;
+    if (D == 0u || D > kDChunks * kBD) {
+        return;
+    }
+    const uint bh = tg_pos.z;
+    if (bh >= B * H || sg >= kSimdGroups) {
+        return;
+    }
+    const uint query_base = tg_pos.y * kBQ;
+    if (query_base >= T) {
+        return;
+    }
+
+    const uint b = bh / H;
+    const uint h = bh - b * H;
+    const bool is_causal = is_causal_int != 0u;
+    const uint key_limit = is_causal ? min(T, query_base + kBQ) : T;
+    const uint head_base = bh * T * D;
+    const float scale = rsqrt(float(D));
+    const ushort lane = ushort(lane_u32);
+    const ushort2 fragment_offset = morton_order(lane);
+    // Each SG owns one 8-column D fragment.
+    const uint output_d_group = sg;
+    // 4 Q8 fragments per D chunk.
+    // D64:  4 float2 = 8 floats/thread.
+    // D128: 8 float2 = 16 floats/thread.
+    thread float2 output_frag[kDChunks * kQGroups];
+
+    #pragma unroll
+    for (uint i = 0u; i < kDChunks * kQGroups; ++i) {
+        output_frag[i] = float2(0.0f);
+    }
+
+    fa_br32_load_q<kDChunks>(q_out, Q_tg, b, h, query_base, T, C, D, tid);
+
+    if (tid < kBQ) {
+        stats_tg[0u * kBQ + tid] = -INFINITY;
+        stats_tg[1u * kBQ + tid] = 0.0f;
+        stats_tg[2u * kBQ + tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint key_base = 0u; key_base < key_limit; key_base += kBK) {
+        const uint valid_keys = min(kBK, key_limit - key_base);
+        const uint valid_key_groups = (valid_keys + kFrag - 1u) / kFrag;
+
+        // QK mapping:
+        // SG 0..3: key_group 0..3, Q groups 0 and 1
+        // SG 4..7: key_group 0..3, Q groups 2 and 3
+        const uint key_group = sg & 3u;
+        const uint q_pair = sg >> 2u;
+        const uint q_group0 = q_pair * 2u;
+        const uint q_group1 = q_group0 + 1u;
+        thread float2 score0 = float2(0.0f);
+        thread float2 score1 = float2(0.0f);
+
+        // ---------------------------------------------------------------------
+        // QK: K enters TG once per D chunk, then serves both Q8 fragments.
+        // ---------------------------------------------------------------------
+        #pragma unroll
+        for (uint chunk = 0u; chunk < kDChunks; ++chunk) {
+            const uint d_base = chunk * kBD;
+            fa_br32_load_k_transposed(k_cache, KV_tg, head_base, key_base, valid_keys, d_base, D, tid);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (valid_keys == kBK || key_group < valid_key_groups) {
+                #pragma unroll
+                for (uint d_sub = 0u; d_sub < kDSub; ++d_sub) {
+                    const float2 q0 = lowreg_matrix::load_tg_8x8(Q_tg + chunk * kBQ * kQStride, kQStride,
+                            ushort2(ushort(q_group0 * kFrag), ushort(d_sub * kFrag)), lane);
+                    const float2 q1 = lowreg_matrix::load_tg_8x8(Q_tg + chunk * kBQ * kQStride, kQStride,
+                            ushort2(ushort(q_group1 * kFrag), ushort(d_sub * kFrag)), lane);
+                    const float2 kt = lowreg_matrix::load_tg_8x8(KV_tg, kKStride, 
+                            ushort2(ushort(d_sub * kFrag), ushort(key_group * kFrag)), lane);
+                    score0 = lowreg_matrix::mma_8x8(q0, kt, score0);
+                    score1 = lowreg_matrix::mma_8x8(q1, kt, score1);
+                }
+            }
+            if (chunk + 1u < kDChunks) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        fa_br32_store_score_fragment(P_tg, score0, q_group0, key_group,
+            query_base, key_base, key_limit, T, is_causal, scale, lane);
+        fa_br32_store_score_fragment(P_tg, score1, q_group1, key_group,
+            query_base, key_base, key_limit, T, is_causal, scale, lane);
+
+        // All 16 score fragments must be visible to softmax.
+        // This also guarantees that K is no longer in use, so the
+        // first V chunk may overwrite KV_tg.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each SG processes four complete softmax rows.
+        fa_br32_softmax(P_tg, stats_tg, sg, lane_u32);
+
+        // Load the first V chunk while the softmax result/stats are
+        // still waiting for cross-SG visibility.
+        fa_br32_load_v_row_major(v_cache, KV_tg, head_base, key_base, valid_keys, 0u, D, tid);
+
+        // Makes P, stats and V visible simultaneously.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Scale every resident O fragment exactly once for this K tile.
+        #pragma unroll
+        for (uint chunk = 0u; chunk < kDChunks; ++chunk) {
+            #pragma unroll
+            for (uint q_group = 0u; q_group < kQGroups; ++q_group) {
+                const uint local_q = q_group * kFrag + uint(fragment_offset.y);
+                const float alpha = stats_tg[2u * kBQ + local_q];
+                output_frag[chunk * kQGroups + q_group] *= alpha;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // PV: each V chunk is loaded once and updates all 32 query rows.
+        // ---------------------------------------------------------------------
+        #pragma unroll
+        for (uint chunk = 0u; chunk < kDChunks; ++chunk) {
+            if (chunk != 0u) {
+                // All SGs must finish reading the previous V chunk
+                // before KV_tg is overwritten.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                fa_br32_load_v_row_major(v_cache, KV_tg, head_base, key_base, valid_keys, chunk * kBD, D, tid);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            #pragma unroll
+            for (uint q_group = 0u; q_group < kQGroups; ++q_group) {
+                float2 accumulator = output_frag[chunk * kQGroups + q_group];
+                if (valid_keys == kBK) {
+                    #pragma unroll
+                    for (uint key_sub = 0u; key_sub < 4u; ++key_sub) {
+                        const float2 probability = lowreg_matrix::load_tg_8x8(P_tg, kPStride,
+                                ushort2(ushort(q_group * kFrag), ushort(key_sub * kFrag)), lane);
+                        const float2 value = lowreg_matrix::load_tg_8x8(KV_tg, kVStride,
+                                ushort2(ushort(key_sub * kFrag), ushort(output_d_group * kFrag)), lane);
+                        accumulator = lowreg_matrix::mma_8x8(probability, value, accumulator);
+                    }
+                } else {
+                    // Only the final partial key tile uses this path.
+                    for (uint key_sub = 0u; key_sub < valid_key_groups; ++key_sub) {
+                        const float2 probability = lowreg_matrix::load_tg_8x8(P_tg, kPStride,
+                                ushort2(ushort(q_group * kFrag), ushort(key_sub * kFrag)), lane);
+                        const float2 value = lowreg_matrix::load_tg_8x8(KV_tg, kVStride,
+                                ushort2(ushort(key_sub * kFrag), ushort(output_d_group * kFrag)), lane);
+                        accumulator = lowreg_matrix::mma_8x8(probability, value, accumulator);
+                    }
+                }
+                output_frag[chunk * kQGroups + q_group] = accumulator;
+            }
+        }
+
+        // Required before the next K tile overwrites KV_tg.
+        // The last tile does not need it because no TG memory follows.
+        if (key_base + kBK < key_limit) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Final normalize and one packed write to q_out.
+    // -------------------------------------------------------------------------
+    #pragma unroll
+    for (uint chunk = 0u; chunk < kDChunks; ++chunk) {
+        #pragma unroll
+        for (uint q_group = 0u; q_group < kQGroups; ++q_group) {
+            const uint local_q = q_group * kFrag + uint(fragment_offset.y);
+            const uint query = query_base + local_q;
+            const uint local_d = output_d_group * kFrag + uint(fragment_offset.x);
+            const uint global_d = chunk * kBD + local_d;
+
+            if (query < T && global_d < D) {
+                const float running_sum = stats_tg[1u * kBQ + local_q];
+                const float inverse_sum = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+                const float2 result = output_frag[chunk * kQGroups + q_group] * inverse_sum;
+                const uint dst = (b * T + query) * C + h * D + global_d;
+                if (global_d + 1u < D) {
+                    *reinterpret_cast<device packed_float2*>(q_out + dst) = packed_float2(result);
+                } else {
+                    q_out[dst] = result.x;
+                }
+            }
+        }
+    }
+}
+
+kernel void fused_rms_fa_forward_block64(
+    device float* q_out          [[buffer(0)]],
+    device const float* k_cache  [[buffer(1)]],
+    device const float* v_cache  [[buffer(2)]],
+    constant uint& B             [[buffer(3)]],
+    constant uint& H             [[buffer(4)]],
+    constant uint& T             [[buffer(5)]],
+    constant uint& C             [[buffer(6)]],
+    constant uint& is_causal_int [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 threads_per_tg [[threads_per_threadgroup]],
+    uint3 thread_pos [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float Q_tg[32u * 65u];
+    threadgroup float KV_tg[64u * 33u];
+    threadgroup float P_tg[32u * 33u];
+    threadgroup float stats_tg[32u * 3u];
+    fused_rms_fa_forward_br32_impl<1u>(q_out, k_cache, v_cache, B, H, T, C, is_causal_int, tg_pos,
+        threads_per_tg, thread_pos.x, lane, sg, Q_tg, KV_tg, P_tg, stats_tg);
+}
+
+kernel void fused_rms_fa_forward_block128(
+    device float* q_out          [[buffer(0)]],
+    device const float* k_cache  [[buffer(1)]],
+    device const float* v_cache  [[buffer(2)]],
+    constant uint& B             [[buffer(3)]],
+    constant uint& H             [[buffer(4)]],
+    constant uint& T             [[buffer(5)]],
+    constant uint& C             [[buffer(6)]],
+    constant uint& is_causal_int [[buffer(7)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],
+    uint3 threads_per_tg [[threads_per_threadgroup]],
+    uint3 thread_pos [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float Q_tg[2u * 32u * 65u];
+    threadgroup float KV_tg[64u * 33u];
+    threadgroup float P_tg[32u * 33u];
+    threadgroup float stats_tg[32u * 3u];
+    fused_rms_fa_forward_br32_impl<2u>(q_out, k_cache, v_cache, B, H, T, C, is_causal_int, tg_pos,
+        threads_per_tg, thread_pos.x, lane, sg, Q_tg, KV_tg, P_tg, stats_tg);
+}
+
+kernel void rmsnorm_backward(
+    device const float* x             [[buffer(0)]],
+    device const float* dy            [[buffer(1)]],
+    device float* dx_out              [[buffer(2)]],
+    device const float* residual_grad [[buffer(3)]],
+    constant uint& B_T                [[buffer(4)]],
+    constant uint& C                  [[buffer(5)]],
+    constant uint& eps_bits           [[buffer(6)]],
+    uint3 tg_pos                      [[threadgroup_position_in_grid]],
+    uint3 thread_pos                  [[thread_position_in_threadgroup]],
+    uint lane                         [[thread_index_in_simdgroup]],
+    uint simd_id                      [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdWidth = 32u;
+    constexpr uint kRowsPerTG = 8u;
+    constexpr uint kChannelTile = 64u;
+    const uint tid = thread_pos.x;
+
+    if (tid >= kThreads || tg_pos.x != 0u || C == 0u) {
+        return;
+    }
+
+    const uint local_row = simd_id;
+    const uint row = tg_pos.y * kRowsPerTG + local_row;
+    const bool row_valid = row < B_T;
+    const uint row_base = row * C;
+    const float C_f = float(C);
+    const float eps = as_type<float>(eps_bits);
+    float local_square_sum = 0.0f;
+    if (row_valid) {
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float value = x[row_base + c];
+            local_square_sum = fma(value, value, local_square_sum);
+        }
+    }
+
+    const float square_sum = simd_sum(local_square_sum);
+    const float inv_rms = row_valid ? rsqrt(square_sum / C_f + eps) : 0.0f;
+    float local_dy_xnorm = 0.0f;
+    if (row_valid) {
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            const float x_norm = x[row_base + c] * inv_rms;
+            local_dy_xnorm = fma(dy[row_base + c], x_norm, local_dy_xnorm);
+        }
+    }
+
+    const float dy_xnorm_sum = simd_sum(local_dy_xnorm);
+    const float mean_dy_xnorm = row_valid ? dy_xnorm_sum / C_f : 0.0f;
+    for (uint channel_base = 0u; channel_base < C; channel_base += kChannelTile) {
+        const uint c0 = channel_base + lane;
+        const uint c1 = channel_base + kSimdWidth + lane;
+
+        if (row_valid && c0 < C) {
+            const uint index0 = row_base + c0;
+            const float x_norm0 = x[index0] * inv_rms;
+            const float dx0 = inv_rms * (dy[index0] - x_norm0 * mean_dy_xnorm);
+            dx_out[index0] = residual_grad[index0] + dx0;
+        }
+        if (row_valid && c1 < C) {
+            const uint index1 = row_base + c1;
+            const float x_norm1 = x[index1] * inv_rms;
+            const float dx1 = inv_rms * (dy[index1] - x_norm1 * mean_dy_xnorm);
+            dx_out[index1] = residual_grad[index1] + dx1;
+        }
+    }
+}
+
+kernel void fused_linear_ce_chunk_logits(
+    device const float* x        [[buffer(0)]],
+    device const float* w        [[buffer(1)]],
+    device float* logits         [[buffer(2)]],
+    constant uint& rows          [[buffer(3)]],
+    constant uint& C             [[buffer(4)]],
+    constant uint& V             [[buffer(5)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]],
+    uint simd_id                 [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kBM = 64u;
+    constexpr uint kBV = 96u;
+    constexpr uint kBK = 16u;
+    constexpr uint kFrag = 8u;
+    constexpr uint kThreads = 256u;
+    constexpr uint kXStride = 17u;
+    constexpr uint kWStride = 97u;
+    constexpr uint kC4PerBK = 4u;
+    constexpr uint kAccCount = 12u;
+    threadgroup float X_tg[kBM * kXStride];
+    threadgroup float W_tg[kBK * kWStride];
+
+    if (tg_pos.x != 0u)
+        return;
+
+    const uint row_block = tg_pos.y * kBM;
+    const uint vocab_base = tg_pos.z * kBV;
+    if (row_block >= rows || vocab_base >= V)
+        return;
+
+    const bool full_channel_tiles = (C % kBK) == 0u;
+    const bool full_row_tile = row_block + kBM <= rows;
+    const bool full_vocab_tile = vocab_base + kBV <= V;
+    const bool full_x_tile = full_row_tile && full_channel_tiles;
+    const bool full_w_tile = full_vocab_tile && full_channel_tiles;
+    const uint simd_row_base = simd_id * kFrag;
+    thread float2 acc[kAccCount];
+
+    #pragma unroll
+    for (uint i = 0u; i < kAccCount; ++i) {
+        acc[i] = float2(0.0f);
+    }
+    for (uint channel_base = 0u; channel_base < C; channel_base += kBK) {
+        constexpr uint kXFloat4Count = kBM * kC4PerBK;
+        if (full_x_tile) {
+            // 满 X tile：移除 row/C 边界判断。
+            for (uint idx = tid; idx < kXFloat4Count; idx += kThreads) {
+                const uint local_row = idx / kC4PerBK;
+                const uint local_c4 = idx - local_row * kC4PerBK;
+                const uint global_row = row_block + local_row;
+                const uint global_c = channel_base + local_c4 * 4u;
+                const float4 value = float4(*reinterpret_cast<device const packed_float4*>(x + global_row * C + global_c));
+                *reinterpret_cast<threadgroup packed_float4*>(X_tg + local_row * kXStride + local_c4 * 4u) = packed_float4(value);
+            }
+        } else {
+            for (uint idx = tid; idx < kXFloat4Count; idx += kThreads) {
+                const uint local_row = idx / kC4PerBK;
+                const uint local_c4 = idx - local_row * kC4PerBK;
+                const uint global_row = row_block + local_row;
+                const uint global_c = channel_base + local_c4 * 4u;
+                float4 value = float4(0.0f);
+                if (global_row < rows && global_c + 4u <= C) {
+                    value = float4(*reinterpret_cast<device const packed_float4*>(x + global_row * C + global_c));
+                } else if (global_row < rows) {
+                    #pragma unroll
+                    for (uint j = 0u; j < 4u; ++j) {
+                        if (global_c + j < C) {
+                            value[j] = x[global_row * C + global_c + j];
+                        }
+                    }
+                }
+                *reinterpret_cast<threadgroup packed_float4*>(X_tg + local_row * kXStride + local_c4 * 4u) = packed_float4(value);
+            }
+        }
+
+        constexpr uint kWFloat4Count = kBV * kC4PerBK;
+        if (full_w_tile) {
+            // 满 W tile：移除 vocab/C 边界判断。
+            for (uint idx = tid; idx < kWFloat4Count; idx += kThreads) {
+                const uint local_vocab = idx / kC4PerBK;
+                const uint local_c4 = idx - local_vocab * kC4PerBK;
+                const uint global_vocab = vocab_base + local_vocab;
+                const uint global_c = channel_base + local_c4 * 4u;
+                const float4 value = float4(*reinterpret_cast<device const packed_float4*>(w + global_vocab * C + global_c));
+                const uint local_c = local_c4 * 4u;
+                W_tg[(local_c + 0u) * kWStride + local_vocab] = value[0];
+                W_tg[(local_c + 1u) * kWStride + local_vocab] = value[1];
+                W_tg[(local_c + 2u) * kWStride + local_vocab] = value[2];
+                W_tg[(local_c + 3u) * kWStride + local_vocab] = value[3];
+            }
+        } else {
+            for (uint idx = tid; idx < kWFloat4Count; idx += kThreads) {
+                const uint local_vocab = idx / kC4PerBK;
+                const uint local_c4 = idx - local_vocab * kC4PerBK;
+                const uint global_vocab = vocab_base + local_vocab;
+                const uint global_c = channel_base + local_c4 * 4u;
+                float4 value = float4(0.0f);
+                if (global_vocab < V && global_c + 4u <= C) {
+                    value = float4(*reinterpret_cast<device const packed_float4*>(w + global_vocab * C + global_c));
+                } else if (global_vocab < V) {
+                    #pragma unroll
+                    for (uint j = 0u; j < 4u; ++j) {
+                        if (global_c + j < C) {
+                            value[j] = w[global_vocab * C + global_c + j];
+                        }
+                    }
+                }
+                const uint local_c = local_c4 * 4u;
+                W_tg[(local_c + 0u) * kWStride + local_vocab] = value[0];
+                W_tg[(local_c + 1u) * kWStride + local_vocab] = value[1];
+                W_tg[(local_c + 2u) * kWStride + local_vocab] = value[2];
+                W_tg[(local_c + 3u) * kWStride + local_vocab] = value[3];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint k_sub = 0u; k_sub < kBK; k_sub += kFrag) {
+            const float2 x_fragment = lowreg_matrix::load_tg_8x8(X_tg, kXStride,
+                ushort2(ushort(simd_row_base), ushort(k_sub)), ushort(lane));
+
+            #pragma unroll
+            for (uint i = 0u; i < kAccCount; ++i) {
+                const float2 w_fragment = lowreg_matrix::load_tg_8x8(W_tg, kWStride, 
+                    ushort2(ushort(k_sub), ushort(i * kFrag)), ushort(lane));
+                acc[i] = lowreg_matrix::mma_8x8(x_fragment, w_fragment, acc[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ushort2 output_position = morton_order(ushort(lane));
+    const uint global_row = row_block + simd_row_base + uint(output_position.y);
+    const uint local_col = uint(output_position.x);
+
+    if (global_row >= rows)
+        return;
+
+    const uint output_row_base = global_row * V;
+    if (full_vocab_tile) {
+        #pragma unroll
+        for (uint i = 0u; i < kAccCount; ++i) {
+            const uint vocab_index = vocab_base + local_col + i * kFrag;
+            *reinterpret_cast<device packed_float2*>(logits + output_row_base + vocab_index) = packed_float2(acc[i]);
+        }
+    } else {
+        #pragma unroll
+        for (uint i = 0u; i < kAccCount; ++i) {
+            const uint vocab_index = vocab_base + local_col + i * kFrag;
+            if (vocab_index + 1u < V) {
+                *reinterpret_cast<device packed_float2*>(logits + output_row_base + vocab_index) = packed_float2(acc[i]);
+            } else if (vocab_index < V) {
+                logits[output_row_base + vocab_index] = acc[i][0];
+            }
+        }
+    }
+}
+
+kernel void fused_linear_ce_logits_to_dlogits(
+    device float* logits         [[buffer(0)]],
+    device const int* targets    [[buffer(1)]],
+    device float* row_loss       [[buffer(2)]],
+    device float* lse_out        [[buffer(3)]],
+    constant uint& rows          [[buffer(4)]],
+    constant uint& V             [[buffer(5)]],
+    constant uint& row_base      [[buffer(6)]],
+    constant uint& scale_bits    [[buffer(7)]],
+    constant uint& write_grad    [[buffer(8)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint tid                     [[thread_index_in_threadgroup]],
+    uint lane                    [[thread_index_in_simdgroup]],
+    uint simd_id                 [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint  kThreads    = 256u;
+    constexpr uint  kSimdgroups = kThreads / 32u;      // 8，与原版一致
+    constexpr uint  kVecSpan    = kThreads * 4u;       // 1024，向量循环每轮跨度
+    constexpr float kLog2E      = 1.4426950408889634f;
+    threadgroup float partial_max[kSimdgroups];
+    threadgroup float partial_sum[kSimdgroups];
+    threadgroup float shared_max;
+    threadgroup float shared_sum;
+    const uint local_row = tg_pos.y;
+    if (tg_pos.x != 0u || local_row >= rows) {
+        return;
+    }
+    const uint global_row  = row_base + local_row;
+    const uint logits_base = local_row * V;
+    const uint vec_end     = (V / 4u) * 4u;            // 可整 float4 的前缀长度
+    // ================= 第一遍：float4 无分支 online (max, sum) =================
+    // 4 个分量各自维护独立的 (max, sum)，循环内零分支、零 divergence。
+    float4 vmax = float4(-INFINITY);
+    float4 vsum = float4(0.0f);
+    for (uint base = tid * 4u; base + 4u <= V; base += kVecSpan) {
+        const float4 x = float4(*reinterpret_cast<device const packed_float4*>(
+            logits + logits_base + base));
+        const float4 nm = max(vmax, x);
+        // 首轮 vmax=-INF、x 有限：nm=x，(vmax-nm)=-INF，exp2(-INF)=0，vsum=0*0+1=1，不产生 NaN
+        vsum = vsum * exp2((vmax - nm) * kLog2E) + exp2((x - nm) * kLog2E);
+        vmax = nm;
+    }
+    // 4 个分量合并成标量 (max, sum)；sum==0 表示该分量无元素，语义与原版哨兵一致
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        const float om = vmax[j];
+        const float os = vsum[j];
+        if (os > 0.0f) {
+            const float nm = max(local_max, om);
+            local_sum = local_sum * exp2((local_max - nm) * kLog2E) +
+                        os * exp2((om - nm) * kLog2E);
+            local_max = nm;
+        }
+    }
+    // 标量尾：V 非 4 的倍数时剩下的不足 4 个元素（V=32768 时该循环为空）
+    for (uint p = vec_end + tid; p < V; p += kThreads) {
+        const float x  = logits[logits_base + p];
+        const float nm = max(local_max, x);
+        local_sum = local_sum * exp2((local_max - nm) * kLog2E) +
+                    exp2((x - nm) * kLog2E);
+        local_max = nm;
+    }
+    // ============ 以下两级归约与原版逐字一致，未做任何改动 ============
+    #pragma unroll
+    for (ushort delta = 16u; delta > 0u; delta >>= 1u) {
+        const float other_max = simd_shuffle_down(local_max, delta);
+        const float other_sum = simd_shuffle_down(local_sum, delta);
+        if (lane + uint(delta) < 32u && other_sum > 0.0f) {
+            if (local_sum == 0.0f) {
+                local_max = other_max;
+                local_sum = other_sum;
+            } else {
+                const float merged_max = max(local_max, other_max);
+                local_sum = local_sum * exp2((local_max - merged_max) * kLog2E) +
+                    other_sum * exp2((other_max - merged_max) * kLog2E);
+                local_max = merged_max;
+            }
+        }
+    }
+    if (lane == 0u) {
+        partial_max[simd_id] = local_max;
+        partial_sum[simd_id] = local_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id == 0u) {
+        float group_max = lane < kSimdgroups ? partial_max[lane] : -INFINITY;
+        float group_sum = lane < kSimdgroups ? partial_sum[lane] : 0.0f;
+        #pragma unroll
+        for (ushort delta = 4u; delta > 0u; delta >>= 1u) {
+            const float other_max = simd_shuffle_down(group_max, delta);
+            const float other_sum = simd_shuffle_down(group_sum, delta);
+            if (lane + uint(delta) < kSimdgroups && other_sum > 0.0f) {
+                if (group_sum == 0.0f) {
+                    group_max = other_max;
+                    group_sum = other_sum;
+                } else {
+                    const float merged_max = max(group_max, other_max);
+                    group_sum = group_sum * exp2((group_max - merged_max) * kLog2E) +
+                        other_sum * exp2((other_max - merged_max) * kLog2E);
+                    group_max = merged_max;
+                }
+            }
+        }
+        if (lane == 0u) {
+            shared_max = group_max;
+            shared_sum = group_sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int   target        = targets[global_row];
+    const bool  target_valid  = target >= 0 && target < int(V) && shared_sum > 0.0f;
+    const float inverse_sum   = target_valid ? 1.0f / shared_sum : 0.0f;
+    if (tid == 0u) {
+        const float target_logit = target_valid ? logits[logits_base + uint(target)] : 0.0f;
+        const float lse_value    = shared_max + log(shared_sum);
+        row_loss[global_row] = target_valid ? (lse_value - target_logit) : 0.0f;
+        lse_out[global_row]  = target_valid ? lse_value : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);   // 保护 tid0 读 target logit 先于覆写
+    if (write_grad == 0u) return;
+    // ================= 第二遍：float4 读 + float4 写 =================
+    const float scale    = as_type<float>(scale_bits);
+    const uint  target_u = target_valid ? uint(target) : V;   // V 作哨兵，永不命中
+    for (uint base = tid * 4u; base + 4u <= V; base += kVecSpan) {
+        float4 out = float4(0.0f);
+        if (target_valid) {
+            const float4 x = float4(*reinterpret_cast<device const packed_float4*>(
+                logits + logits_base + base));
+            out = exp2((x - shared_max) * kLog2E) * inverse_sum;
+            if (target_u >= base && target_u < base + 4u) {
+                const uint jj = target_u - base;
+                out -= float4(float(jj == 0u), float(jj == 1u),
+                              float(jj == 2u), float(jj == 3u));
+            }
+            out *= scale;
+        }
+        *reinterpret_cast<device packed_float4*>(logits + logits_base + base) =
+            packed_float4(out);
+    }
+    // 标量尾（V=32768 时为空）
+    for (uint p = vec_end + tid; p < V; p += kThreads) {
+        float value = 0.0f;
+        if (target_valid) {
+            value = exp2((logits[logits_base + p] - shared_max) * kLog2E) * inverse_sum;
+            if (p == target_u) {
+                value -= 1.0f;
+            }
+            value *= scale;
+        }
+        logits[logits_base + p] = value;
+    }
+}
+
+
+kernel void fused_linear_ce_forward_reduce(
+    device const float* row_loss [[buffer(0)]],
+    device float* out_loss       [[buffer(1)]],
+    constant uint& N             [[buffer(2)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]
+) {
+    // 单 TG 归约 N（N 通常 <= 几 K；更大时可再加 multi-TG atomic）
+    threadgroup float buf[256];
+    float local = 0.0f;
+    for (uint i = tid; i < N; i += tpg) {
+        local += row_loss[i];
+    }
+    buf[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tpg / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) buf[tid] += buf[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out_loss[0] = (N > 0) ? (buf[0] / float(N)) : 0.0f;
+    }
+}
+
+kernel void adamw_step(
+    device float* p               [[buffer(0)]],
+    device const float* g         [[buffer(1)]],
+    device float* m               [[buffer(2)]],
+    device float* v               [[buffer(3)]],
+    constant float& decay_factor  [[buffer(4)]],
+    constant float& lr_t          [[buffer(5)]],
+    constant float& b1            [[buffer(6)]],
+    constant float& b2            [[buffer(7)]],
+    constant float& eps           [[buffer(8)]],
+    constant uint& numel          [[buffer(9)]],
+    constant uint& decay_numel    [[buffer(10)]],
+    uint id                       [[thread_position_in_grid]]
+) {
+    const uint base = id * 4u;
+    const float wd = base < decay_numel ? decay_factor : 1.0f;
+    const float one_minus_b1 = 1.0f - b1;
+    const float one_minus_b2 = 1.0f - b2;
+
+    // 完整的4元素向量。
+    if (base + 4u <= numel) {
+        device packed_float4* p4 = (device packed_float4*)(p + base);
+        device const packed_float4* g4 = (device const packed_float4*)(g + base);
+        device packed_float4* m4 = (device packed_float4*)(m + base);
+        device packed_float4* v4 = (device packed_float4*)(v + base);
+
+        float4 pv = float4(*p4);
+        const float4 gv = float4(*g4);
+        float4 mv = float4(*m4);
+        float4 vv = float4(*v4);
+        // Decoupled weight decay。
+        pv *= wd;
+        // 一阶矩和二阶矩。
+        mv = fma(gv - mv, float4(one_minus_b1), mv);
+        const float4 gv_squared = gv * gv;
+        vv = fma(gv_squared - vv, float4(one_minus_b2), vv);
+        // denominator依赖每个元素更新后的二阶矩，不能提前计算。
+        const float4 denominator = sqrt(vv) + float4(eps);
+        pv = fma(-(mv / denominator), float4(lr_t), pv);
+        *p4 = packed_float4(pv);
+        *m4 = packed_float4(mv);
+        *v4 = packed_float4(vv);
+        return;
+    }
+
+    // 处理剩余的1～3个元素。
+    for (uint i = base; i < numel; ++i) {
+        float p_val = p[i];
+        const float g_val = g[i];
+        float m_val = m[i];
+        float v_val = v[i];
+        p_val *= wd;
+        m_val = fma(g_val - m_val, one_minus_b1, m_val);
+        const float g_squared = g_val * g_val;
+        v_val = fma(g_squared - v_val, one_minus_b2, v_val);
+        const float denominator = sqrt(v_val) + eps;
+        p_val = fma(-(m_val / denominator), lr_t, p_val);
+
+        p[i] = p_val;
+        m[i] = m_val;
+        v[i] = v_val;
+    }
+}
+
+kernel void adamw8bit_step(
+    device float* p [[buffer(0)]],
+    device const float* g [[buffer(1)]],
+    device uchar* qm [[buffer(2)]],
+    device uchar* qv [[buffer(3)]],
+    device float* absmax_m [[buffer(4)]],
+    device float* absmax_v [[buffer(5)]],
+    device const float* qmap_m [[buffer(6)]],
+    device const float* qmap_v [[buffer(7)]],
+    constant float& decay [[buffer(8)]],
+    constant float& lr_t [[buffer(9)]],
+    constant float& b1 [[buffer(10)]],
+    constant float& b2 [[buffer(11)]],
+    constant float& eps [[buffer(12)]],
+    constant uint& numel [[buffer(13)]],
+    constant uint& decay_numel [[buffer(14)]],
+    constant uint& first_step [[buffer(15)]],
+    uint block [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    constexpr uint kBlockSize = 256u;
+
+    threadgroup float local_max_m[kBlockSize];
+    threadgroup float local_max_v[kBlockSize];
+
+    const uint i = block * kBlockSize + lane;
+    const bool valid = i < numel;
+
+    float m = 0.0f;
+    float v = 0.0f;
+
+    if (valid && !first_step) {
+        m = absmax_m[block] * qmap_m[uint(qm[i])];
+        v = absmax_v[block] * qmap_v[uint(qv[i])];
+    }
+
+    if (valid) {
+        float p_value = p[i];
+        const float g_value = g[i];
+
+        p_value *= (i < decay_numel) ? decay : 1.0f;
+        m = fma(g_value - m, 1.0f - b1, m);
+        v = fma(g_value * g_value - v, 1.0f - b2, v);
+
+        p[i] = fma(
+            -(m / (sqrt(fmax(v, 0.0f)) + eps)),
+            lr_t,
+            p_value
+        );
+    }
+
+    local_max_m[lane] = valid ? fabs(m) : 0.0f;
+    local_max_v[lane] = valid ? fmax(v, 0.0f) : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            local_max_m[lane] = fmax(
+                local_max_m[lane],
+                local_max_m[lane + stride]
+            );
+            local_max_v[lane] = fmax(
+                local_max_v[lane],
+                local_max_v[lane + stride]
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (lane == 0u) {
+        absmax_m[block] = fmax(local_max_m[0], 1.0e-30f);
+        absmax_v[block] = fmax(local_max_v[0], 1.0e-30f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (!valid) {
+        return;
+    }
+
+    const float m_normalized = clamp(
+        m / absmax_m[block],
+        -1.0f,
+        1.0f
+    );
+
+    const float v_normalized = clamp(
+        fmax(v, 0.0f) / absmax_v[block],
+        0.0f,
+        1.0f
+    );
+
+    uint lo_m = 0u;
+    uint hi_m = 255u;
+
+    for (uint iter = 0u; iter < 8u; ++iter) {
+        const uint mid = (lo_m + hi_m) >> 1u;
+        if (qmap_m[mid] < m_normalized) {
+            lo_m = mid + 1u;
+        } else {
+            hi_m = mid;
+        }
+    }
+
+    const uint m_upper = min(lo_m, 255u);
+    const uint m_lower = m_upper > 0u ? m_upper - 1u : 0u;
+
+    qm[i] = uchar(
+        fabs(qmap_m[m_upper] - m_normalized)
+        < fabs(qmap_m[m_lower] - m_normalized)
+        ? m_upper
+        : m_lower
+    );
+
+    uint lo_v = 0u;
+    uint hi_v = 255u;
+
+    for (uint iter = 0u; iter < 8u; ++iter) {
+        const uint mid = (lo_v + hi_v) >> 1u;
+        if (qmap_v[mid] < v_normalized) {
+            lo_v = mid + 1u;
+        } else {
+            hi_v = mid;
+        }
+    }
+
+    const uint v_upper = min(lo_v, 255u);
+    const uint v_lower = v_upper > 0u ? v_upper - 1u : 0u;
+
+    qv[i] = uchar(
+        fabs(qmap_v[v_upper] - v_normalized)
+        < fabs(qmap_v[v_lower] - v_normalized)
+        ? v_upper
+        : v_lower
+    );
+}
