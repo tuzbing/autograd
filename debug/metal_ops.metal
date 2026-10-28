@@ -13483,7 +13483,28 @@ METAL_FUNC void fp16_gemm_impl(
             if (math_sg == 0u) {
                 const uint load_thread = lane;
                 constexpr uint NUM_SFB_LOAD_THREADS = SIMD_WIDTH;
-                for (uint index = load_thread; index < group_k * scale_n_rows; index += NUM_SFB_LOAD_THREADS) {
+                for (uint index = load_thread; index < group_k * scale_n_rows / 4u; index += NUM_SFB_LOAD_THREADS) {
+                    const uint local_n_scale = index*4u / group_k;
+                    const uint local_k_scale = index*4u % group_k;
+                    const uint global_n_scale = first_scale_n + local_n_scale;
+
+                    float4 value = float4(0.0f);
+                    if (global_n_scale < group_n) {
+                        const ulong offset = ulong(global_n_scale) * group_k + local_k_scale;
+                        if ((offset & 3ul) == 0ul && offset + 3ul < ulong(group_n) * group_k) {
+                            value = *reinterpret_cast<device const float4*>(sb + offset);
+                        } else { // 源地址不对齐或跨过最后一个有效 scale：保留有效元素，其余补零。
+                            #pragma unroll
+                            for (uint j = 0u; j < 4u; ++j) {
+                                if (offset + j < ulong(group_n) * group_k) {
+                                    value[j] = sb[offset + j];
+                                }
+                            }
+                        }
+                    }
+                    *reinterpret_cast<threadgroup float4*>(smem_sfb + index * 4u) = value;
+                }
+                for (uint index = ((group_k * scale_n_rows) & ~3u) + load_thread; index < group_k * scale_n_rows; index += NUM_SFB_LOAD_THREADS) {
                     const uint local_n_scale = index / group_k;
                     const uint local_k_scale = index % group_k;
                     const uint global_n_scale = first_scale_n + local_n_scale;
@@ -13607,8 +13628,7 @@ METAL_FUNC void fp16_gemm_impl(
                         simdgroup_barrier(mem_flags::mem_threadgroup);
                         const uint scratch_row = uint(lane_offset.y);
                         const uint scratch_col = uint(lane_offset.x);
-                        const float2 accum = float2(acc_scratch[scratch_row * 8u + scratch_col],
-                                                    acc_scratch[scratch_row * 8u + scratch_col + 1u]);
+                        const float2 accum = float2(acc_scratch[scratch_row * 8u + scratch_col], acc_scratch[scratch_row * 8u + scratch_col + 1u]);
                         const uint m_wave = f / FRAGMENTS_PER_SIMDGROUP_PER_WAVE;
                         const uint fragment_in_wg = (f % FRAGMENTS_PER_SIMDGROUP_PER_WAVE) * SIMDGROUPS_PER_MATH_WG + simdgroup_in_math_wg;
                         const uint fragment_m = m_wave * WAVE_BLOCK_M + math_wg_idx * M_ROWS_PER_WG_PER_WAVE
@@ -13647,20 +13667,20 @@ METAL_FUNC void fp16_gemm_impl(
                 const ulong global_idx = ulong(global_m) * ulong(N) + ulong(global_n);
                 const float2 value = final_accum[f];
 
-                if (global_n < N) {
+                if (global_n < (N & ~1u)) {
+                    float2 out_value = value;
+                    if constexpr (WITH_ACCUMULATION) {
+                        out_value += float2(*reinterpret_cast<device const packed_float2*>(c + global_idx));
+                    }
+                    *reinterpret_cast<device packed_float2*>(d + global_idx) = packed_float2(out_value);
+                }
+
+                if ((N & 1u) != 0u && global_n == N - 1u) {
                     float out_value = value[0];
                     if constexpr (WITH_ACCUMULATION) {
                         out_value += c[global_idx];
                     }
                     d[global_idx] = out_value;
-                }
-
-                if (global_n + 1u < N) {
-                    float out_value = value[1];
-                    if constexpr (WITH_ACCUMULATION) {
-                        out_value += c[global_idx + 1u];
-                    }
-                    d[global_idx + 1u] = out_value;
                 }
             }
         }
