@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 """Profile the exact GPT training callbacks used by train_autograd.py.
 
-This file intentionally contains no copied Metal dispatch geometry.  Internal
-kernel timing is collected by wrapping the Metal context while the already
-bound Runtime callbacks execute.  Therefore the printed kernel list is the
-list that debug/backend.py actually dispatched for the selected model shape.
-
-Default values are identical to train_autograd.py.  Examples:
-
-  python /tmp/timing_ops_v2.py
-  python /tmp/timing_ops_v2.py --max-seq-len 256
-  python /tmp/timing_ops_v2.py --depth 12 --aspect-ratio 64 --head-dim 64
-
-Copying this file to debug/timing_ops_v2.py also works unchanged.
+/Users/a58/Documents/code/nanochat/.venv/bin/python timing_ops_v2.py --T=256 --iters=5 --operator-threshold-ms 0 \
+  --kernel-threshold-ms 0
 """
 
 from __future__ import annotations
@@ -49,7 +39,6 @@ def _find_repo_root() -> Path:
         "cannot locate autograd repository; run from its root or copy this "
         "file to debug/timing_ops_v2.py"
     )
-
 
 ROOT_DIR = _find_repo_root()
 DEBUG_DIR = ROOT_DIR / "debug"
@@ -204,8 +193,10 @@ def randn(
     return (rng.standard_normal(shape).astype(np.float32) * scale).copy()
 
 
-def prepare_model(device: str, cfg: BenchConfig) -> ModelBundle:
+def prepare_model(device: str, cfg: BenchConfig, use_fp16_gemm: bool = False) -> ModelBundle:
     rt = reset_runtime(device)
+    rt.use_fp16_gemm = bool(use_fp16_gemm)
+    rt.backend.use_fp16_gemm = bool(use_fp16_gemm)
     model = GPT2(
         cfg.V, cfg.C, cfg.T, cfg.H, cfg.B, cfg.L, np.float32, device
     )
@@ -706,6 +697,821 @@ def print_internal_profiles(
             print("    all dispatches were below the kernel threshold")
         print(f"    {'dispatch GPU sum':<69s} {total:9.3f} ms")
 
+def profile_kv_cache_attention(
+    *,
+    batch_size: int,
+    max_seq_len: int,
+    embed_dim: int,
+    num_heads: int,
+    warmup: int = 3,
+    iters: int = 20,
+) -> None:
+    from op import KVCacheAttentionOp
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if max_seq_len <= 0:
+        raise ValueError("max_seq_len must be positive")
+    if embed_dim <= 0 or num_heads <= 0:
+        raise ValueError("embed_dim and num_heads must be positive")
+    if embed_dim % num_heads:
+        raise ValueError("embed_dim must be divisible by num_heads")
+    if warmup < 0 or iters <= 0:
+        raise ValueError("require warmup >= 0 and iters > 0")
+
+    head_dim = embed_dim // num_heads
+    if head_dim % 2:
+        raise ValueError("head_dim must be even for RoPE")
+
+    previous_runtime = Runtime._default_runtime
+    rt = Runtime(device="mps", forward_only=True, owns_params=False)
+    Runtime._default_runtime = rt
+
+    try:
+        rng = np.random.default_rng(SEED + 200)
+
+        def leaf(array):
+            return make_leaf(
+                np.asarray(array),
+                "mps",
+                requires_grad=False,
+            )
+
+        x_host = (
+            rng.standard_normal((batch_size, 1, embed_dim))
+            .astype(np.float32)
+        )
+
+        weight_shape = (embed_dim, embed_dim)
+        bias_shape = (embed_dim,)
+
+        wq_host = randn(rng, weight_shape)
+        bq_host = np.zeros(bias_shape, dtype=np.float32)
+
+        wk_host = randn(rng, weight_shape)
+        bk_host = np.zeros(bias_shape, dtype=np.float32)
+
+        wv_host = randn(rng, weight_shape)
+        bv_host = np.zeros(bias_shape, dtype=np.float32)
+
+        # KV cache layout must match engine.KVCache:
+        # [batch, max_seq_len, num_heads, head_dim]
+        k_cache_host = np.zeros(
+            (batch_size, max_seq_len, num_heads, head_dim),
+            dtype=np.float32,
+        )
+        v_cache_host = np.zeros_like(k_cache_host)
+
+        position_host = np.asarray([0], dtype=np.int32)
+
+        # Same RoPE layout as module.GPT2:
+        # [max_seq_len, head_dim // 2]
+        positions = np.arange(
+            max_seq_len,
+            dtype=np.float32,
+        )[:, None]
+        channels = np.arange(
+            0,
+            head_dim,
+            2,
+            dtype=np.float32,
+        )[None, :]
+        inv_freq = 100000.0 ** (-channels / head_dim)
+        freqs = positions * inv_freq
+
+        rope_cos_host = np.cos(freqs).astype(np.float32)
+        rope_sin_host = np.sin(freqs).astype(np.float32)
+
+        x = leaf(x_host)
+        wq = leaf(wq_host)
+        bq = leaf(bq_host)
+        wk = leaf(wk_host)
+        bk = leaf(bk_host)
+        wv = leaf(wv_host)
+        bv = leaf(bv_host)
+        k_cache = leaf(k_cache_host)
+        v_cache = leaf(v_cache_host)
+        position = leaf(position_host)
+        rope_cos = leaf(rope_cos_host)
+        rope_sin = leaf(rope_sin_host)
+
+        output = KVCacheAttentionOp(
+            n_head=num_heads,
+            layer_idx=0,
+            eps=1e-6,
+            mode="decode",
+        )(
+            x,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            k_cache,
+            v_cache,
+            position,
+            rope_cos,
+            rope_sin,
+        )
+
+        rt.loss = output
+        rt.build_topo(output)
+
+        with suppress_output(True):
+            rt.bind_memory()
+
+        rt.is_compiled = True
+
+        callback = functools.partial(
+            output.op.forward,
+            output.op.inputs,
+            output.op.outputs,
+        )
+
+        state_tensors = [
+            x,
+            wq,
+            bq,
+            wk,
+            bk,
+            wv,
+            bv,
+            k_cache,
+            v_cache,
+            position,
+            rope_cos,
+            rope_sin,
+        ]
+
+        state_hosts = [
+            x_host,
+            wq_host,
+            bq_host,
+            wk_host,
+            bk_host,
+            wv_host,
+            bv_host,
+            k_cache_host,
+            v_cache_host,
+            position_host,
+            rope_cos_host,
+            rope_sin_host,
+        ]
+
+        gpu_samples = []
+        wall_samples = []
+
+        for iteration in range(warmup + iters):
+            # Reset inputs and KV cache outside the measured interval.
+            rt.backend.synchronize()
+
+            for tensor, host in zip(state_tensors, state_hosts):
+                rt.backend.copy_from_host(tensor, host)
+
+            rt.backend.synchronize()
+
+            gpu_ms, wall_ms = _profile_callback_once(
+                rt.backend,
+                callback,
+            )
+
+            if iteration >= warmup:
+                gpu_samples.append(gpu_ms)
+                wall_samples.append(wall_ms)
+
+        rt.backend.synchronize()
+
+        gpu = stats(gpu_samples)
+        wall = stats(wall_samples)
+
+        print(
+            "\nKVCacheAttention operator timing "
+            f"(decode, B={batch_size}, S={max_seq_len}, "
+            f"C={embed_dim}, H={num_heads}, D={head_dim}, "
+            f"warmup={warmup}, iters={iters})"
+        )
+        print(
+            f"{'callback':<34s} "
+            f"{'GPU median':>13s} "
+            f"{'GPU p90':>13s} "
+            f"{'wall median':>14s}"
+        )
+        print(
+            f"{'metal_kv_cache_attention_forward':<34s} "
+            f"{gpu.median_ms:10.6f} ms "
+            f"{gpu.p90_ms:10.6f} ms "
+            f"{wall.median_ms:11.6f} ms"
+        )
+
+    finally:
+        Runtime._default_runtime = previous_runtime
+
+def profile_rollout_ops(
+    *,
+    batch_size: int,
+    vocab_size: int,
+    top_k: int = 50,
+    max_top_k: int = 64,
+    temperature: float = 1.0,
+    warmup: int = 3,
+    iters: int = 20,
+) -> None:
+    from op import RolloutTopkOp, RolloutSampleOp
+
+    if batch_size <= 0 or vocab_size <= 0:
+        raise ValueError("require batch_size > 0 and vocab_size > 0")
+    # 当前 RolloutTopkOp 的输出容量固定为 min(64, V)。
+    if not 1 <= top_k <= min(64, max_top_k, vocab_size):
+        raise ValueError(
+            "require 1 <= top_k <= min(64, max_top_k, vocab_size)"
+        )
+    if warmup < 0 or iters <= 0:
+        raise ValueError("require warmup >= 0 and iters > 0")
+    if not np.isfinite(temperature) or temperature < 0:
+        raise ValueError("require finite temperature >= 0")
+
+    previous_runtime = Runtime._default_runtime
+    rt = Runtime(device="mps", forward_only=True, owns_params=False)
+    Runtime._default_runtime = rt
+
+    try:
+        rng = np.random.default_rng(SEED)
+
+        def leaf(array):
+            return make_leaf(
+                np.asarray(array), "mps", requires_grad=False
+            )
+
+        def int_array(shape, value=0):
+            return np.full(shape, value, dtype=np.int32)
+
+        # 测量一次 decode；logits 的时间维度为 1，与训练 T 无关。
+        max_tokens = 256
+        logits_host = rng.standard_normal(
+            (batch_size, 1, vocab_size)
+        ).astype(np.float32)
+        logits = leaf(logits_host)
+        k_tensor = leaf(int_array((1,), top_k))
+        temperature_tensor = leaf(
+            np.array([temperature], dtype=np.float32)
+        )
+
+        rng_host = np.zeros((batch_size, 4), dtype=np.uint32)
+        rng_host[:, 0] = np.uint32(SEED)
+
+        state_hosts = [
+            rng_host,
+            np.zeros((max_tokens, batch_size, 2), dtype=np.uint32),
+            int_array((batch_size,)),                 # finished
+            int_array((batch_size, 1), -1),           # next_tokens
+            int_array((batch_size, max_tokens), -1),  # generated_ids
+            int_array((batch_size,)),                 # lengths
+            int_array((1,)),                         # position
+            int_array((1,)),                         # step
+        ]
+        state_tensors = [leaf(host) for host in state_hosts]
+        (
+            rng_state,
+            rng_raw,
+            finished,
+            next_tokens,
+            generated_ids,
+            lengths,
+            position,
+            step,
+        ) = state_tensors
+
+        values, indices = RolloutTopkOp(
+            max_top_k=max_top_k,
+            mode="decode",
+        )(logits, k_tensor, position)
+
+        # 返回的是图输出 finished_all；token 写入 next_tokens。
+        finished_all = RolloutSampleOp(
+            eos_token=vocab_size - 1,
+            bos_token=0,
+            max_tokens=max_tokens,
+            mode="decode",
+        )(
+            values,
+            indices,
+            rng_state,
+            rng_raw,
+            finished,
+            temperature_tensor,
+            k_tensor,
+            next_tokens,
+            generated_ids,
+            lengths,
+            position,
+            step,
+            logits,
+        )
+
+        rt.loss = finished_all
+        rt.build_topo(finished_all)
+        with suppress_output(True):
+            rt.bind_memory()
+        rt.is_compiled = True
+
+        # 使用 Runtime 绑定好的回调，保留 Sample 所需 scratch。
+        callbacks = [
+            (
+                "metal_rollout_topk_forward",
+                functools.partial(
+                    values.op.forward,
+                    values.op.inputs,
+                    values.op.outputs,
+                ),
+            ),
+            (
+                "metal_rollout_sample_forward",
+                functools.partial(
+                    finished_all.op.forward,
+                    finished_all.op.inputs,
+                    finished_all.op.outputs,
+                ),
+            ),
+        ]
+        samples = {
+            name: {"gpu": [], "wall": []}
+            for name, _ in callbacks
+        }
+
+        for iteration in range(warmup + iters):
+            # 同步及状态重置不计入算子耗时。
+            rt.backend.synchronize()
+            for tensor, host in zip(state_tensors, state_hosts):
+                rt.backend.copy_from_host(tensor, host)
+            rt.backend.synchronize()
+
+            # 每轮先生成 top-k，再测量使用该结果的 Sample。
+            for name, callback in callbacks:
+                gpu_ms, wall_ms = _profile_callback_once(
+                    rt.backend, callback
+                )
+                if iteration >= warmup:
+                    samples[name]["gpu"].append(gpu_ms)
+                    samples[name]["wall"].append(wall_ms)
+
+        # 所有结果检查均在计时范围之外。
+        rt.backend.synchronize()
+        actual_values = rt.backend.numpy_view(values).copy()[:, :top_k]
+        actual_indices = rt.backend.numpy_view(indices).copy()[:, :top_k]
+        tokens = rt.backend.numpy_view(next_tokens).copy().reshape(-1)
+
+        expected_indices = np.argsort(
+            -logits_host[:, 0, :], axis=1, kind="stable"
+        )[:, :top_k]
+        expected_values = np.take_along_axis(
+            logits_host[:, 0, :], expected_indices, axis=1
+        )
+        np.testing.assert_array_equal(actual_indices, expected_indices)
+        np.testing.assert_allclose(
+            actual_values, expected_values, rtol=0, atol=1e-6
+        )
+        if not np.all(
+            np.any(tokens[:, None] == expected_indices, axis=1)
+        ):
+            raise RuntimeError(f"sampled tokens outside top-k: {tokens}")
+        if temperature == 0:
+            np.testing.assert_array_equal(
+                tokens, expected_indices[:, 0]
+            )
+
+        print(
+            "\nRollout operator timing "
+            f"(decode, B={batch_size}, V={vocab_size}, "
+            f"top_k={top_k}, K_MAX={values.shape[-1]}, "
+            f"temperature={temperature}, "
+            f"warmup={warmup}, iters={iters})"
+        )
+        print(
+            f"{'callback':<34s} "
+            f"{'GPU median':>13s} "
+            f"{'GPU p90':>13s} "
+            f"{'wall median':>14s}"
+        )
+        for name, _ in callbacks:
+            gpu = stats(samples[name]["gpu"])
+            wall = stats(samples[name]["wall"])
+            print(
+                f"{name:<34s} "
+                f"{gpu.median_ms:10.6f} ms "
+                f"{gpu.p90_ms:10.6f} ms "
+                f"{wall.median_ms:11.6f} ms"
+            )
+    finally:
+        Runtime._default_runtime = previous_runtime
+
+def profile_prepared_callback_dispatches(
+    backend,
+    callback,
+    prepare,
+    *,
+    warmup: int,
+    iters: int,
+):
+    def capture_once():
+        return capture_callback_dispatches(backend, callback)
+
+    for _ in range(warmup):
+        prepare()
+        capture_once()
+
+    grouped = defaultdict(
+        lambda: {"gpu": [], "wall": []}
+    )
+    expected_sequence = None
+
+    for _ in range(iters):
+        prepare()
+        events = capture_once()
+
+        sequence = [
+            (event.ordinal, event.label)
+            for event in events
+        ]
+
+        if expected_sequence is None:
+            expected_sequence = sequence
+        elif sequence != expected_sequence:
+            raise AssertionError(
+                "dispatch sequence changed between samples: "
+                f"expected={expected_sequence}, got={sequence}"
+            )
+
+        for event in events:
+            key = (event.ordinal, event.label)
+            grouped[key]["gpu"].append(event.gpu_ms)
+            grouped[key]["wall"].append(event.wall_ms)
+
+    result = []
+    for (ordinal, label), values in sorted(grouped.items()):
+        result.append(
+            {
+                "ordinal": ordinal,
+                "label": label,
+                "gpu": stats(values["gpu"]),
+                "wall": stats(values["wall"]),
+            }
+        )
+
+    return result
+
+
+def print_qwen_dispatches(phase, events):
+    print(f"\n    {phase} internal dispatches")
+
+    total_gpu = 0.0
+
+    for event in events:
+        gpu = event["gpu"].median_ms
+        wall = event["wall"].median_ms
+        total_gpu += gpu
+
+        print(
+            f"      {event['ordinal'] + 1:02d} "
+            f"{event['label']:<66s} "
+            f"GPU={gpu:10.3f} ms "
+            f"wall={wall:10.3f} ms"
+        )
+
+    print(
+        f"      {'dispatch GPU sum':<69s}"
+        f"{total_gpu:10.3f} ms"
+    )
+
+def profile_qwen_fused_ops(
+    *,
+    batch_size: int,
+    seq_len: int,
+    warmup: int = 3,
+    iters: int = 20,
+) -> None:
+    from op import (
+        FusedRMSNormGQAOp,
+        FusedRMSNormLinearCrossEntropyOp,
+        FusedRMSNormMLPOp,
+    )
+
+    # Qwen 配置，与 module.QwenCoder / check_qwen_kernel.py 保持一致。
+    vocab_size = 151936
+    embed_dim = 1536
+    mlp_hidden_dim = 8960
+    n_head = 12
+    n_kv_head = 2
+    eps = 1e-6
+    rope_theta = 1_000_000.0
+    qwen_max_seq_len = 32768
+
+    if batch_size <= 0 or seq_len <= 0:
+        raise ValueError("batch_size and seq_len must be positive")
+    if seq_len > qwen_max_seq_len:
+        raise ValueError(
+            f"seq_len must be <= Qwen max sequence length "
+            f"{qwen_max_seq_len}"
+        )
+    if warmup < 0 or iters <= 0:
+        raise ValueError("require warmup >= 0 and iters > 0")
+
+    previous_runtime = Runtime._default_runtime
+
+    try:
+        def run_case(label, build_case):
+            rt = Runtime(
+                device="mps",
+                forward_only=False,
+                owns_params=True,
+            )
+            Runtime._default_runtime = rt
+
+            output = build_case()
+
+            rt.loss = output
+            rt.build_topo(output)
+
+            with suppress_output(True):
+                rt.bind_memory()
+
+            rt.is_compiled = True
+
+            node = output.op
+
+            forward_callback = functools.partial(
+                node.forward,
+                node.inputs,
+                node.outputs,
+            )
+            backward_callback = functools.partial(
+                node.backward,
+                node.inputs,
+                node.outputs,
+            )
+
+            def prepare_backward():
+                # 重新生成 backward 所需的 forward 中间结果。
+                rt.backend.begin_pass()
+                forward_callback()
+                rt.backend.end_pass()
+
+                # 填充输出梯度，保持与 profile_contextual_nodes()
+                # 中的 backward 前处理一致。
+                rt.backend.begin_pass()
+                rt.backend.fill(output.grad, 1.0)
+                rt.backend.end_pass()
+
+            # ------------------------------------------------------------
+            # 算子整体 forward/backward 时间
+            # ------------------------------------------------------------
+            forward_gpu = []
+            forward_wall = []
+            backward_gpu = []
+            backward_wall = []
+
+            for iteration in range(warmup + iters):
+                rt.backend.synchronize()
+
+                f_gpu, f_wall = _profile_callback_once(
+                    rt.backend,
+                    forward_callback,
+                )
+
+                rt.backend.begin_pass()
+                rt.backend.fill(output.grad, 1.0)
+                rt.backend.end_pass()
+
+                b_gpu, b_wall = _profile_callback_once(
+                    rt.backend,
+                    backward_callback,
+                )
+
+                if iteration >= warmup:
+                    forward_gpu.append(f_gpu)
+                    forward_wall.append(f_wall)
+                    backward_gpu.append(b_gpu)
+                    backward_wall.append(b_wall)
+
+            rt.backend.synchronize()
+
+            forward_stats = stats(forward_gpu)
+            forward_wall_stats = stats(forward_wall)
+            backward_stats = stats(backward_gpu)
+            backward_wall_stats = stats(backward_wall)
+
+            print(
+                f"{label:<38s} "
+                f"{forward_stats.median_ms:10.6f} ms "
+                f"{forward_wall_stats.median_ms:10.6f} ms "
+                f"{backward_stats.median_ms:10.6f} ms "
+                f"{backward_wall_stats.median_ms:10.6f} ms"
+            )
+
+            # ------------------------------------------------------------
+            # forward 内部 kernel 计时
+            # ------------------------------------------------------------
+            forward_dispatches = profile_callback_dispatches(
+                rt.backend,
+                forward_callback,
+                warmup=warmup,
+                iters=iters,
+            )
+
+            # ------------------------------------------------------------
+            # backward 内部 kernel 计时
+            # ------------------------------------------------------------
+            backward_dispatches = profile_prepared_callback_dispatches(
+                rt.backend,
+                backward_callback,
+                prepare_backward,
+                warmup=warmup,
+                iters=iters,
+            )
+
+            print_qwen_dispatches(
+                "forward",
+                forward_dispatches,
+            )
+            print_qwen_dispatches(
+                "backward",
+                backward_dispatches,
+            )
+
+        rng = np.random.default_rng(SEED + 300)
+
+        def leaf(array, requires_grad=True):
+            return make_leaf(
+                np.asarray(array),
+                "mps",
+                requires_grad=requires_grad,
+            )
+
+        def build_mlp():
+            x = leaf(np.zeros(
+                (batch_size, seq_len, embed_dim),
+                dtype=np.float32,
+            ))
+            norm_weight = leaf(np.ones(
+                (embed_dim,),
+                dtype=np.float32,
+            ))
+            wgu = leaf(np.zeros(
+                (embed_dim, 2 * mlp_hidden_dim),
+                dtype=np.float32,
+            ))
+            wdown = leaf(np.zeros(
+                (mlp_hidden_dim, embed_dim),
+                dtype=np.float32,
+            ))
+
+            return FusedRMSNormMLPOp(eps=eps)(
+                x,
+                norm_weight,
+                wgu,
+                wdown,
+            )
+
+        def build_gqa():
+            head_dim = embed_dim // n_head
+            kv_dim = n_kv_head * head_dim
+
+            x = leaf(np.zeros(
+                (batch_size, seq_len, embed_dim),
+                dtype=np.float32,
+            ))
+            norm_weight = leaf(np.ones(
+                (embed_dim,),
+                dtype=np.float32,
+            ))
+
+            wq = leaf(np.zeros(
+                (embed_dim, embed_dim),
+                dtype=np.float32,
+            ))
+            bq = leaf(np.zeros(
+                (embed_dim,),
+                dtype=np.float32,
+            ))
+            wk = leaf(np.zeros(
+                (embed_dim, kv_dim),
+                dtype=np.float32,
+            ))
+            bk = leaf(np.zeros(
+                (kv_dim,),
+                dtype=np.float32,
+            ))
+            wv = leaf(np.zeros(
+                (embed_dim, kv_dim),
+                dtype=np.float32,
+            ))
+            bv = leaf(np.zeros(
+                (kv_dim,),
+                dtype=np.float32,
+            ))
+
+            positions = np.arange(
+                qwen_max_seq_len,
+                dtype=np.float32,
+            )[:, None]
+            channels = np.arange(
+                0,
+                head_dim,
+                2,
+                dtype=np.float32,
+            )[None, :]
+            inv_freq = (
+                rope_theta ** (-channels / np.float32(head_dim))
+            )
+            freqs = positions * inv_freq
+
+            rope_cos = leaf(
+                np.cos(freqs).astype(np.float32),
+                requires_grad=False,
+            )
+            rope_sin = leaf(
+                np.sin(freqs).astype(np.float32),
+                requires_grad=False,
+            )
+
+            return FusedRMSNormGQAOp(
+                n_head=n_head,
+                n_kv_head=n_kv_head,
+                eps=eps,
+                is_causal=True,
+                rope_sign=1,
+            )(
+                x,
+                norm_weight,
+                wq,
+                bq,
+                wk,
+                bk,
+                wv,
+                bv,
+                rope_cos,
+                rope_sin,
+            )
+
+        def build_linear_cross_entropy():
+            x = leaf(np.zeros(
+                (batch_size, seq_len, embed_dim),
+                dtype=np.float32,
+            ))
+            weight = leaf(np.zeros(
+                (vocab_size, embed_dim),
+                dtype=np.float32,
+            ))
+            norm_weight = leaf(np.ones(
+                (embed_dim,),
+                dtype=np.float32,
+            ))
+            targets = leaf(
+                np.zeros(
+                    (batch_size, seq_len),
+                    dtype=np.int32,
+                ),
+                requires_grad=False,
+            )
+
+            return FusedRMSNormLinearCrossEntropyOp(
+                eps=eps,
+            )(
+                x,
+                weight,
+                norm_weight,
+                targets,
+            )
+
+        print(
+            "\nQwen fused operator timing "
+            f"(B={batch_size}, T={seq_len}, V={vocab_size}, "
+            f"C={embed_dim}, H={mlp_hidden_dim}, "
+            f"n_head={n_head}, n_kv_head={n_kv_head}, "
+            f"warmup={warmup}, iters={iters})"
+        )
+        print(
+            f"{'operator':<38s} "
+            f"{'forward GPU':>15s} "
+            f"{'forward wall':>16s} "
+            f"{'backward GPU':>16s} "
+            f"{'backward wall':>17s}"
+        )
+
+        run_case(
+            "FusedRMSNormMLP(norm_weight)",
+            build_mlp,
+        )
+        run_case(
+            "FusedRMSNormGQA",
+            build_gqa,
+        )
+        run_case(
+            "FusedRMSNormLinearCrossEntropy",
+            build_linear_cross_entropy,
+        )
+
+    finally:
+        Runtime._default_runtime = previous_runtime
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -753,6 +1559,7 @@ def main() -> None:
         default=0.0,
         help="hide individual dispatches below this GPU time",
     )
+    parser.add_argument("--use-fp16-gemm", action="store_true", help="enable the fused FP16 GEMM path for GPT timing")
     parser.add_argument("--skip-kernels", action="store_true")
     args = parser.parse_args()
 
@@ -795,7 +1602,8 @@ def main() -> None:
         f"C={cfg.C} H={cfg.H} D={cfg.D} L={cfg.L}"
     )
 
-    bundle = prepare_model("mps", cfg)
+    print(f"use_fp16_gemm={args.use_fp16_gemm}")
+    bundle = prepare_model("mps", cfg, use_fp16_gemm=args.use_fp16_gemm)
     topology = describe_topology(bundle)
     print("\nTraining topology covered")
     counts = Counter(info.op_name for info in topology)
@@ -829,6 +1637,32 @@ def main() -> None:
             operator_threshold_ms=args.operator_threshold_ms,
             kernel_threshold_ms=args.kernel_threshold_ms,
         )
+
+    # profile_kv_cache_attention(
+    #     batch_size=cfg.B,
+    #     max_seq_len=cfg.T,
+    #     embed_dim=cfg.C,
+    #     num_heads=cfg.H,
+    #     warmup=args.warmup,
+    #     iters=args.iters,
+    # )
+
+    # profile_rollout_ops(
+    #         batch_size=cfg.B,
+    #         vocab_size=cfg.V,
+    #         top_k=min(50, cfg.V),
+    #         max_top_k=64,
+    #         temperature=1.0,
+    #         warmup=args.warmup,
+    #         iters=args.iters,
+    #     )
+
+    # profile_qwen_fused_ops(
+    #     batch_size=cfg.B,
+    #     seq_len=cfg.T,
+    #     warmup=args.warmup,
+    #     iters=args.iters,
+    # )
 
 
 if __name__ == "__main__":

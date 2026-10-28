@@ -2,16 +2,17 @@ from math import prod
 from utils import contiguous_strides
 
 class Tensor():
-	__slots__ = ("shape", "dtype", "device", 
+	__slots__ = ("shape", "dtype", "grad_dtype", "device", 
 				"strides", "offset", "is_contiguous",
 				"requires_grad", "grad", "op", "init_val",
 				"storage", "name")
 
 	def __init__(self, shape, dtype, strides = None, 
 				offset=0, is_contiguous=True,
-				requires_grad=True, init_val=None, device=None, name=''):
+				requires_grad=True, init_val=None, device=None, name='', grad_dtype=None):
 		self.shape = shape
 		self.dtype = dtype
+		self.grad_dtype = dtype if grad_dtype is None else grad_dtype
 		self.device = device
 		self.strides = (strides if strides is not None else contiguous_strides(shape)) 
 		self.offset = offset
@@ -39,7 +40,7 @@ class Tensor():
 	def __repr__(self):
 		grad_flag = ", requires_grad=" if self.requires_grad else ""
 		name = f"{self.name}: " if self.name else ""
-		return (f"Tensor({name} shape={self.shape} dtype={self.dtype} device={self.device} {grad_flag})")
+		return (f"Tensor({name} shape={self.shape} dtype={self.dtype} grad_dtype={self.grad_dtype} device={self.device} {grad_flag})")
 
 	def __add__(self, other):
 		from op import AddOp
@@ -105,9 +106,13 @@ class Tensor():
 		from op import CrossEntropyLossOp
 		return CrossEntropyLossOp(dim)(self, labels)
 
-	def fused_linear_cross_entropy(self, weight, targets):
+	def fused_linear_cross_entropy(self, weight, targets, row_scale=None):
 		from op import FusedLinearCrossEntropyOp
-		return FusedLinearCrossEntropyOp()(self, weight, targets)
+		return FusedLinearCrossEntropyOp()(self, weight, targets, row_scale)
+
+	def fused_rmsnorm_linear_cross_entropy(self, weight, norm_weight, targets, row_scale=None, eps=1e-6):
+		from op import FusedRMSNormLinearCrossEntropyOp
+		return FusedRMSNormLinearCrossEntropyOp(eps=eps)(self, weight, norm_weight, targets, row_scale)
 
 	def attn_out_contiguous(self):
 		from op import AttnOutContiguousOp

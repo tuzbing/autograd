@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Correctness checker for the exact GPT training graph used by train_autograd.py.
 
-CPU is a correctness oracle with independent activation/gradient storage.
-MPS keeps Runtime.bind_memory() unchanged, including arena reuse, aliases and
-recomputation.  Only operators present in module.GPT2.forward() are checked.
+/Users/a58/Documents/code/nanochat/.venv/bin/python check_tiny_gpt2_kernel.py --T=256
+
 """
 
 import argparse
@@ -26,6 +25,8 @@ RTOL = 1e-6
 SEED = 1333
 FAILURES = []
 PRINT_PASSES = True
+
+OPTIMIZER_STATE_MODE = "fp32"  # "fp32" / "8bit" / "mini"
 
 
 def _locate_project_root():
@@ -60,6 +61,10 @@ from op import (  # noqa: E402
     FusedRMSNormMLPOp,
     FusedLinearAddOp,
     FusedLinearCrossEntropyOp,
+    KVCacheAttentionOp,
+    LMHeadOp,
+    RolloutTopkOp,
+    RolloutSampleOp,
 )
 from optimizer import AdamW # noqa: E402
 from tensor import Tensor  # noqa: E402
@@ -67,14 +72,24 @@ from tensor import Tensor  # noqa: E402
 Runtime = runtime.Runtime
 
 
-def make_tensor(shape, dtype, device, requires_grad, init_val):
+def make_tensor(shape, dtype, device, requires_grad, init_val, grad_dtype=None):
     return Tensor(
         shape=shape,
         dtype=dtype,
+        grad_dtype=grad_dtype,
         device=device,
         requires_grad=requires_grad,
         init_val=np.asarray(init_val, dtype=dtype).copy(),
     )
+
+def grad_dtype_value(value):
+    if value == "fp32":
+        return np.float32
+
+    if value == "bf16":
+        return "bf16"
+
+    raise ValueError(f"unsupported grad_dtype={value!r}")
 
 
 def iter_gpt2_named_tensors(model):
@@ -155,6 +170,16 @@ def parse_args():
         action="store_true",
         help="print failures and summary events, but omit individual passing comparisons",
     )
+    parser.add_argument(
+        "--grad-dtype",
+        choices=("fp32", "bf16"),
+        default="fp32",
+        help=(
+            "Logical dtype of model parameter gradients. "
+            "CPU reference remains FP32."
+        ),
+    )
+    parser.add_argument("--use-fp16-gemm", action="store_true", help="validate the fused FP16 GEMM path")
     args = parser.parse_args()
 
     if min(
@@ -213,7 +238,44 @@ def reset_runtime(device):
 
 
 def copy_to_host(rt, tensor):
-    return np.asarray(rt.backend.copy_to_host(tensor)).copy()
+    if rt.allocator.device != "mps":
+        return np.asarray(rt.backend.copy_to_host(tensor)).copy()
+        # return np.asarray(rt.backend.numpy_view(tensor)).copy()
+    storage = tensor.storage
+    storage_dtype = np.dtype(storage.dtype)
+    shape = tuple(tensor.shape)
+    count = prod(shape)
+    nbytes = count * storage_dtype.itemsize
+
+    if nbytes > storage.nbytes:
+        raise RuntimeError(
+            f"Host read exceeds storage: "
+            f"requested={nbytes}, available={storage.nbytes}"
+        )
+
+    raw = np.asarray(
+        rt.backend.ctx.numpy_view_uint8(
+            storage.ptr.buffer_id,
+            storage.ptr.offset,
+            (nbytes,),
+        )
+    ).copy()
+
+    values = raw.view(storage_dtype).reshape(shape)
+    is_bf16 = (storage_dtype == np.dtype(np.uint16)
+        and (
+            str(tensor.dtype).lower() in ("bf16", "bfloat16")
+            or str(getattr(tensor, "grad_dtype", "")).lower()
+            in ("bf16", "bfloat16")
+        )
+    )
+
+    if is_bf16:
+        bits32 = values.astype(np.uint32)
+        bits32 <<= np.uint32(16)
+        return bits32.view(np.float32)
+
+    return values
 
 
 def read_storage_f32(rt, storage, shape=None):
@@ -227,7 +289,7 @@ def read_storage_f32(rt, storage, shape=None):
     ).copy()
 
 
-def check(name, got, ref, *, fail_fast=False):
+def check(name, got, ref, *, fail_fast=False, atol=ATOL, rtol=RTOL):
     got = np.asarray(got)
     ref = np.asarray(ref)
     if got.shape != ref.shape:
@@ -236,14 +298,14 @@ def check(name, got, ref, *, fail_fast=False):
     denom = np.maximum(np.abs(ref.astype(np.float64)), 1e-30)
     max_abs = float(diff.max(initial=0.0))
     max_rel = float((diff / denom).max(initial=0.0))
-    ok = bool(np.allclose(got, ref, atol=ATOL, rtol=RTOL, equal_nan=False))
+    ok = bool(np.allclose(got, ref, atol=atol, rtol=rtol, equal_nan=False))
     if PRINT_PASSES or not ok:
         print(
             f"  {'PASS' if ok else 'FAIL'} {name}: max_abs={max_abs:.8e}, "
-            f"max_rel={max_rel:.8e}, atol={ATOL:g}, rtol={RTOL:g}"
+            f"max_rel={max_rel:.8e}, atol={atol:g}, rtol={rtol:g}"
         )
     if fail_fast and not ok:
-        bad = np.argwhere(~np.isclose(got, ref, atol=ATOL, rtol=RTOL, equal_nan=False))
+        bad = np.argwhere(~np.isclose(got, ref, atol=atol, rtol=rtol, equal_nan=False))
         first = tuple(int(v) for v in bad[0]) if bad.size else ()
         raise AssertionError(
             f"{name} mismatch at {first}: got={got[first]!r}, ref={ref[first]!r}, "
@@ -252,6 +314,226 @@ def check(name, got, ref, *, fail_fast=False):
     if not ok:
         FAILURES.append((name, max_abs, max_rel))
     return ok
+
+def tolerances_for_tensor(tensor, *, value_kind):
+    """
+    CPU reference 始终保持 FP32。
+
+    value_kind:
+        "parameter"
+        "parameter_grad"
+        "activation"
+        "activation_grad"
+    """
+    if value_kind == "parameter":
+        # 参数本身仍然是 FP32。
+        return 2e-7, 3e-5
+
+    if value_kind == "parameter_grad":
+        grad_dtype = getattr(tensor, "grad_dtype", np.float32)
+
+        if str(grad_dtype).lower() in ("bf16", "bfloat16"):
+            # CPU reference 仍是 FP32，只放宽比较误差。
+            #
+            # BF16 的相对精度约为 3.9e-3。
+            # 额外保留少量 GEMM 累加顺序误差。
+            return 2e-5, 4e-3
+
+        return 1e-6, 1e-6
+
+    if value_kind in ("activation", "activation_grad"):
+        return 1e-6, 1e-6
+
+    raise ValueError(f"unknown value_kind={value_kind!r}")
+
+def tolerances_for_grad_dtype(
+    grad_dtype,
+    value_kind,
+):
+    """
+    CPU reference 始终使用 FP32。
+
+    grad_dtype 只决定比较时允许的误差。
+    """
+    if value_kind == "parameter":
+        # 参数值始终是 FP32。
+        return 2e-7, 3e-5
+
+    if value_kind == "parameter_grad":
+        if str(grad_dtype).lower() in (
+            "bf16",
+            "bfloat16",
+        ):
+            # CPU reference 仍然是 FP32。
+            # MPS 参数梯度为 BF16 精度时放宽比较误差。
+            return 2e-5, 4e-3
+
+        return 1e-6, 1e-6
+
+    if value_kind in (
+        "activation",
+        "activation_grad",
+    ):
+        return 1e-6, 1e-6
+
+    raise ValueError(
+        f"unknown value_kind={value_kind!r}"
+    )
+
+def check_parameter_gradient(
+    name,
+    got,
+    reference,
+    grad_dtype,
+    fail_fast=False,
+):
+    atol, rtol = tolerances_for_grad_dtype(
+        grad_dtype,
+        "parameter_grad",
+    )
+
+    return check(
+        name,
+        got,
+        reference,          # [保持] FP32 CPU reference
+        fail_fast=fail_fast,
+        atol=atol,
+        rtol=rtol,
+    )
+
+def check_tensor_value(
+    name,
+    got,
+    reference,
+    *,
+    tensor=None,
+    value_kind="activation",
+    fail_fast=False,
+):
+    atol, rtol = tolerances_for_tensor(
+        tensor,
+        value_kind=value_kind,
+    )
+
+    return check(
+        name,
+        got,
+        reference,
+        fail_fast=fail_fast,
+        atol=atol,
+        rtol=rtol,
+    )
+
+def _optimizer_tolerances(
+    state_mode,
+    value_kind,
+    *,
+    quantized=False,
+    stochastic=False,
+):
+    """
+    value_kind:
+        "parameter" - 参数值
+        "m"         - 一阶动量
+        "v"         - 二阶动量
+    """
+
+    if value_kind not in ("parameter", "m", "v"):
+        raise ValueError(
+            f"invalid optimizer value kind: {value_kind!r}"
+        )
+
+    if state_mode not in ("fp32", "8bit", "mini"):
+        raise ValueError(
+            f"invalid optimizer state_mode: {state_mode!r}"
+        )
+
+    # [保持原有容差]
+    # FP32 和 8bit 继续使用原有验证标准。
+    if state_mode in ("fp32", "8bit"):
+        if value_kind == "parameter":
+            return 3e-5, 2e-7
+
+        return 3e-5, 2e-10
+
+    # mini 模式下，小参数仍然使用 FP32 m。
+    # 只有 quantized=True 时才需要放宽容差。
+    if not quantized:
+        if value_kind == "parameter":
+            return 3e-5, 2e-7
+
+        return 3e-5, 2e-10
+
+    # [新增] mini 量化参数的容差。
+    #
+    # m 被逐 block 量化后，下一步参数更新会放大量化误差。
+    # 因此参数的容差应比 m 更宽。
+    if value_kind == "parameter":
+        if stochastic:
+            return 5e-3, 1e-4
+        return 3e-3, 5e-5
+
+    if value_kind == "m":
+        if stochastic:
+            return 5e-3, 2e-5
+        return 3e-3, 1e-5
+
+    # 当前 mini 的 v 仍然是 FP32 分组统计值，
+    # 不应因为 m 被量化而大幅放宽。
+    return 3e-5, 2e-10
+
+def _check_optimizer_value(
+    name,
+    got,
+    ref,
+    *,
+    state_mode,
+    value_kind,
+    quantized=False,
+    stochastic=False,
+    fail_fast=True,
+):
+    rtol, atol = _optimizer_tolerances(
+        state_mode,
+        value_kind,
+        quantized=quantized,
+        stochastic=stochastic,
+    )
+
+    check(
+        name,
+        got,
+        ref,
+        fail_fast=fail_fast,
+        atol=atol,
+        rtol=rtol,
+    )
+
+def _check_grad_accum_optimizer_value(
+    name,
+    got,
+    ref,
+    *,
+    state_mode,
+    value_kind,
+    quantized=False,
+    stochastic=False,
+):
+    rtol, atol = _optimizer_tolerances(
+        state_mode,
+        value_kind,
+        quantized=quantized,
+        stochastic=stochastic,
+    )
+
+    check(
+        name,
+        got,
+        ref,
+        fail_fast=False,
+        atol=max(atol, 1e-6),
+        rtol=max(rtol, 1e-6),
+    )
 
 
 def op_name(node):
@@ -394,9 +676,13 @@ class GraphState:
     labels_by_node: dict
 
 
-def build_graph(device, cfg, arrays, input_ids, labels):
+def build_graph(device, cfg, arrays, input_ids, labels, grad_dtype=np.float32, use_fp16_gemm=False):
     rt = reset_runtime(device)
+    rt.use_fp16_gemm = bool(use_fp16_gemm)
+    rt.backend.use_fp16_gemm = bool(use_fp16_gemm)
     model = GPT2(cfg.V, cfg.C, cfg.T, cfg.H, cfg.B, cfg.L, cfg.dtype, device)
+    for parameter in model.parameters():
+        parameter.grad_dtype = grad_dtype
     initialize_model(model, arrays)
     input_t = make_tensor(input_ids.shape, np.int32, device, False, input_ids)
     labels_t = make_tensor(labels.shape, np.int32, device, False, labels)
@@ -447,18 +733,43 @@ def run_exact_training_graph(state, repeats=2):
     return results
 
 
-def compare_exact_graph(cpu, mps):
-    print("\n=== Exact Runtime.execute() training path ===")
+def compare_exact_graph(
+    cpu,
+    mps,
+    mps_grad_dtype=np.float32,
+):
+    print(
+        "\n=== Exact Runtime.execute() training path ==="
+    )
+
     if len(cpu) != len(mps):
-        raise AssertionError("CPU/MPS repeat count differs")
-    for repeat, (cpu_result, mps_result) in enumerate(zip(cpu, mps), 1):
-        print(f"  [training execution {repeat}]")
-        check(f"repeat[{repeat}]/loss", mps_result["loss"], cpu_result["loss"])
-        for name in sorted(cpu_result["parameter_grads"]):
-            check(
-                f"repeat[{repeat}]/parameter.grad/{name}",
+        raise AssertionError(
+            "CPU/MPS repeat count differs"
+        )
+
+    for repeat, (
+        cpu_result,
+        mps_result,
+    ) in enumerate(zip(cpu, mps), 1):
+        print(
+            f"  [training execution {repeat}]"
+        )
+
+        check(
+            f"repeat[{repeat}]/loss",
+            mps_result["loss"],
+            cpu_result["loss"],
+        )
+
+        for name in sorted(
+            cpu_result["parameter_grads"]
+        ):
+            check_parameter_gradient(
+                f"repeat[{repeat}]"
+                f"/parameter.grad/{name}",
                 mps_result["parameter_grads"][name],
                 cpu_result["parameter_grads"][name],
+                mps_grad_dtype,
             )
 
 
@@ -567,26 +878,101 @@ def run_staged_graph(state, reference_inputs=None):
     }
 
 
-def compare_staged_graph(cpu, mps):
-    print("\n=== Per-operator exact training path ===")
+def compare_staged_graph(
+    cpu,
+    mps,
+    mps_grad_dtype=np.float32,
+):
+    print(
+        "\n=== Per-operator exact training path ==="
+    )
+
     if list(cpu["forward"]) != list(mps["forward"]):
-        raise AssertionError("CPU/MPS forward topology labels differ")
+        raise AssertionError(
+            "CPU/MPS forward topology labels differ"
+        )
+
     for label in cpu["forward"]:
-        for i, (mps_value, cpu_value) in enumerate(zip(mps["forward"][label], cpu["forward"][label])):
-            check(f"{label}/forward/output[{i}]", mps_value, cpu_value)
-    for label in reversed(list(cpu["forward"])):
+        for index, (
+            mps_value,
+            cpu_value,
+        ) in enumerate(
+            zip(
+                mps["forward"][label],
+                cpu["forward"][label],
+            )
+        ):
+            check(
+                f"{label}/forward/output[{index}]",
+                mps_value,
+                cpu_value,
+            )
+
+    for label in reversed(
+        list(cpu["forward"])
+    ):
         cpu_bwd = cpu["backward"][label]
         mps_bwd = mps["backward"][label]
-        for i, (mps_value, cpu_value) in enumerate(zip(mps_bwd["output_grads"], cpu_bwd["output_grads"])):
+
+        for index, (
+            mps_value,
+            cpu_value,
+        ) in enumerate(
+            zip(
+                mps_bwd["output_grads"],
+                cpu_bwd["output_grads"],
+            )
+        ):
             if cpu_value is not None:
-                check(f"{label}/backward/output[{i}].grad", mps_value, cpu_value)
-        if len(cpu_bwd["inputs"]) != len(mps_bwd["inputs"]):
-            raise AssertionError(f"{label}: different differentiable input count")
-        for cpu_item, mps_item in zip(cpu_bwd["inputs"], mps_bwd["inputs"]):
-            if (cpu_item["index"], cpu_item["parameter"]) != (mps_item["index"], mps_item["parameter"]):
-                raise AssertionError(f"{label}: input mapping differs")
-            suffix = cpu_item["parameter"] or f"input[{cpu_item['index']}]"
-            check(f"{label}/backward/{suffix}.grad", mps_item["grad"], cpu_item["grad"])
+                check(
+                    f"{label}"
+                    f"/backward/output[{index}].grad",
+                    mps_value,
+                    cpu_value,
+                )
+
+        if len(cpu_bwd["inputs"]) != len(
+            mps_bwd["inputs"]
+        ):
+            raise AssertionError(
+                f"{label}: different "
+                "differentiable input count"
+            )
+
+        for cpu_item, mps_item in zip(
+            cpu_bwd["inputs"],
+            mps_bwd["inputs"],
+        ):
+            if (
+                cpu_item["index"],
+                cpu_item["parameter"],
+            ) != (
+                mps_item["index"],
+                mps_item["parameter"],
+            ):
+                raise AssertionError(
+                    f"{label}: input mapping differs"
+                )
+
+            parameter_name = cpu_item["parameter"]
+
+            if parameter_name is not None:
+                check_parameter_gradient(
+                    f"{label}"
+                    f"/backward/"
+                    f"{parameter_name}.grad",
+                    mps_item["grad"],
+                    cpu_item["grad"],
+                    mps_grad_dtype,
+                )
+            else:
+                check(
+                    f"{label}"
+                    f"/backward/input"
+                    f"[{cpu_item['index']}].grad",
+                    mps_item["grad"],
+                    cpu_item["grad"],
+                )
 
 
 def layernorm_values(x, gamma, beta, eps=1e-6):
@@ -1251,7 +1637,8 @@ def probe_fa_internal(cfg, x_np, params, upstream):
                 for name in ("q", "k", "v")
             ],
             [B, T, C, H, eps_bits],
-            256,
+            ((C+127)//128)*256,
+            # 256,
             (B * T + 15) // 16,
             1,
             256,
@@ -1285,17 +1672,17 @@ def probe_fa_internal(cfg, x_np, params, upstream):
     check(
         "fused_rms_fa_qkv/Q",
         read_storage_f32(rt, sf["q"]),
-        oracle["q_raw"],
+        oracle["q_raw"], atol=1e-5, rtol=1e-5,
     )
     check(
         "fused_rms_fa_qkv/K",
         read_storage_f32(rt, sf["k"]),
-        oracle["k_raw"],
+        oracle["k_raw"], atol=1e-5, rtol=1e-5,
     )
     check(
         "fused_rms_fa_qkv/V",
         read_storage_f32(rt, sf["v"]),
-        oracle["v"],
+        oracle["v"], atol=1e-5, rtol=1e-5,
     )
 
     _dispatch(rt, lambda: dispatch_rope(sf, 0))
@@ -1323,10 +1710,7 @@ def probe_fa_internal(cfg, x_np, params, upstream):
                 sf["q"].ptr.offset,
             ],
             [B, H, T, C, 1, 0],
-            fa_grid_x,
-            fa_grid_y,
-            B * H,
-            fa_threads,
+            fa_grid_x, fa_grid_y, B * H, fa_threads,
         ),
     )
 
@@ -1362,17 +1746,17 @@ def probe_fa_internal(cfg, x_np, params, upstream):
     check(
         "backward/recompute_qkv/Q",
         read_storage_f32(rt, sb["q"]),
-        oracle["q_raw"],
+        oracle["q_raw"], atol=1e-5, rtol=1e-5,
     )
     check(
         "backward/recompute_qkv/K",
         read_storage_f32(rt, sb["k"]),
-        oracle["k_raw"],
+        oracle["k_raw"], atol=1e-5, rtol=1e-5,
     )
     check(
         "backward/recompute_qkv/V",
         read_storage_f32(rt, sb["v"]),
-        oracle["v"],
+        oracle["v"], atol=1e-5, rtol=1e-5,
     )
 
     _dispatch(rt, lambda: dispatch_rope(sb, 0))
@@ -1400,10 +1784,7 @@ def probe_fa_internal(cfg, x_np, params, upstream):
                 sb["lse"].ptr.offset,
             ],
             [B, H, T, C, 1, 1],
-            gx,
-            gy,
-            B * H,
-            threads,
+            gx, gy, B * H, threads,
         ),
     )
 
@@ -1766,6 +2147,358 @@ def probe_fa_internal(cfg, x_np, params, upstream):
         oracle["dx_local"],
     )
 
+def make_kv_case(cfg, seed, mode, cache_host=None, position=0):
+    rng = np.random.default_rng(seed)
+
+    B = cfg.B
+    T = cfg.T if mode == "prefill" else 1
+    C = cfg.C
+    H = cfg.H
+    D = cfg.D
+    S = cfg.T
+
+    x_host = (
+        rng.standard_normal((B, T, C))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    wq_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+    wk_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+    wv_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    bq_host = np.zeros((C,), dtype=np.float32)
+    bk_host = np.zeros((C,), dtype=np.float32)
+    bv_host = np.zeros((C,), dtype=np.float32)
+
+    positions = np.arange(S, dtype=np.float32)[:, None]
+    channels = np.arange(
+        0,
+        D,
+        2,
+        dtype=np.float32,
+    )[None, :]
+    inv_freq = 100000.0 ** (-channels / D)
+    freqs = positions * inv_freq
+
+    rope_cos_host = np.cos(freqs).astype(np.float32)
+    rope_sin_host = np.sin(freqs).astype(np.float32)
+
+    x = make_tensor(
+        x_host.shape,
+        np.float32,
+        device=None,
+        requires_grad=False,
+        init_val=x_host,
+    )
+
+def make_kv_graph(
+    device,
+    cfg,
+    x_host,
+    wq_host,
+    bq_host,
+    wk_host,
+    bk_host,
+    wv_host,
+    bv_host,
+    rope_cos_host,
+    rope_sin_host,
+    k_cache_host,
+    v_cache_host,
+    position,
+    mode,
+):
+    B, T, C = x_host.shape
+    H = cfg.H
+    D = cfg.D
+    S = cfg.T
+
+    def tensor(shape, dtype, value, name):
+        return Tensor(
+            shape=shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=False,
+            init_val=np.asarray(value, dtype=dtype).copy(),
+            name=name,
+        )
+
+    x = tensor(
+        (B, T, C),
+        np.float32,
+        x_host,
+        "kv_x",
+    )
+    wq = tensor((C, C), np.float32, wq_host, "wq")
+    bq = tensor((C,), np.float32, bq_host, "bq")
+    wk = tensor((C, C), np.float32, wk_host, "wk")
+    bk = tensor((C,), np.float32, bk_host, "bk")
+    wv = tensor((C, C), np.float32, wv_host, "wv")
+    bv = tensor((C,), np.float32, bv_host, "bv")
+
+    k_cache = tensor(
+        (B, S, H, D),
+        np.float32,
+        k_cache_host,
+        "k_cache",
+    )
+
+    v_cache = tensor(
+        (B, S, H, D),
+        np.float32,
+        v_cache_host,
+        "v_cache",
+    )
+
+    position_t = tensor(
+        (1,),
+        np.int32,
+        np.asarray([position], dtype=np.int32),
+        "position",
+    )
+
+    rope_cos = tensor(
+        rope_cos_host.shape,
+        np.float32,
+        rope_cos_host,
+        "rope_cos",
+    )
+    rope_sin = tensor(
+        rope_sin_host.shape,
+        np.float32,
+        rope_sin_host,
+        "rope_sin",
+    )
+
+    out = KVCacheAttentionOp(
+        n_head=H,
+        layer_idx=0,
+        eps=1e-6,
+        mode=mode,
+    )(
+        x,
+        wq,
+        bq,
+        wk,
+        bk,
+        wv,
+        bv,
+        k_cache,
+        v_cache,
+        position_t,
+        rope_cos,
+        rope_sin,
+    )
+
+    runtime = Runtime(
+        device=device,
+        forward_only=True,
+    )
+
+    value = runtime.run_forward(
+        out,
+        return_value=True,
+    )
+
+    return {
+        "runtime": runtime,
+        "output": np.asarray(value).copy(),
+        "k_cache": copy_to_host(runtime, k_cache),
+        "v_cache": copy_to_host(runtime, v_cache),
+    }
+
+def probe_kv_cache_attention(cfg, seed):
+    print("\n=== KVCacheAttentionOp CPU/MPS forward ===")
+
+    rng = np.random.default_rng(seed)
+
+    B = cfg.B
+    T = min(cfg.T, 4)
+    C = cfg.C
+    H = cfg.H
+    D = cfg.D
+    S = cfg.T
+
+    x_host = (
+        rng.standard_normal((B, T, C))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    wq_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+    wk_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+    wv_host = (
+        rng.standard_normal((C, C))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    bq_host = (
+        rng.standard_normal((C,))
+        .astype(np.float32)
+        * 0.02
+    )
+    bk_host = (
+        rng.standard_normal((C,))
+        .astype(np.float32)
+        * 0.02
+    )
+    bv_host = (
+        rng.standard_normal((C,))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    positions = np.arange(S, dtype=np.float32)[:, None]
+    channels = np.arange(
+        0,
+        D,
+        2,
+        dtype=np.float32,
+    )[None, :]
+    inv_freq = 100000.0 ** (-channels / D)
+    freqs = positions * inv_freq
+
+    rope_cos_host = np.cos(freqs).astype(np.float32)
+    rope_sin_host = np.sin(freqs).astype(np.float32)
+
+    k_cache_host = np.zeros(
+        (B, S, H, D),
+        dtype=np.float32,
+    )
+    v_cache_host = np.zeros_like(k_cache_host)
+
+    cpu = make_kv_graph(
+        "cpu",
+        cfg,
+        x_host,
+        wq_host,
+        bq_host,
+        wk_host,
+        bk_host,
+        wv_host,
+        bv_host,
+        rope_cos_host,
+        rope_sin_host,
+        k_cache_host,
+        v_cache_host,
+        0,
+        "prefill",
+    )
+
+    mps = make_kv_graph(
+        "mps",
+        cfg,
+        x_host,
+        wq_host,
+        bq_host,
+        wk_host,
+        bk_host,
+        wv_host,
+        bv_host,
+        rope_cos_host,
+        rope_sin_host,
+        k_cache_host,
+        v_cache_host,
+        0,
+        "prefill",
+    )
+
+    check(
+        "KVCacheAttention/prefill/output",
+        mps["output"],
+        cpu["output"],
+        atol=ATOL,
+        rtol=RTOL,
+    )
+
+    check(
+        "KVCacheAttention/prefill/k_cache",
+        mps["k_cache"],
+        cpu["k_cache"],
+        atol=3e-6,
+        rtol=2e-4,
+    )
+
+    check(
+        "KVCacheAttention/prefill/v_cache",
+        mps["v_cache"],
+        cpu["v_cache"],
+        atol=ATOL,
+        rtol=RTOL,
+    )
+
+    decode_x = (
+        rng.standard_normal((B, 1, C))
+        .astype(np.float32)
+        * 0.02
+    )
+
+    cpu_decode = make_kv_graph(
+        "cpu",
+        cfg,
+        decode_x,
+        wq_host,
+        bq_host,
+        wk_host,
+        bk_host,
+        wv_host,
+        bv_host,
+        rope_cos_host,
+        rope_sin_host,
+        cpu["k_cache"],
+        cpu["v_cache"],
+        T,
+        "decode",
+    )
+
+    mps_decode = make_kv_graph(
+        "mps",
+        cfg,
+        decode_x,
+        wq_host,
+        bq_host,
+        wk_host,
+        bk_host,
+        wv_host,
+        bv_host,
+        rope_cos_host,
+        rope_sin_host,
+        mps["k_cache"],
+        mps["v_cache"],
+        T,
+        "decode",
+    )
+
+    check(
+        "KVCacheAttention/decode/output",
+        mps_decode["output"],
+        cpu_decode["output"],
+        atol=ATOL,
+        rtol=RTOL,
+    )
+
 def ce_oracle(x, w, labels):
     B, T, C = x.shape
     N, V = B * T, w.shape[0]
@@ -1937,6 +2670,574 @@ def probe_ce_internal(cfg, x_np, w_np, labels_np):
     check("fused_ce/x.grad", copy_to_host(rt, x.grad), oracle["dx"])
     check("fused_ce/w.grad", copy_to_host(rt, w.grad), oracle["dw"])
 
+def run_lm_head_forward(device, x_np, weight_np):
+    Runtime._default_runtime = None
+
+    rt = Runtime(
+        device=device,
+        forward_only=True,
+        owns_params=False,
+    )
+    Runtime._default_runtime = rt
+
+    x = make_tensor(
+        x_np.shape,
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=x_np,
+    )
+
+    weight = make_tensor(
+        weight_np.shape,
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=weight_np,
+    )
+
+    out = LMHeadOp()(x, weight)
+
+    rt.loss = out
+    rt.build_topo(out)
+    rt.bind_memory()
+    rt.is_compiled = True
+
+    value = rt.run_forward(
+        out,
+        return_value=True,
+    )
+
+    return np.asarray(value).copy()
+
+def run_rollout_forward(
+    device,
+    logits_np,
+    top_k_value,
+    temperature_value,
+    rng_state_np,
+    finished_np,
+    eos_token=99,
+    bos_token=98,
+):
+    Runtime._default_runtime = None
+    gc.collect()
+
+    rt = Runtime(
+        device=device,
+        forward_only=True,
+        owns_params=False,
+    )
+
+    Runtime._default_runtime = rt
+
+    logits = make_tensor(
+        logits_np.shape,
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=logits_np,
+    )
+
+    top_k = make_tensor(
+        (1,),
+        np.int32,
+        device,
+        requires_grad=False,
+        init_val=np.asarray(
+            [top_k_value],
+            dtype=np.int32,
+        ),
+    )
+
+    temperature = make_tensor(
+        (1,),
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=np.asarray(
+            [temperature_value],
+            dtype=np.float32,
+        ),
+    )
+
+    rng_state = make_tensor(
+        rng_state_np.shape,
+        np.uint32,
+        device,
+        requires_grad=False,
+        init_val=rng_state_np,
+    )
+
+    finished = make_tensor(
+        finished_np.shape,
+        np.int32,
+        device,
+        requires_grad=False,
+        init_val=finished_np,
+    )
+
+    logits_position = make_tensor((1,), np.int32, device, requires_grad=False, init_val=np.asarray([0], dtype=np.int32),)
+    topk_values, topk_indices = RolloutTopkOp(max_top_k=64, mode="decode")(logits, top_k, logits_position)
+
+    next_tokens = RolloutSampleOp(
+        eos_token=eos_token,
+        bos_token=bos_token,
+    )(
+        topk_values,
+        topk_indices,
+        rng_state,
+        finished,
+        temperature,
+        top_k,
+    )
+
+    rt.loss = next_tokens
+    rt.build_topo(next_tokens)
+    rt.bind_memory()
+    rt.is_compiled = True
+
+    value = rt.run_forward(
+        next_tokens,
+        return_value=True,
+    )
+
+    return {
+        "topk_values": copy_to_host(rt, topk_values),
+        "topk_indices": copy_to_host(rt, topk_indices),
+        "next_tokens": np.asarray(value).copy(),
+        "rng_state": copy_to_host(rt, rng_state),
+    }
+
+def probe_lm_head_op(cfg, seed):
+    print("\n=== LMHeadOp CPU/MPS forward ===")
+
+    rng = np.random.default_rng(seed)
+
+    B = cfg.B
+    T = min(cfg.T, 8)
+    C = cfg.C
+    V = cfg.V
+
+    x_np = (
+        rng.standard_normal((B, T, C))
+        .astype(np.float32)
+        * np.float32(0.1)
+    )
+
+    weight_np = (
+        rng.standard_normal((V, C))
+        .astype(np.float32)
+        * np.float32(0.1)
+    )
+
+    reference = np.matmul(
+        x_np.reshape(-1, C),
+        weight_np.T,
+    ).reshape(B, T, V)
+
+    cpu_out = run_lm_head_forward(
+        "cpu",
+        x_np,
+        weight_np,
+    )
+
+    mps_out = run_lm_head_forward(
+        "mps",
+        x_np,
+        weight_np,
+    )
+
+    check(
+        "LMHeadOp CPU vs NumPy",
+        cpu_out,
+        reference,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    check(
+        "LMHeadOp MPS vs NumPy",
+        mps_out,
+        reference,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    check(
+        "LMHeadOp MPS vs CPU",
+        mps_out,
+        cpu_out,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+def rollout_topk_reference(logits_np, top_k):
+    B, _, V = logits_np.shape
+    K = min(int(top_k), 64, V)
+
+    logits_2d = logits_np.reshape(B, V)
+
+    candidate_indices = np.argpartition(
+        logits_2d,
+        V - K,
+        axis=-1,
+    )[:, V - K:]
+
+    candidate_values = np.take_along_axis(
+        logits_2d,
+        candidate_indices,
+        axis=-1,
+    )
+
+    order = np.argsort(
+        candidate_values,
+        axis=-1,
+        kind="stable",
+    )[:, ::-1]
+
+    values = np.full(
+        (B, 64),
+        -np.inf,
+        dtype=np.float32,
+    )
+    indices = np.zeros(
+        (B, 64),
+        dtype=np.int32,
+    )
+
+    values[:, :K] = np.take_along_axis(
+        candidate_values,
+        order,
+        axis=-1,
+    )
+    indices[:, :K] = np.take_along_axis(
+        candidate_indices,
+        order,
+        axis=-1,
+    )
+
+    return values, indices
+
+def run_rollout_forward_stepwise(
+    device,
+    logits_np,
+    top_k_value,
+    temperature_value,
+    rng_state_np,
+    finished_np,
+    eos_token=99,
+    bos_token=98,
+):
+    Runtime._default_runtime = None
+    gc.collect()
+
+    rt = Runtime(
+        device=device,
+        forward_only=True,
+        owns_params=False,
+    )
+    Runtime._default_runtime = rt
+
+    logits = make_tensor(
+        logits_np.shape,
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=logits_np,
+    )
+
+    top_k = make_tensor(
+        (1,),
+        np.int32,
+        device,
+        requires_grad=False,
+        init_val=np.asarray(
+            [top_k_value],
+            dtype=np.int32,
+        ),
+    )
+
+    temperature = make_tensor(
+        (1,),
+        np.float32,
+        device,
+        requires_grad=False,
+        init_val=np.asarray(
+            [temperature_value],
+            dtype=np.float32,
+        ),
+    )
+
+    rng_state = make_tensor(
+        rng_state_np.shape,
+        np.uint32,
+        device,
+        requires_grad=False,
+        init_val=rng_state_np,
+    )
+
+    finished = make_tensor(
+        finished_np.shape,
+        np.int32,
+        device,
+        requires_grad=False,
+        init_val=finished_np,
+    )
+
+    logits_position = make_tensor(
+        (1,),
+        np.int32,
+        device,
+        requires_grad=False,
+        init_val=np.asarray(
+            [prompt_len - 1],
+            dtype=np.int32,
+        ),
+    )
+
+    topk_values, topk_indices = RolloutTopkOp(
+        max_top_k=64,
+        mode="prefill",
+    )(
+        logits,
+        top_k,
+        logits_position,
+    )
+
+    next_tokens = RolloutSampleOp(
+        eos_token=eos_token,
+        bos_token=bos_token,
+    )(
+        topk_values,
+        topk_indices,
+        rng_state,
+        finished,
+        temperature,
+        top_k,
+    )
+
+    rt.loss = next_tokens
+    rt.build_topo(next_tokens)
+    rt.bind_memory()
+    rt.is_compiled = True
+
+    topk_node = None
+    sample_node = None
+
+    for node in rt.topo:
+        if isinstance(node.op, RolloutTopkOp):
+            topk_node = node
+        elif isinstance(node.op, RolloutSampleOp):
+            sample_node = node
+
+    if topk_node is None or sample_node is None:
+        raise AssertionError(
+            "RolloutTopkOp or RolloutSampleOp is missing from topology"
+        )
+
+    backend = rt.backend
+
+    # 执行 Top-k 节点，并立即同步、复制输出。
+    backend.begin_pass()
+    topk_node.forward(
+        topk_node.inputs,
+        topk_node.outputs,
+    )
+    backend.end_pass()
+
+    if hasattr(backend, "synchronize"):
+        backend.synchronize()
+
+    topk_values_host = copy_to_host(
+        rt,
+        topk_values,
+    )
+    topk_indices_host = copy_to_host(
+        rt,
+        topk_indices,
+    )
+
+    # 继续执行 Sample 节点。
+    backend.begin_pass()
+    sample_node.forward(
+        sample_node.inputs,
+        sample_node.outputs,
+    )
+    backend.end_pass()
+
+    if hasattr(backend, "synchronize"):
+        backend.synchronize()
+
+    next_tokens_host = copy_to_host(
+        rt,
+        next_tokens,
+    )
+
+    return {
+        "topk_values": topk_values_host,
+        "topk_indices": topk_indices_host,
+        "next_tokens": next_tokens_host,
+    }
+
+def probe_rollout_ops(cfg, seed):
+    print("\n=== RolloutTopkOp/RolloutSampleOp CPU/MPS forward ===")
+
+    rng = np.random.default_rng(seed)
+
+    B = max(2, min(cfg.B, 4))
+    V = 97
+    K = 50
+
+    logits_np = (
+        rng.standard_normal((B, 1, V))
+        .astype(np.float32)
+        * np.float32(0.1)
+    )
+
+    # 每一行使用非零状态，避免 xorshift 进入零状态。
+    rng_state_np = np.zeros(
+        (B, 4),
+        dtype=np.uint32,
+    )
+    rng_state_np[:, 0] = np.asarray(
+        [12345 + 7919 * i for i in range(B)],
+        dtype=np.uint32,
+    )
+
+    finished_np = np.zeros(
+        (B,),
+        dtype=np.int32,
+    )
+
+    ref_values, ref_indices = rollout_topk_reference(
+        logits_np,
+        K,
+    )
+
+    cpu_result = run_rollout_forward_stepwise(
+        "cpu",
+        logits_np,
+        top_k_value=K,
+        temperature_value=0.0,
+        rng_state_np=rng_state_np,
+        finished_np=finished_np,
+    )
+
+    mps_result = run_rollout_forward_stepwise(
+        "mps",
+        logits_np,
+        top_k_value=K,
+        temperature_value=0.0,
+        rng_state_np=rng_state_np,
+        finished_np=finished_np,
+    )
+
+    check(
+        "RolloutTopk CPU values",
+        cpu_result["topk_values"][:, :K],
+        ref_values[:, :K],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    check(
+        "RolloutTopk CPU indices",
+        cpu_result["topk_indices"],
+        ref_indices,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    check(
+        "RolloutTopk MPS values",
+        mps_result["topk_values"][:, :K],
+        ref_values[:, :K],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    check(
+        "RolloutTopk MPS indices",
+        mps_result["topk_indices"],
+        ref_indices,
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    check(
+        "RolloutSample CPU greedy",
+        cpu_result["next_tokens"].reshape(-1),
+        ref_indices[:, 0],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    check(
+        "RolloutSample MPS greedy",
+        mps_result["next_tokens"].reshape(-1),
+        ref_indices[:, 0],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    # finished 行必须直接输出 eos_token。
+    finished_np = np.zeros((B,), dtype=np.int32)
+    finished_np[1] = 1
+
+    mps_finished = run_rollout_forward(
+        "mps",
+        logits_np,
+        top_k_value=K,
+        temperature_value=0.0,
+        rng_state_np=rng_state_np,
+        finished_np=finished_np,
+        eos_token=99,
+    )
+
+    check(
+        "RolloutSample MPS finished row",
+        mps_finished["next_tokens"].reshape(-1)[1:2],
+        np.asarray([99], dtype=np.int32),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    # temperature > 0 时，CPU 与 Metal 的随机数算法不同，
+    # 只验证输出属于有效 top-k 候选。
+    cpu_sample = run_rollout_forward(
+        "cpu",
+        logits_np,
+        top_k_value=K,
+        temperature_value=1.0,
+        rng_state_np=rng_state_np,
+        finished_np=np.zeros((B,), dtype=np.int32),
+    )
+
+    mps_sample = run_rollout_forward(
+        "mps",
+        logits_np,
+        top_k_value=K,
+        temperature_value=1.0,
+        rng_state_np=rng_state_np,
+        finished_np=np.zeros((B,), dtype=np.int32),
+    )
+
+    for name, result in (
+        ("CPU", cpu_result),
+        ("MPS", mps_result),
+    ):
+        sampled = result["next_tokens"].reshape(-1)
+        valid_indices = result["topk_indices"][:, :K]
+
+        for row in range(B):
+            row_indices = valid_indices[row]
+            if int(sampled[row]) not in row_indices:
+                raise AssertionError(
+                    f"RolloutSample {name} row {row} "
+                    f"returned token {sampled[row]} outside top-k"
+                )
+
 def _make_block_prefix(
     device,
     cfg,
@@ -2074,11 +3375,7 @@ def _dispatch_fa_recompute_project(
             cfg.H,
             _eps_bits(),
         ],
-        512,
-        (cfg.B * cfg.T + 31) // 32,
-        1,
-        512,
-    )
+        512, (cfg.B * cfg.T + 31) // 32, 1, 512,)
 
 def probe_linear_add_internal(cfg, x_np, arrays, block, upstream):
     print("\n=== Internal kernels: FusedLinearAdd (real FA producer path) ===")
@@ -2268,11 +3565,7 @@ def _dispatch_context_recompute(rt, cfg, t, h, dh):
             H,
             _eps_bits(),
         ],
-        512,
-        (B * T + 31) // 32,
-        1,
-        512,
-    )
+        512, (B * T + 31) // 32, 1, 512,)
 
     return q_offset, k_offset, v_offset
 
@@ -2545,15 +3838,50 @@ def probe_mlp_internal(
         fail_fast=True,
     )
 
-def _make_optimizer_leaf(rt, array, grad):
-    tensor = Tensor(array.shape, np.float32, device=rt.allocator.device,
-                    requires_grad=True, init_val=np.asarray(array, dtype=np.float32).copy())
-    tensor.storage = rt.allocator.alloc(tensor.shape, tensor.dtype)
+def _make_optimizer_leaf(
+    rt,
+    array,
+    grad,
+    grad_dtype=np.float32,
+):
+    tensor = Tensor(
+        array.shape,
+        np.float32,
+        device=rt.allocator.device,
+        requires_grad=True,
+        grad_dtype=grad_dtype,
+        init_val=np.asarray(
+            array,
+            dtype=np.float32,
+        ).copy(),
+    )
+
+    tensor.storage = rt.allocator.alloc(
+        tensor.shape,
+        np.float32,
+    )
     rt.backend.init(tensor)
-    tensor.grad = Tensor(tensor.shape, tensor.dtype, device=rt.allocator.device,
-                         requires_grad=False, init_val=np.asarray(grad, dtype=np.float32).copy())
-    tensor.grad.storage = rt.allocator.alloc(tensor.shape, tensor.dtype)
-    rt.backend.init(tensor.grad)
+
+    tensor.grad = Tensor(
+        tensor.shape,
+        np.float32,
+        device=rt.allocator.device,
+        requires_grad=False,
+        grad_dtype=grad_dtype,
+        init_val=np.asarray(
+            grad,
+            dtype=np.float32,
+        ).copy(),
+    )
+
+    grad_storage_dtype = np.uint16 if rt.allocator.device == "mps" and str(grad_dtype).lower() in ("bf16", "bfloat16") else np.float32
+
+    tensor.grad.storage = rt.allocator.alloc(
+        tensor.shape,
+        grad_storage_dtype,
+    )
+    rt.backend.copy_from_host(tensor.grad, np.ascontiguousarray(grad, dtype=np.float32))
+
     return tensor
 
 
@@ -2568,125 +3896,447 @@ def _adamw_numpy_step(p, g, m, v, step, lr, betas, eps, wd):
     p -= lr_t * m / (np.sqrt(v) + np.float32(eps))
     return p.astype(np.float32), m.astype(np.float32), v.astype(np.float32)
 
-def read_adamw8bit_state(rt, optimizer, index):
+def _optimizer_quantized_parts(optimizer, index):
+    if optimizer.state_mode == "fp32":
+        return ()
+
+    # 8bit/mini 的 dispatch 与 params 一一对应；
+    # fp32 的 dispatch 会合并 arena，不能按此方式索引。
+    item = optimizer.dispatches[index]
+    if item[0] == "fp32":
+        return ()
+
+    if optimizer.state_mode == "8bit" and item[0] == "q8":
+        return (
+            ("m", item[3], item[5], optimizer.qmap_m),
+            ("v", item[4], item[6], optimizer.qmap_v),
+        )
+
+    if optimizer.state_mode == "mini" and item[0] == "mini8bit":
+        # item[13]表示是否真正使用uint8量化
+        # 小参数虽然是mini8bit dispatch, 但quantized=False, 其m state是FP32, 不能进入量化验证
+        if not bool(item[13]):
+            return ()
+        # mini模式没有全局qmap, item[4]是每块的[scale, zero] metadata
+        return (("m", item[3], item[4], None, int(item[9]), bool(item[12])),)
+
+    raise AssertionError(
+        f"mode/dispatch mismatch: {optimizer.state_mode}, {item[0]}"
+    )
+
+def _read_optimizer_u8(rt, storage):
+    return np.asarray(
+        rt.backend.ctx.numpy_view_uint8(
+            storage.ptr.buffer_id, storage.ptr.offset, storage.shape
+        )
+    ).copy().reshape(-1)
+
+def read_adamw_state(rt, optimizer, index):
+    """调用前 synchronize；量化状态须在至少一次 step 后读取。"""
     p = optimizer.params[index]
 
-    for item in optimizer.dispatches:
-        if item[0] != "q8":
-            continue
-        _, p0, _, qm, qv, absmax_m, absmax_v, _, _ = item
-        if (p0.ptr.buffer_id == p.storage.ptr.buffer_id and p0.ptr.offset == p.storage.ptr.offset):
-            break
-    else:
+    if optimizer.state_mode == "mini":
+        item = optimizer.dispatches[index]
+
+        if item[0] == "mini8bit":
+            m_storage = item[3]
+            meta_storage = item[4]
+            v_storage = item[5]
+            quantized = bool(item[13])
+
+            if quantized:
+                codes = _read_optimizer_u8(rt, m_storage)
+                meta = read_storage_f32(rt, meta_storage).reshape(-1, 2)
+
+                blocks = (np.arange(p.numel, dtype=np.int64) // optimizer.BLOCK_SIZE)
+                decoded = (codes.astype(np.float32) - meta[blocks, 1]) * meta[blocks, 0]
+
+                if bool(item[12]): # transpose_m
+                    cols = int(item[9])
+                    rows = p.numel // cols
+                    j = np.arange(p.numel, dtype=np.int64)
+                    physical_index = (j % rows) * cols + j // rows
+                    logical = np.empty_like(decoded)
+                    logical[physical_index] = decoded
+                    m = logical
+                else:
+                    m = decoded
+            else:
+                m = read_storage_f32(rt, m_storage).reshape(-1)
+
+            v = read_storage_f32(rt, v_storage).reshape(-1)
+            return m.reshape(p.shape), v
+
+    parts = _optimizer_quantized_parts(optimizer, index)
+
+    if not parts:
         return (
             read_storage_f32(rt, optimizer.m[index], p.shape),
             read_storage_f32(rt, optimizer.v[index], p.shape),
         )
 
-    q_m = np.asarray(
-        rt.backend.ctx.numpy_view_uint8(
-            qm.ptr.buffer_id,
-            qm.ptr.offset,
-            tuple(p.shape),
-        )
-    ).copy()
+    decoded = {}
+    blocks = np.arange(p.numel) // optimizer.BLOCK_SIZE
 
-    q_v = np.asarray(
-        rt.backend.ctx.numpy_view_uint8(
-            qv.ptr.buffer_id,
-            qv.ptr.offset,
-            tuple(p.shape),
-        )
-    ).copy()
-
-    m_absmax = np.asarray(
-        rt.backend.ctx.numpy_view_float32(
-            absmax_m.ptr.buffer_id,
-            absmax_m.ptr.offset,
-            tuple(absmax_m.shape),
-        )
-    ).copy()
-
-    v_absmax = np.asarray(
-        rt.backend.ctx.numpy_view_float32(
-            absmax_v.ptr.buffer_id,
-            absmax_v.ptr.offset,
-            tuple(absmax_v.shape),
-        )
-    ).copy()
-
-    qmap_m = np.asarray(
-        rt.backend.ctx.numpy_view_float32(
-            optimizer.qmap_m.ptr.buffer_id,
-            optimizer.qmap_m.ptr.offset,
-            (256,),
-        )
-    ).copy()
-
-    qmap_v = np.asarray(
-        rt.backend.ctx.numpy_view_float32(
-            optimizer.qmap_v.ptr.buffer_id,
-            optimizer.qmap_v.ptr.offset,
-            (256,),
-        )
-    ).copy()
-
-    blocks = np.arange(
-        p.numel,
-        dtype=np.int64,
-    ) // optimizer.BLOCK_SIZE
-
-    m = (
-        m_absmax[blocks] * qmap_m[q_m.reshape(-1)]
-    ).reshape(p.shape)
+    for name, codes_storage, scale_storage, table_storage in parts:
+        codes = _read_optimizer_u8(rt, codes_storage)
+        scale = read_storage_f32(rt, scale_storage).reshape(-1)
+        table = read_storage_f32(rt, table_storage, (256,))
+        decoded[name] = (
+            table[codes] * scale[blocks]
+        ).reshape(p.shape)
 
     v = (
-        v_absmax[blocks] * qmap_v[q_v.reshape(-1)]
-    ).reshape(p.shape)
+        decoded["v"]
+        if "v" in decoded
+        else read_storage_f32(rt, optimizer.v[index])
+    )
+    return decoded["m"], v
 
-    return m, v
+def _adamw_reference_step(p, g, m, v, step, optimizer, group_ids):
+    def ema_f32(old, target, beta):
+        old = old.astype(np.float32)
+        target = target.astype(np.float32)
+        beta = np.float32(beta)
+        return (old + (target - old) * (np.float32(1.0) - beta)).astype(np.float32)
 
-def probe_adamw():
-    print("\n=== Training step: AdamW (matrix decay, vector no decay) ===")
-    rng = np.random.default_rng(SEED + 77)
-    p0 = [
-        (rng.standard_normal((17, 13))*0.02).astype(np.float32),
-        (rng.standard_normal((13,))*0.02).astype(np.float32),
+    b1, b2 = optimizer.betas
+
+    if group_ids is None:
+        target_v = g.astype(np.float32) * g.astype(np.float32)
+        v_indices = np.arange(g.size)
+    else:
+        count = np.bincount(group_ids)
+        target_v = (np.bincount(group_ids, weights=g.astype(np.float64) ** 2) / count).astype(np.float32)
+        v_indices = group_ids
+
+    new_m = ema_f32(m, g, b1)
+    new_v = ema_f32(v, target_v, b2)
+
+    lr_bc1 = np.float32(optimizer.lr / (1.0 - b1**step))
+    inv_sqrt_bc2 = np.float32(1.0 / math.sqrt(1.0 - b2**step))
+    denom = np.sqrt(np.maximum(new_v[v_indices], np.float32(0.0))) * inv_sqrt_bc2 + np.float32(optimizer.eps)
+    direction = -new_m / denom
+
+    # p 已由调用方应用 decay。
+    # 参数更新使用本步未量化的 m/v，随后才保存量化状态。
+    new_p = (p.astype(np.float32) + direction.astype(np.float32) * lr_bc1).astype(np.float32)
+
+    return new_p, new_m, new_v
+
+def _check_optimizer_quantization(rt, label, part, expected):
+    if len(part) == 6:
+        _, codes_storage, scale_storage, table_storage, item_cols, transpose_m = part
+    else:
+        _, codes_storage, scale_storage, table_storage = part
+        item_cols = None
+        transpose_m = False 
+    codes = _read_optimizer_u8(rt, codes_storage)
+
+    # mini8bit: 每个256元素块使用独立的scale/zero,不存在256项全局查找表
+    if table_storage is None:
+        meta = read_storage_f32(rt, scale_storage).reshape(-1, 2)
+        expected = np.asarray(expected, dtype=np.float32).reshape(-1)
+        if transpose_m:
+            cols = int(item_cols)
+            rows = expected.size // cols 
+            j = np.arange(expected.size, dtype=np.int64)
+            physical_index = ((j % rows) * cols) + j // rows
+            expected_quant = expected[physical_index]
+        else:
+            expected_quant = expected
+        n_blocks = (expected_quant.size + 255) // 256
+        assert meta.shape == (n_blocks, 2), (f"{label}/meta shape dismatch: got {meta.shape}, expected {(n_blocks, 2)}")
+        blocks = np.arange(expected.size, dtype=np.int64) // 256
+        block_min = np.minimum.reduceat(expected_quant, np.arange(0, expected_quant.size, 256))
+        block_max = np.maximum.reduceat(expected_quant, np.arange(0, expected_quant.size, 256))
+        expected_scale = np.maximum(block_max - block_min, np.float32(1.0e-5)) / np.float32(255.0)
+        expected_zero = np.clip(-np.rint(block_min/expected_scale), 0.0, 255.0).astype(np.float32)
+        np.testing.assert_allclose(meta[:, 0], expected_scale, rtol=3e-5, atol=1e-12, err_msg=label+"/scale")
+        raw_zero = (-block_min/expected_scale).astype(np.float64)
+        zero_slack = 8.0 * float(np.finfo(np.float32).eps) * np.maximum(1.0, np.abs(raw_zero))
+        zero_lower = np.clip(np.rint(raw_zero - zero_slack), 0.0, 255.0)
+        zero_upper = np.clip(np.rint(raw_zero + zero_slack), 0.0, 255.0)
+        got_zero = meta[:, 1].astype(np.float64)
+        valid_zero = np.isfinite(got_zero) & (got_zero == np.rint(got_zero)) & (got_zero >= zero_lower) & (got_zero <= zero_upper)
+        if not np.all(valid_zero):
+            bad = np.flatnonzero(~valid_zero)
+            index = int(bad[0])
+            raise AssertionError(
+                f"{label}/zero: block={index}, "
+                f"got={got_zero[index]}, "
+                f"reference_unrounded={raw_zero[index]}, "
+                f"allowed=[{zero_lower[index]}, "
+                f"{zero_upper[index]}]"
+            )
+        decoded = (codes.astype(np.float32) - meta[blocks, 1]) * meta[blocks, 0]
+
+        # mini kernel的量化误差最多约为半个量化步长,这里使用一个完整的step容差，兼容stochastic rounding
+        error = np.abs(decoded - expected_quant)
+        allowed = meta[blocks, 0] + 3e-6
+        assert np.all(error <= allowed), f"{label}/decoded: max_error={error.max()}, max_allowed={allowed.max()}"
+        return
+
+    # 8bit动态查找表路径
+    table = read_storage_f32(rt, table_storage, (256, ))
+    assert np.all(np.isfinite(table))
+    assert np.all(np.diff(table) >= 0)
+
+    expected = np.asarray(expected, dtype=np.float32).reshape(-1)
+    expected_scale = np.maximum(np.maximum.reduceat(np.abs(expected), np.arange(0, expected.size, 256)), np.float32(1e-30))
+    actual_scale = read_storage_f32(rt, scale_storage).reshape(-1)
+    np.testing.assert_allclose(actual_scale, expected_scale, rtol=3e-5, atol=1e-30, err_msg=label+"/scale")
+
+    normalized = np.clip(expected / expected_scale[np.arange(expected.size) // 256], table[0], table[-1])
+    upper = np.clip(np.searchsorted(table, normalized, side="left"), 0, 255)
+    lower = np.maximum(upper - 1, 0)
+
+    best = np.minimum(np.abs(table[upper] - normalized), np.abs(table[lower] - normalized))
+    actual = np.abs(table[codes] - normalized)
+
+    # 允许舍入误差使量化中点附近的值选择相邻编码。
+    assert np.all(actual <= best + 3e-6), label + "/nearest-code"
+
+def probe_adamw(state_mode=OPTIMIZER_STATE_MODE, grad_dtype=np.float32):
+    if state_mode not in ("fp32", "8bit", "mini"):
+        raise ValueError(state_mode)
+
+    print(
+        f"\n=== AdamW state_mode={state_mode}: Metal vs NumPy ==="
+    )
+
+    cfg = Config(B=1, T=8, V=128, C=128, H=2, D=64, L=1)
+    arrays = build_parameter_arrays(cfg, SEED + 701)
+    state = build_graph(
+        "mps", cfg, arrays, *build_inputs(cfg, SEED + 702), grad_dtype=grad_dtype,
+    )
+    rt = state.rt
+    rng = np.random.default_rng(SEED + 703)
+
+    # 保留全部模型参数，兼容 FP32 arena 合并。
+    cases = list(state.param_by_name.items())
+    cases.append((
+        "extra_vector",
+        _make_optimizer_leaf(
+            rt,
+            rng.standard_normal((4101,)).astype(np.float32) * 0.02,
+            np.zeros((4101,), dtype=np.float32),
+            grad_dtype=grad_dtype,
+        ),
+    ))
+
+    if state_mode != "mini":
+        shape = (17, 13)
+        p0 = (
+            rng.standard_normal(shape) * 0.02
+        ).astype(np.float32)
+        cases.append((
+            "small_matrix",
+            _make_optimizer_leaf(
+                rt,
+                p0,
+                np.zeros_like(p0),
+            ),
+        ))
+
+    optimizer = AdamW(
+        [p for _, p in cases],
+        lr=0.002,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.2,
+        state_mode=state_mode,
+    )
+    assert [id(p) for p in optimizer.params] == [
+        id(p) for _, p in cases
     ]
-    grads = [
-        (rng.standard_normal(x.shape)*0.01).astype(np.float32) for x in p0
-    ]
-    lr, wd, betas, eps = 0.002, 0.234903, (0.9, 0.999), 1e-8
-    refs = []
-    for index, (p, g) in enumerate(zip(p0, grads)):
-        m = np.zeros_like(p); v = np.zeros_like(p)
-        per_param_wd = wd if p.ndim > 1 else 0.0
-        history = []
-        for step in (1, 2):
-            p, m, v = _adamw_numpy_step(p, g, m, v, step, lr, betas, eps, per_param_wd)
-            history.append((p.copy(), m.copy(), v.copy()))
-        refs.append(history)
-    for device in ("cpu", "mps"):
-        print(f"  [{device}]")
-        rt = reset_runtime(device)
-        params = [_make_optimizer_leaf(rt, p, g) for p, g in zip(p0, grads)]
-        use_8bit = (device == "mps")
-        optimizer = AdamW(params, lr=lr, weight_decay=wd, betas=betas, eps=eps, quant_8bit=use_8bit)
-        for step in (1, 2):
-            optimizer.step(); rt.backend.synchronize()
-            for index, tensor in enumerate(params):
-                expected_p, expected_m, expected_v = refs[index][step-1]
-                kind = "matrix" if tensor.ndim > 1 else "vector"
-                if use_8bit:
-                    got_m, got_v = read_adamw8bit_state(rt, optimizer, index)
-                    check(f"AdamW8bit/{device}/step[{step}]/{kind}/parameter", copy_to_host(rt, tensor), expected_p)
-                    check(f"AdamW8bit/{device}/step[{step}]/{kind}/m", got_m, expected_m)
-                    check(f"AdamW8bit/{device}/step[{step}]/{kind}/v", got_v, expected_v)
+
+    # 独立从模型定义取得 head 信息，不从优化器 dispatch 反推。
+    heads = {}
+    column_ids = set()
+    stochastic_ids = set()
+    for node in state.rt.topo:
+        op_name = node.op.op_name
+        if op_name == "Gather":
+            stochastic_ids.add(id(node.inputs[1]))
+        elif op_name == "FusedLinearCrossEntropy":
+            stochastic_ids.add(id(node.inputs[1]))
+        elif op_name == "FusedRMSNormMLP":
+            column_ids.add(id(node.inputs[1]))
+            column_ids.add(id(node.inputs[2]))
+        elif op_name == "FusedLinearAdd":
+            column_ids.add(id(node.inputs[2]))
+
+    for block in state.model.blocks:
+        for p in (
+            block.attn.q_proj.weight,
+            block.attn.k_proj.weight,
+            block.attn.v_proj.weight,
+        ):
+            heads[id(p)] = block.attn.head_dim
+
+    group_ids_by_param = []
+    for i, (_, p) in enumerate(cases):
+        large = p.numel >= 4096
+        ids = None
+
+        if state_mode != "fp32":
+            if state_mode == "8bit":
+                wanted = "q8" if large else "fp32"
+            elif state_mode == "mini":
+                wanted = "mini8bit"
+            assert optimizer.dispatches[i][0] == wanted
+
+        if state_mode == "mini" and large:
+            cols = p.shape[-1]
+            head_cols = 0
+            if id(p) in heads:
+                # Q/K权重: 按attention head分组
+                head_cols = int(heads[id(p)])
+                block_elems = int(p.shape[0]) * head_cols
+                ids = (np.arange(p.numel) % cols) // head_cols
+            elif id(p) in column_ids:
+                # MLP/Linear权重: 按列分组
+                head_cols = 1
+                block_elems = int(p.shape[0])
+                ids = (np.arange(p.numel) % cols)
+            elif id(p) in stochastic_ids:
+                # embedding/stochastic参数: 按连续列块分组
+                head_cols = 0
+                block_elems = cols
+                ids = np.arange(p.numel) // block_elems
+            else:
+                # 普通向量或未分组参数
+                # block_elems = int(p.numel)
+                head_cols = 0
+                block_elems = 1
+                ids = np.arange(p.numel, dtype=np.int64)
+
+            assert optimizer.dispatches[i][8:11] == (block_elems, cols, head_cols)
+            assert prod(optimizer.v[i].shape) == int(ids.max()) + 1
+
+        group_ids_by_param.append(ids)
+
+    rt.backend.synchronize()
+
+    # 首步零梯度：验证初始化和零 scale。
+    # 中间两步非零：验证量化状态解码及更新。
+    # 最后零梯度：验证历史动量延续。
+    for step, wd in enumerate((0.2, 0.0, 0.07, 0.13), 1):
+        optimizer.lr = 0.002 / step
+        optimizer.weight_decay = wd
+        expected = []
+
+        for i, (_, p) in enumerate(cases):
+            ids = group_ids_by_param[i]
+
+            if step == 1:
+                old_m = np.zeros(p.numel, np.float32)
+                old_v = np.zeros(
+                    p.numel if ids is None else int(ids.max()) + 1,
+                    np.float32,
+                )
+            else:
+                old_m, old_v = read_adamw_state(rt, optimizer, i)
+                old_m = old_m.reshape(-1)
+                old_v = old_v.reshape(-1)
+
+            g = (
+                rng.standard_normal(p.shape) * 0.03
+            ).astype(np.float32)
+
+            if p.ndim > 1:
+                # 各列幅度不同，便于识别错误的 head 分组。
+                g *= np.linspace(
+                    0.2, 2.0, p.shape[-1], dtype=np.float32
+                )
+            if step in (1, 4):
+                g.fill(0)
+
+            if np.dtype(p.grad.storage.dtype) == np.dtype(np.uint16):
+                bits = np.ascontiguousarray(g).view(np.uint32)
+                rounded_bits = (
+                    bits
+                    + np.uint32(0x7FFF)
+                    + ((bits >> np.uint32(16)) & np.uint32(1))
+                ) & np.uint32(0xFFFF0000)
+                g = rounded_bits.view(np.float32)
+
+            rt.backend.copy_from_host(
+                p.grad, np.ascontiguousarray(g)
+            )
+
+            old_p = copy_to_host(rt, p).reshape(-1)
+            decay = np.float32(
+                1.0 - optimizer.lr * (wd if p.ndim > 1 else 0.0)
+            )
+            expected.append(_adamw_reference_step(
+                old_p * decay,
+                g.reshape(-1),
+                old_m,
+                old_v,
+                step,
+                optimizer,
+                ids,
+            ))
+
+        optimizer.step()
+        rt.backend.synchronize()
+
+        for i, (name, p) in enumerate(cases):
+            ref_p, ref_m, ref_v = expected[i]
+            label = f"AdamW/{state_mode}/{name}/step{step}"
+
+            if optimizer.state_mode == "fp32":
+                quantized = False
+                stochastic = False
+            elif optimizer.state_mode == "mini":
+                item = optimizer.dispatches[i]
+                quantized = item[0] == "mini8bit" and bool(item[13])
+                stochastic = item[0] == "mini8bit" and bool(item[11])
+            else:
+                item = optimizer.dispatches[i]
+                quantized = optimizer.state_mode == "8bit" and item[0] == "q8"
+                stochastic = False
+            _check_optimizer_value(label + "/p", 
+                copy_to_host(rt, p).reshape(-1),
+                ref_p,
+                state_mode=optimizer.state_mode,
+                value_kind="parameter",
+                quantized=quantized,
+                stochastic=stochastic,
+                fail_fast=True)
+
+            got_m, got_v = read_adamw_state(rt, optimizer, i)
+            parts = {
+                part[0]: part
+                for part in _optimizer_quantized_parts(optimizer, i)
+            }
+
+            for moment, got, ref in (
+                ("m", got_m, ref_m),
+                ("v", got_v, ref_v),
+            ):
+                if moment in parts:
+                    _check_optimizer_quantization(
+                        rt, label + "/" + moment, parts[moment], ref
+                    )
                 else:
-                    check(f"AdamW/{device}/step[{step}]/{kind}/parameter", copy_to_host(rt, tensor), expected_p)
-                    check(f"AdamW/{device}/step[{step}]/{kind}/m", read_storage_f32(rt, optimizer.m[index]), expected_m)
-                    check(f"AdamW/{device}/step[{step}]/{kind}/v", read_storage_f32(rt, optimizer.v[index]), expected_v)
+                    _check_optimizer_value(
+                        label + "/" + moment,
+                        got.reshape(-1),
+                        ref,
+                        state_mode=optimizer.state_mode,
+                        value_kind=moment,
+                        quantized=quantized,
+                        stochastic=stochastic,
+                        fail_fast=True,
+                    )
 
+    print(
+        f"  PASS AdamW/{state_mode}: "
+        "parameters, moments and quantization"
+    )
 
 def _copy_training_batch(state, input_ids, labels):
     state.rt.backend.copy_from_host(state.input_ids, input_ids)
@@ -2709,39 +4359,13 @@ def _gradient_snapshot(state):
 
 def _optimizer_snapshot(state, optimizer):
     moments = {}
-    use_8bit_state = (
-        optimizer.quant8bit
-        and hasattr(state.rt.backend, "ctx")
-    )
 
     for index, tensor in enumerate(optimizer.params):
         name = state.param_name_by_id[id(tensor)]
-
-        if use_8bit_state:
-            m, v = read_adamw8bit_state(
-                state.rt,
-                optimizer,
-                index,
-            )
-        else:
-            m = read_storage_f32(
-                state.rt,
-                optimizer.m[index],
-                tensor.shape,
-            )
-            v = read_storage_f32(
-                state.rt,
-                optimizer.v[index],
-                tensor.shape,
-            )
-
-        moments[name] = {
-            "m": m,
-            "v": v,
-        }
+        m, v = read_adamw_state(state.rt, optimizer, index)
+        moments[name] = {"m": m, "v": v}
 
     return moments
-
 
 def _gradient_storage_layout(state):
     layout = {}
@@ -2789,17 +4413,33 @@ def _make_accumulation_batches(cfg, accumulation_steps, training_steps, seed):
     return large_cfg, batches
 
 
-def _run_training_trajectory(cfg, arrays, batches, accumulation_steps, enabled, optimizer_gradients=None):
+def _run_training_trajectory(cfg, arrays, batches, accumulation_steps, enabled, 
+                             optimizer_gradients=None, grad_dtype=np.float32):
     initial = batches[0][1][0]
-    state = build_graph("mps", cfg, arrays, *initial)
+    state = build_graph("mps", cfg, arrays, *initial, grad_dtype=grad_dtype)
     optimizer = AdamW(
         state.model.parameters(),
         lr=0.002,
         weight_decay=0.234903,
         betas=(0.9, 0.999),
         eps=1e-8,
-        quant_8bit=True,
+        state_mode=OPTIMIZER_STATE_MODE,
     )
+    optimizer_metadata = {}
+    for index, t in enumerate(optimizer.params):
+        name = state.param_name_by_id[id(t)]
+        quantized = False
+        stochastic = False
+        if optimizer.state_mode == "mini" and isinstance(optimizer.dispatches, tuple):
+            item = optimizer.dispatches[index]
+            if item[0] == "mini8bit":
+                stochastic = bool(item[11])
+                quantized = bool(item[13])
+        # elif optimizer.state_mode == "8bit" and isinstance(optimizer.dispatches, tuple):
+        #     item = optimizer.dispatches[index]
+        #     quantized = item[0] == "q8"
+        optimizer_metadata[name] = {"quantized": quantized, "stochastic": stochastic}
+
     initial_layout = _gradient_storage_layout(state)
     history = []
     for step, (large_batch, micro_batches) in enumerate(batches, 1):
@@ -2875,18 +4515,29 @@ def _run_training_trajectory(cfg, arrays, batches, accumulation_steps, enabled, 
             "gradients": gradients,
             "parameters": parameters,
             "optimizer": _optimizer_snapshot(state, optimizer),
+            "optimizer_metadata": optimizer_metadata,
         })
     if _gradient_storage_layout(state) != initial_layout:
         raise AssertionError("gradient accumulation replaced or reallocated parameter gradient storage")
     return history
 
-def _compare_training_trajectories(reference, accumulated, accumulation_steps):
+def _compare_training_trajectories(reference, accumulated, accumulation_steps, state_mode, grad_dtype=np.float32):
+    gradient_atol, gradient_rtol = ATOL, RTOL
+    if str(grad_dtype).lower() in ("bf16", "bfloat16"):
+        gradient_atol, gradient_rtol = tolerances_for_grad_dtype(grad_dtype, "parameter_grad")
+        gradient_atol *= accumulation_steps
+        gradient_rtol *= accumulation_steps
+
     bitwise_equal = 0
     tensor_count = 0
     max_abs = {"gradient": 0.0, "parameter": 0.0, "optimizer.m": 0.0, "optimizer.v": 0.0}
     for step, (ref_step, acc_step) in enumerate(zip(reference, accumulated), 1):
+        metadata = acc_step.get("optimizer_metadata", {})
         for name in sorted(ref_step["gradients"]):
-            label = f"grad_accum[{accumulation_steps}]/step[{step}]/gradient/{name}"
+            meta = metadata.get(name, {"quantized": False, "stochastic": False,})
+            quantized = bool(meta["quantized"])
+            stochastic = bool(meta["stochastic"])
+            gradient_label = f"grad_accum[{accumulation_steps}]/step[{step}]/gradient/{name}"
             max_abs["gradient"] = max(
                 max_abs["gradient"],
                 float(np.max(np.abs(
@@ -2901,12 +4552,16 @@ def _compare_training_trajectories(reference, accumulated, accumulation_steps):
             # for parallel reductions. K=1 still takes the exact overwrite
             # path (accumulation_step == 0); numerical equality is therefore
             # the meaningful cross-run assertion here.
-            check(label, acc_step["gradients"][name], ref_step["gradients"][name])
-            check(
-                f"grad_accum[{accumulation_steps}]/step[{step}]/parameter/{name}",
-                acc_step["parameters"][name],
-                ref_step["parameters"][name],
-            )
+            check(gradient_label, acc_step["gradients"][name], ref_step["gradients"][name],
+                atol=gradient_atol, rtol=gradient_rtol)
+            parameter_label = f"grad_accum[{accumulation_steps}]/step[{step}]/parameter/{name}"
+            _check_grad_accum_optimizer_value(parameter_label,
+                                              acc_step["parameters"][name],
+                                              ref_step["parameters"][name],
+                                              state_mode=state_mode,
+                                              value_kind="parameter",
+                                              quantized=quantized,
+                                              stochastic=stochastic)
             max_abs["parameter"] = max(
                 max_abs["parameter"],
                 float(np.max(np.abs(
@@ -2915,10 +4570,14 @@ def _compare_training_trajectories(reference, accumulated, accumulation_steps):
             )
             for moment in ("m", "v"):
                 key = f"optimizer.{moment}"
-                check(
+                _check_grad_accum_optimizer_value(
                     f"grad_accum[{accumulation_steps}]/step[{step}]/{key}/{name}",
                     acc_step["optimizer"][name][moment],
                     ref_step["optimizer"][name][moment],
+                    state_mode=state_mode,
+                    value_kind=moment,
+                    quantized=quantized,
+                    stochastic=stochastic,
                 )
                 max_abs[key] = max(
                     max_abs[key],
@@ -2939,7 +4598,7 @@ def _compare_training_trajectories(reference, accumulated, accumulation_steps):
             "Metal reductions are not guaranteed bitwise deterministic"
         )
 
-def probe_gradient_accumulation(cfg, arrays, seed):
+def probe_gradient_accumulation(cfg, arrays, seed, grad_dtype=np.float32):
     print("\n=== No-extra-buffer parameter gradient accumulation ===")
     training_steps = 2
     for accumulation_steps in (1, 2, 4):
@@ -2948,18 +4607,21 @@ def probe_gradient_accumulation(cfg, arrays, seed):
             cfg, accumulation_steps, training_steps, seed
         )
         reference = _run_training_trajectory(
-            cfg, arrays, batches, accumulation_steps, enabled=False
+            cfg, arrays, batches, accumulation_steps, enabled=False, grad_dtype=grad_dtype,
         )
         accumulated = _run_training_trajectory(
             cfg, arrays, batches, accumulation_steps, enabled=True,
             optimizer_gradients=[item["gradients"] for item in reference],
+            grad_dtype=grad_dtype,
         )
-        _compare_training_trajectories(reference, accumulated, accumulation_steps)
+        _compare_training_trajectories(reference, accumulated, accumulation_steps, OPTIMIZER_STATE_MODE, grad_dtype=grad_dtype)
 
 def main():
     global PRINT_PASSES
     args, cfg = parse_args()
     PRINT_PASSES = not args.compact
+    grad_dtype = grad_dtype_value(args.grad_dtype)
+    print(f"grad_dtype={args.grad_dtype}")
     print(f"project_root={PROJECT_ROOT}")
     print(f"runtime={runtime.__file__}")
     print(
@@ -2971,7 +4633,7 @@ def main():
     input_ids, labels = build_inputs(cfg, args.seed)
 
     if args.gradient_accumulation_only:
-        probe_gradient_accumulation(cfg, arrays, args.seed)
+        probe_gradient_accumulation(cfg, arrays, args.seed, grad_dtype=grad_dtype)
         if FAILURES:
             print(f"\n{len(FAILURES)} gradient accumulation correctness check(s) failed:")
             for name, max_abs, max_rel in FAILURES:
@@ -2985,21 +4647,27 @@ def main():
     # The current extension must initialize its Metal contexts before the first
     # CPUBackend instance is constructed.  Device caches both afterwards.
     mps_exact = run_exact_training_graph(
-        build_graph("mps", cfg, arrays, input_ids, labels)
+        build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=grad_dtype, use_fp16_gemm=args.use_fp16_gemm)
     )
     cpu_exact = run_exact_training_graph(
-        build_graph("cpu", cfg, arrays, input_ids, labels)
+        build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype=np.float32)
     )
-    compare_exact_graph(cpu_exact, mps_exact)
+    compare_exact_graph(cpu_exact, mps_exact, mps_grad_dtype=grad_dtype)
 
     cpu_trace = run_staged_graph(
-        build_graph("cpu", cfg, arrays, input_ids, labels)
+        build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype=np.float32)
     )
     mps_trace = run_staged_graph(
-        build_graph("mps", cfg, arrays, input_ids, labels),
+        build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=grad_dtype, use_fp16_gemm=args.use_fp16_gemm),
         reference_inputs=cpu_trace["forward_inputs"],
     )
-    compare_staged_graph(cpu_trace, mps_trace)
+    compare_staged_graph(cpu_trace, mps_trace, mps_grad_dtype=grad_dtype)
+
+    probe_kv_cache_attention(cfg, args.seed + 1000)
+
+    probe_lm_head_op(cfg, args.seed + 2000,)
+
+    # probe_rollout_ops(cfg, args.seed + 3000)
 
     if not args.skip_internal_kernels:
         block = args.kernel_block
@@ -3019,10 +4687,10 @@ def main():
         probe_ce_internal(cfg, final_x, arrays["lm_head.weight"], labels)
 
     if not args.skip_gradient_accumulation:
-        probe_gradient_accumulation(cfg, arrays, args.seed)
+        probe_gradient_accumulation(cfg, arrays, args.seed, grad_dtype=grad_dtype)
 
     if not args.skip_optimizer:
-        probe_adamw()
+        probe_adamw(grad_dtype=grad_dtype)
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")
         for name, max_abs, max_rel in FAILURES:

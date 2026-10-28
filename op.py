@@ -4,6 +4,7 @@ from typing import List
 from tensor import Tensor
 from utils import broadcast_shape, resolve_reshape_shape, infer_reshape_view
 from math import prod
+import numpy as np
 
 class Op(ABC):
 	op_name = "Op"
@@ -288,15 +289,42 @@ class FusedLinearCrossEntropyOp(Op):
 	def __init__(self, ignore_index=-1):
 		self.ignore_index = ignore_index
 
-	def infer_shape(self, x, w, targets):
+	def infer_shape(self, x, w, targets, row_scale=None):
 		return (1,)
 
-	def __call__(self, x, w, targets):
-		shape = self.infer_shape(x, w, targets)
+	def __call__(self, x, w, targets, row_scale=None):
+		if row_scale is None:
+			inputs = (x, w, targets)
+		else:
+			inputs = (x, w, targets, row_scale)
+		shape = self.infer_shape(x, w, targets, row_scale)
 		req_grad = x.requires_grad or w.requires_grad
 		out = Tensor(shape=shape, dtype=x.dtype, requires_grad=req_grad, device=x.device)
-		out.op = OpNode(op=self, inputs=(x, w, targets), outputs=(out,))
+		out.op = OpNode(op=self, inputs=inputs, outputs=(out,))
 		return out
+
+class FusedRMSNormLinearCrossEntropyOp(Op):
+	op_name = "FusedRMSNormLinearCrossEntropy"
+
+	def __init__(self, eps=1e-6):
+		self.eps = eps
+
+	def infer_shape(self, x, w, norm_weight, targets, row_scale=None):
+		return (1,)
+
+	def __call__(self, x, w, norm_weight, targets, row_scale=None):
+		shape = self.infer_shape(x, w, norm_weight, targets, row_scale)
+		inputs = (x, w, norm_weight, targets)
+		if row_scale is not None:
+			inputs = inputs + (row_scale,)
+		out = Tensor(shape=shape, dtype=x.dtype, 
+			         requires_grad=(x.requires_grad or w.requires_grad or norm_weight.requires_grad),
+			         device=x.device)
+		out.op = OpNode(op=self, inputs=inputs, outputs=(out,))
+		return out
+
+	def save_for_backward(self, inputs, outputs):
+		return []
 
 class ScaledDotProductAttenOp(Op):
 	op_name = "ScaledDotProductAttention"
@@ -371,7 +399,13 @@ class FusedRMSNormMLPOp(Op):
 	def __init__(self, eps=1e-6):
 		self.eps = eps 
 
-	def infer_shape(self, x, wgu, wdown):
+	def infer_shape(self, x, *args):
+		if len(args) == 2:
+			norm_weight = None
+			wgu, wdown = args
+		elif len(args) == 3:
+			norm_weight, wgu, wdown = args
+
 		C = x.shape[-1]
 		if wgu.ndim != 2 or wgu.shape[0] != C:
 			raise ValueError(f"wgu share must be ({C}, 2H), got {wgu.shape}")
@@ -380,8 +414,22 @@ class FusedRMSNormMLPOp(Op):
 		H = wgu.shape[1] // 2
 		if wdown.shape != (H, C):
 			raise ValueError(f"wdown shape must be ({H}, {C}), got {wdown.shape}")
+
+		if norm_weight is not None and norm_weight.shape != (C,):
+			raise ValueError(f"norm_weight shape must be ({C},), got {norm_weight.shape}")
 			
 		return x.shape
+
+	def __call__(self, x, *args):
+		shape = self.infer_shape(x, *args)
+		if len(args) == 2:
+			inputs = (x, args[0], args[1])
+		else:
+			inputs = (x, args[0], args[1], args[2])
+		requires_grad = any(t.requires_grad for t in inputs)
+		out = Tensor(shape=shape, dtype=x.dtype, requires_grad=requires_grad, device=x.device)
+		out.op = OpNode(op=self, inputs=inputs, outputs=(out,))
+		return out
 
 	def save_for_backward(self, inputs, outputs):
 		return list(inputs)
@@ -431,6 +479,53 @@ class FusedRMSNormFlashAttentionOp(Op):
 	def save_for_backward(self, inputs, outputs):
 		return list(inputs)
 
+class FusedRMSNormGQAOp(Op):
+	op_name = "FusedRMSNormGQA"
+	recompute_output = True
+
+	def __init__(self, n_head, n_kv_head, eps=1e-6, is_causal=True, rope_sign=1):
+		self.n_head = n_head
+		self.n_kv_head = n_kv_head
+		self.eps = eps
+		self.is_causal = is_causal
+		self.rope_sign = rope_sign
+
+	def infer_shape(self, x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin):
+		B, T, C = x.shape
+		if C % self.n_head or C % 4:
+			raise ValueError("require C % n_head == 0 and C % 4 == 0")
+		return x.shape
+
+	def __call__(self, x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin):
+		inputs = (x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin)
+		shape = self.infer_shape(*inputs)
+		out = Tensor(shape=shape, dtype=x.dtype, device=x.device, requires_grad=any(t.requires_grad for t in inputs[:8]))
+		out.op = OpNode(op=self, inputs=inputs, outputs=(out,))
+		return out
+
+	def save_for_backward(self, inputs, outputs):
+		return list(inputs)
+
+class KVCacheAttentionOp(Op):
+	op_name = "KVCacheAttention"
+
+	def __init__(self, n_head, layer_idx, eps=1e-6, mode="decode"):
+		self.n_head = n_head
+		self.layer_idx = layer_idx
+		self.eps = eps
+		self.mode = mode
+
+	def infer_shape(self, x):
+		B, T, C = x.shape
+		if self.mode == "decode" and T != 1:
+			raise ValueError("KV cache decode requires T=1")
+		return (B, T, C)
+
+	def __call__(self, x, wq, bq, wk, bk, wv, bv, k_cache, v_cache, position, rope_cos, rope_sin):
+		out = Tensor(shape=self.infer_shape(x), dtype=x.dtype, requires_grad=False, device=x.device)
+		out.op = OpNode(op=self, inputs=(x, wq, bq, wk, bk, wv, bv, k_cache, v_cache, position, rope_cos, rope_sin), outputs=(out,))
+		return out
+
 class FusedLinearAddOp(Op):
 	op_name = "FusedLinearAdd"
 
@@ -445,4 +540,153 @@ class FusedLinearAddOp(Op):
 		return out 
 
 	def save_for_backward(self, inputs, outputs):
+		return []  
+
+class LMHeadOp(Op):
+	op_name = "LMHead"
+
+	def infer_shape(self, x, weight):
+		if x.shape[-1] != weight.shape[-1]:
+			raise ValueError(f"LMHead dimension mismatch: x={x.shape}, weight={weight.shape}")
+		return x.shape[:-1] + (weight.shape[0],)
+
+	def __call__(self, x, weight):
+		out = Tensor(shape=self.infer_shape(x, weight), dtype=x.dtype, requires_grad=x.requires_grad or weight.requires_grad, device=x.device,)
+		out.op = OpNode(op=self, inputs=(x, weight), outputs=(out,),)
+		return out
+
+	def save_for_backward(self, inputs, outputs):
 		return []
+
+class LastPositionLMHeadOp(Op):
+	op_name = "LastPositionLMHead"
+
+	def infer_shape(self, x, weight, position):
+		if x.ndim != 3 or x.shape[0] != 1:
+			raise ValueError("LastPositionLMHead requires x with shape [1, T, C]")
+		if weight.ndim != 2 or x.shape[-1] != weight.shape[-1]:
+			raise ValueError(f"LastPositionLMHead dimension mismatch: x={x.shape}, weight={weight.shape}")
+		if tuple(position.shape) != (1,) or np.dtype(position.dtype) != np.dtype(np.int32):
+			raise ValueError("position must have shape (1,) or dtype int32")
+		if not x.is_contiguous or not weight.is_contiguous:
+			raise ValueError("LastPositionLMHead requires contiguous inputs")
+
+		return (1, 1, weight.shape[0])
+
+	def __call__(self, x, weight, position):
+		out = Tensor(shape=self.infer_shape(x, weight, position), dtype=x.dtype, device=x.device, requires_grad=False, name="last_position_lm_head")
+		out.op = OpNode(op=self, inputs=(x, weight, position), outputs=(out,))
+		return out
+
+	def save_for_backward(self, inputs, outputs):
+		return []
+
+class RolloutTopkOp(Op):
+	op_name = "RolloutTopk"
+
+	def __init__(self, max_top_k=64, mode="decode"):
+		self.max_top_k = max_top_k
+		self.mode_id = 0 if mode == "prefill" else 1
+
+	def infer_shape(self, logits, top_k=None, logits_position=None):
+		B = logits.shape[0]
+		V = logits.shape[-1]
+		K = min(64, V)
+
+		return (B, K), (B, K)
+
+	def __call__(self, logits, top_k, logits_position):
+		values_shape, indices_shape = self.infer_shape(logits, top_k, logits_position)
+
+		values = Tensor(shape=values_shape, dtype=logits.dtype, requires_grad=False, device=logits.device,
+						name="rollout_topk_values")
+		indices = Tensor(shape=indices_shape, dtype=np.int32, requires_grad=False, device=logits.device,
+						name="rollout_topk_indices")
+		values.op = OpNode(op=self, inputs=(logits, top_k, logits_position), outputs=(values, indices))
+		indices.op = values.op 
+		return values, indices
+
+	def save_for_backward(self, inputs, outputs):
+		return []
+
+
+class RolloutSampleOp(Op):
+	op_name = "RolloutSample"
+
+	def __init__(self, eos_token, bos_token, max_tokens, mode, step_offset=0):
+		self.eos_token = eos_token
+		self.bos_token = bos_token
+		self.max_tokens = max_tokens
+		self.mode_id = 0 if mode == "prefill" else 1
+		self.step_offset = step_offset
+
+	def infer_shape(self, topk_values, topk_indices):
+		if topk_indices.ndim != 2:
+			raise ValueError(f"RolloutSample expects top-k indices [B, K], got {topk_indices.shape}")
+		if topk_values.shape != topk_indices.shape:
+			raise ValueError(f"top-k shape mismatch values={topk_values.shape}, indices={topk_indices.shape}")
+		return (1,)
+
+	def __call__(self, topk_values, topk_indices, rng_state, rng_raw, finished, temperature, top_k,
+				 next_tokens, generated_ids, lengths, position, step, logits):
+		out = Tensor(shape=self.infer_shape(topk_values, topk_indices),
+					 dtype=np.int32,
+					 requires_grad=False,
+					 device=topk_indices.device,
+					 name="rollout_finished_all")
+		out.op = OpNode(op=self, 
+			            inputs=(topk_values, topk_indices, rng_state, rng_raw, finished, temperature, top_k, next_tokens, generated_ids, lengths, position, step, logits), 
+			            outputs=(out,),)
+		return out
+
+	def save_for_backward(self, inputs, outputs):
+		return []
+
+class DecodeStateOp(Op):
+	op_name = "DecodeState"
+
+	def __init__(self, phase, offset):
+		self.phase = phase
+		self.offset = offset
+
+	def infer_shape(self, dependency, tokens, masks, metadata, finished, config, positions, steps, candidates, next_tokens, global_step):
+	    return next_tokens.shape
+
+	def __call__(self, dependency, tokens, masks, metadata, finished, config, positions, steps, candidates, next_tokens, global_step):
+	    inputs = (dependency, tokens, masks, metadata, finished, config, positions, steps, candidates, next_tokens, global_step)
+	    out = Tensor(shape=self.infer_shape(*inputs), dtype=np.int32, device=tokens.device, 
+	    	         requires_grad=False, name="decode_work_ids")
+	    out.op = OpNode(op=self, inputs=inputs, outputs=(out,),)
+	    return out
+
+	def save_for_backward(self, inputs, outputs):
+		return []
+
+class DecodeFinishedOp(Op):
+	op_name = "DecodeFinish"
+
+	def infer_shape(self, next_ids, finished, step, config):
+		return (1,)
+
+	def __call__(self, next_ids, finished, step, config):
+		inputs = (next_ids, finished, step, config)
+
+		out = Tensor(shape=self.infer_shape(*inputs), dtype=np.int32, device=next_ids.device, requires_grad=False, name="decode_finished_all")
+		out.op = OpNode(op=self, inputs=inputs, outputs=(out,),)
+		return out
+
+	def save_for_backward(self, inputs, outputs):
+		return []
+
+
+
+
+
+
+
+
+
+
+
+
+

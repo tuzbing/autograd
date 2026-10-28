@@ -5,6 +5,8 @@ from pathlib import Path
 import numpy as np
 from math import prod
 import struct
+from scratch import align_up
+from gemm import fp16_gemm_kernel_name
 
 _ROOT_BACKEND_PATH = Path(__file__).resolve().parent.parent / "backend.py"
 _SPEC = importlib.util.spec_from_file_location("_autograd_root_backend", _ROOT_BACKEND_PATH)
@@ -157,12 +159,11 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		return f"fused_rms_fa_forward_block{capacity}", 256, (seq_len+31)//32, 256
 
 	def fa_from_qkv_dispatch(self, head_dim, seq_len):
-		if head_dim <= 0 or head_dim > 512:
+		if head_dim <= 0 or head_dim > 128:
 			raise ValueError(f"fused attention requires 0 < head_dim <= 512, got {head_dim}")
-		if head_dim <= 128:
-			return "fused_fa_from_qkv", 128, (seq_len+7)//8, 128
-		capacity = 256 if head_dim <= 256 else 512
-		return f"fused_fa_from_qkv_block{capacity}", 32, seq_len, 32
+		if head_dim <= 64:
+			return "fused_fa_from_qkv_d64", 128, (seq_len+7)//8, 128
+		return "fused_fa_from_qkv_d128", 128, (seq_len+7)//8, 128
 
 	def fa_bwd_dq_dispatch(self, head_dim, seq_len):
 		if head_dim <= 0 or head_dim > 128:
@@ -198,6 +199,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset,
 				wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset],
 			[B, T, C, H, eps_bits], 256, (B * T + 15) // 16, 1, 256)
+
 		# RoPE
 		self.ctx.dispatch_with_args_3d("rope_qk_inplace",
 			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -289,25 +291,45 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			[B, T, C, eps_bits], 128, (B * T + 3) // 4, 1, 128)
 
 		# 7. dWq, dWk, dWv
-		if wq.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dq.ptr.buffer_id, wq.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dq.ptr.offset, wq.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
-		if wk.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dk.ptr.buffer_id, wk.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dk.ptr.offset, wk.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
-		if wv.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dv.ptr.buffer_id, wv.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dv.ptr.offset, wv.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
+		for weight, dweigt in ((wq, dq), (wk, dk), (wv, dv)):
+			if not weight.requires_grad:
+				continue
+			dw_bf16 = np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16)
+			if dw_bf16:
+				dw_capacity = (v.ptr.offset + v.nbytes - k.ptr.offset) // 4
+				dw_tile_rows = min(C, dw_capacity // C)
+
+				for row0 in range(0, C, dw_tile_rows):
+					tile_rows = min(dw_tile_rows, C - row0)
+					# tmp[tile_rows, C] = Z[:, row0:row0+tile_rows].T @ dweight
+					self.ctx.dispatch_gemm_mps([q.ptr.buffer_id, dweigt.ptr.buffer_id, k.ptr.buffer_id],
+						[q.ptr.offset+row0*4, dweigt.ptr.offset, k.ptr.offset],
+						[1, tile_rows, C, B*T, 1, 0, 0, 0, 0, C*4], 1.0, 0.0)
+					self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+						[k.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+						[k.ptr.offset, weight.grad.storage.ptr.offset+row0*C*2],
+						[accumulate], tile_rows*C, 1, 1, min(tile_rows*C, 256))
+			else:
+				self.ctx.dispatch_gemm_mps(
+					[q.ptr.buffer_id, dweigt.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+					[q.ptr.offset, dweigt.ptr.offset, weight.grad.storage.ptr.offset],
+					[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
 
 		# 8. dbq/dbk/dbv
 		if bq.requires_grad or bk.requires_grad or bv.requires_grad:
-			self.ctx.dispatch_with_args_3d('fused_qkv_bias_grad',
+			bq_bf16 = bq.requires_grad and np.dtype(bq.grad.storage.dtype) == np.dtype(np.uint16)
+			bk_bf16 = bk.requires_grad and np.dtype(bk.grad.storage.dtype) == np.dtype(np.uint16)
+			bv_bf16 = bv.requires_grad and np.dtype(bv.grad.storage.dtype) == np.dtype(np.uint16)
+			bf16_mask = int(bq_bf16) | (int(bk_bf16) << 1) | (int(bv_bf16) << 2)
+			if bf16_mask:
+				bias_kernel = "fused_qkv_bias_grad_bf16"
+				enable_mask = int(bq.requires_grad) | (int(bk.requires_grad) << 1) | (int(bv.requires_grad) << 2)
+				bias_args = [B*T, C, accumulate, enable_mask, bf16_mask]
+			else:
+				bias_kernel = "fused_qkv_bias_grad"
+				bias_args = [B*T, C, accumulate]
+
+			self.ctx.dispatch_with_args_3d(bias_kernel,
 				[dq.ptr.buffer_id, dk.ptr.buffer_id, dv.ptr.buffer_id, 
 					bq.grad.storage.ptr.buffer_id if bq.requires_grad else 0,
 					bk.grad.storage.ptr.buffer_id if bk.requires_grad else 0,
@@ -316,7 +338,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					bq.grad.storage.ptr.offset if bq.requires_grad else 0,
 					bk.grad.storage.ptr.offset if bk.requires_grad else 0,
 					bv.grad.storage.ptr.offset if bv.requires_grad else 0],
-				[B*T, C, accumulate], 128, (C + 3) // 4, 1, 128)
+				bias_args, 128, (C + 3) // 4, 1, 128)
 
 		# 9. dZ =  dQ*Wq + dK*Wk + dV*Wv
 		if x.requires_grad:
@@ -339,6 +361,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 	def metal_fused_linear_ce_forward(self, inputs, outputs, scratch=None):
 		x, w, targets = inputs[0], inputs[1], inputs[2]
+		row_scale = inputs[3] if len(inputs) > 3 else None
 		out_loss = outputs[0]
 		
 		N = x.shape[0] * x.shape[1] if len(x.shape) == 3 else x.shape[0]
@@ -349,11 +372,17 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		logits = scratch["logits"]
 		chunk_rows = min(logits.shape[0], N)
 		itemsize = np.dtype(x.dtype).itemsize
+		dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
 
 		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
-		scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
-		scale_bits = struct.unpack("<i", struct.pack("<f", scale))[0]
+		use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
 		need_grad = x.requires_grad or w.requires_grad
+		if row_scale is None:
+			kernel_name = "fused_linear_ce_logits_to_dlogits"
+			scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
+			scale_bits = struct.unpack("<I", struct.pack("<f", scale))[0]
+		else:
+			kernel_name = "fused_linear_ce_logits_to_dlogits_row_scaled"
 
 		for row_base in range(0, N, chunk_rows):
 			rows = min(chunk_rows, N - row_base)
@@ -366,30 +395,130 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
 
 			# 2) row_loss/lse/dlogits
-			self.ctx.dispatch_with_args_3d("fused_linear_ce_logits_to_dlogits",
-				[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
-				[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
-				[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			if row_scale is None:
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
+					[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
+					[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			else:
+				inp_vars = [logits, targets.storage, row_loss, lse, row_scale.storage]
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+					[rows, V, row_base, N, int(need_grad)], 256, rows, 1, 256)
 
 			if not need_grad:
 				continue
 
-			# 3) dX = dlogits @ W
+			# 3) dX = dlogits([rows, V]) @ W([V, C])
 			if x.requires_grad:
-				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-					[logits.ptr.offset, w.storage.ptr.offset, x.grad.storage.ptr.offset+row_base*C*itemsize],
-					[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
+				x_grad_offset = x.grad.storage.ptr.offset+row_base*C*itemsize
+				if use_fp16_gemm:
+					gemm_quant = scratch["gemm_quant"]
+					quant_base = gemm_quant.ptr.offset
+					group_k = (V+127)//128
+					group_n = (C+127)//128
+					qa_size = align_up(rows*V*2, 16)
+					qb_size = align_up(V*C*2, 16)
+					sa_size = align_up(rows*group_k*4, 16)
+					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
+						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+						[logits.ptr.offset, quant_base, quant_base + qa_size + qb_size],
+						[rows, V, V, 1], 128, group_k, (rows+3)//4, 128)
+					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
+						[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+						[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
+						[C, V, 1, C], 256, group_k, group_n, 256)
+					
+					cfg = scratch.gemm_configs[("dx", rows, False)]
+					num_math_threads = 128 if cfg["block_m"]*cfg["block_n"] <= 64*64 else 512
+					num_threads = 2*32 + num_math_threads
+					print(f"dX NEED KERNEL {fp16_gemm_kernel_name(cfg, False)}")
+					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
+						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
+						[rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
+				else:
+					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
+						[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
 
-			# 4) dW += dlogits.T@X
-			if w.requires_grad:
-				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-					[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
-					[1, V, C, rows, 1, 0, 0, 0], 1.0, 1.0 if accumulate or row_base != 0 else 0.0)
+			# 4) dW += dlogits.T([V, rows])@X([rows, C])
+			if w.requires_grad and not dw_bf16:
+				with_accum = bool(accumulate or row_base != 0)
+				if use_fp16_gemm:
+					gemm_quant = scratch["gemm_quant"]
+					quant_base = gemm_quant.ptr.offset
+					group_k = (rows + 127) // 128
+					group_n = (C + 127) // 128
+
+					qa_size = align_up(V*rows*2, 16)
+					qb_size = align_up(rows*C*2, 16)
+					sa_size = align_up(V*group_k*4, 16)
+					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
+						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+						[logits.ptr.offset, quant_base, quant_base+qa_size+qb_size],
+						[V, rows, 1, V], 128, group_k, (V+3)//4, 128)
+					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
+						[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+						[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
+						[C, rows, 1, C], 256, group_k, group_n, 256)
+					
+					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
+					num_math_threads = 128 if cfg["block_m"]*cfg["block_n"] <= 64*64 else 512
+					num_threads = 2*32 + num_math_threads
+					print(f"dW NEED KERNEL {fp16_gemm_kernel_name(cfg, with_accum)}")
+					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, with_accum),
+						[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+						[V, C, rows, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
+				else:
+					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
+						[1, V, C, rows, 1, 0, 0, 0], 1.0, float(with_accum))
 
 		self.ctx.dispatch_with_args_3d('fused_linear_ce_forward_reduce',
 			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
 			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
 			[N], 256, 1, 1, 256)
+
+		if not dw_bf16:
+			return
+
+		# 前半区存放dlogits, 后半区存放dW
+		capacity = logits.nbytes // 4
+		tile_rows = min(chunk_rows, capacity - C)
+		tile_v = min(V, capacity // (tile_rows + C))
+		dw_offset = logits.ptr.offset + tile_rows * tile_v * 4
+		for vocab_base in range(0, V, tile_v):
+			cols = min(tile_v, V - vocab_base)
+			w_offset = w.storage.ptr.offset + vocab_base * C * 4
+
+			for row_base in range(0, N, tile_rows):
+				rows = min(tile_rows, N - row_base)
+				x_offset = x.storage.ptr.offset + row_base*C*4
+
+				# 1. 重算当前token块, 词表块的logits
+				self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w_offset, logits.ptr.offset],
+					[rows, C, cols], 256, (rows+63)//64, (cols+95)//96, 256)
+
+				# 2. 使用阶段一保存的全词表LSE原地生成当前块的dlogits
+				count = rows * cols
+				self.ctx.dispatch_with_args_3d("ce_tile_logits_to_dlogits",
+					[logits.ptr.buffer_id, lse.ptr.buffer_id, targets.storage.ptr.buffer_id],
+					[logits.ptr.offset, lse.ptr.offset, targets.storage.ptr.offset],
+					[cols, vocab_base, V, row_base, scale_bits], count, 1, 1, min(count, 256))
+
+				# 3. dW_tile += dlogits_tile.T @ X_chunk
+				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[logits.ptr.offset, x_offset, dw_offset], [1, cols, C, rows, 1, 0, 0, 0], 1.0, 0.0 if row_base == 0 else 1.0)
+
+			# 4. 转换成BF16
+			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+				[logits.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+				[dw_offset, w.grad.storage.ptr.offset + vocab_base*C*2],
+				[int(accumulate)], cols*C, 1, 1, min(cols*C, 256))
 
 	def metal_fused_linear_ce_backward(self, inputs, outputs, scratch=None):
 		return
@@ -413,6 +542,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 				out_buf.ptr.offset, k.ptr.offset, v.ptr.offset],
 			[B, T, C, H, eps_bits], 512, (B*T+31)//32, 1, 512)
+
 		# RoPE
 		self.ctx.dispatch_with_args_3d("rope_qk_inplace",
 			[out_buf.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -452,6 +582,17 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	    K_dim = act.shape[-1]
 	    N_dim = w.shape[-1]
 	    accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
+
+	    dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+	    db_bf16 = b.requires_grad and np.dtype(b.grad.storage.dtype) == np.dtype(np.uint16)
+	    if dw_bf16:
+	    	fa_k = scratch["fa_k"]
+	    	fa_v = scratch["fa_v"]
+	    	dw_buffer_id = fa_k.ptr.buffer_id
+	    	dw_offset = fa_k.ptr.offset
+	    	dw_capacity = (fa_v.ptr.offset + fa_v.nbytes - dw_offset) // 4
+	    	dw_tile_k = min(K_dim, dw_capacity // N_dim)
+
 	    if act.op is not None and act.op.op.op_name == "FusedRMSNormFlashAttention":
 	    	cached = getattr(self, "_recomputed_attention_cache", None)
 	    	if cached is not None and id(act) in cached:
@@ -463,9 +604,20 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	    else:
 	        act_buf = act.storage
 	    if w.requires_grad:
-	        self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-	        	[act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
-	        	[1, K_dim, N_dim, B_dim*M_dim, 1, 0, 0, 0], 1.0, float(accumulate))
+	    	if dw_bf16:
+	    		for k0 in range(0, K_dim, dw_tile_k):
+	    			tile_k = min(dw_tile_k, K_dim - k0)
+	    			self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dw_buffer_id],
+	    				[act_buf.ptr.offset + k0*4, out.grad.storage.ptr.offset, dw_offset],
+	    				[1, tile_k, N_dim, B_dim*M_dim, 1, 0, 0, 0, 0, K_dim*4], 1.0, 0.0)
+	    			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+	    				[dw_buffer_id, w.grad.storage.ptr.buffer_id],
+	    				[dw_offset, w.grad.storage.ptr.offset + k0*N_dim*2],
+	    				[accumulate], tile_k*N_dim, 1, 1, min(tile_k*N_dim, 256))
+	    	else:
+		        self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+		        	[act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+		        	[1, K_dim, N_dim, B_dim*M_dim, 1, 0, 0, 0], 1.0, float(accumulate))
 	    if x.requires_grad:
 	        self.ctx.dispatch_strided(
 	            "strided_add_backward_kernel",
@@ -483,13 +635,19 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	        	[1, B_dim*M_dim, K_dim, N_dim, 0, 1, 0, 0], 1.0, 0.0)
 
 	    if b.requires_grad:
-	        self.ctx.dispatch_with_args_3d("bias_grad_reduce",
+	        bias_kernel = "bias_grad_reduce_bf16" if db_bf16 else "bias_grad_reduce"
+	        self.ctx.dispatch_with_args_3d(bias_kernel,
 	        	[out.grad.storage.ptr.buffer_id, b.grad.storage.ptr.buffer_id],
 	        	[out.grad.storage.ptr.offset, b.grad.storage.ptr.offset], 
 	        	[prod(x.shape[:-1]), N_dim, accumulate], 256, (N_dim+15)//16, 1, 256)
 
 	def metal_fused_rmsnorm_mlp_forward(self, inputs, outputs, scratch=None):
-	    x, wgu, wdown = inputs
+	    if len(inputs) == 3:
+	    	x, wgu, wdown = inputs
+	    	norm_weight = None
+	    elif len(inputs) == 4:
+	    	x, norm_weight, wgu, wdown = inputs
+
 	    out = outputs[0]
 
 	    N = prod(x.shape[:-1])
@@ -497,48 +655,28 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	    H2 = wgu.shape[-1]
 	    H = H2 // 2
 
-	    eps_bits = struct.unpack(
-	        "<i",
-	        struct.pack("<f", out.op.op.eps),
-	    )[0]
+	    eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
 
 	    gu = scratch["gu"]
 	    hidden = scratch["hidden"]
 
 	    # 使用 out 暂存 RMSNorm 输出，避免额外的 x_norm scratch
-	    self.ctx.dispatch_with_args_3d(
-	        "rmsnorm_forward",
-	        [
-	            x.storage.ptr.buffer_id,
-	            out.storage.ptr.buffer_id,
-	        ],
-	        [
-	            x.storage.ptr.offset,
-	            out.storage.ptr.offset,
-	        ],
-	        [C, eps_bits],
-	        N * 256,
-	        1,
-	        1,
-	        256,
-	    )
+	    if norm_weight is None:
+		    self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+		        [x.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+		        [x.storage.ptr.offset, hidden.ptr.offset],
+		        [C, eps_bits], N * 256, 1, 1, 256)
+	    else:
+		    self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+		    	[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+		    	[x.storage.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
+		    	[C, eps_bits], N*256, 1, 1, 256)
 
 	    # GU = X_norm @ Wgu
 	    self.ctx.dispatch_gemm_mps(
-	        [
-	            out.storage.ptr.buffer_id,
-	            wgu.storage.ptr.buffer_id,
-	            gu.ptr.buffer_id,
-	        ],
-	        [
-	            out.storage.ptr.offset,
-	            wgu.storage.ptr.offset,
-	            gu.ptr.offset,
-	        ],
-	        [1, N, H2, C, 0, 0, 0, 0],
-	        1.0,
-	        0.0,
-	    )
+	    	[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+	        [hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+	        [1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 	    # HIDDEN = SiLU(gate) * up
 	    self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
@@ -548,23 +686,17 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 	    # OUT = HIDDEN @ Wdown
 	    self.ctx.dispatch_gemm_mps(
-	        [
-	            hidden.ptr.buffer_id,
-	            wdown.storage.ptr.buffer_id,
-	            out.storage.ptr.buffer_id,
-	        ],
-	        [
-	            hidden.ptr.offset,
-	            wdown.storage.ptr.offset,
-	            out.storage.ptr.offset,
-	        ],
-	        [1, N, C, H, 0, 0, 0, 0],
-	        1.0,
-	        0.0,
-	    )
+	        [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+	        [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+	        [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
 
 	def metal_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
-		x, wgu, wdown = inputs
+		if len(inputs) == 3:
+			x, wgu, wdown = inputs
+			norm_weight = None
+		elif len(inputs) == 4:
+			x, norm_weight, wgu, wdown = inputs
+
 		out = outputs[0]
 		grad_out = out.grad
 		if grad_out is None: return
@@ -583,10 +715,27 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		residual_grad = grad_out.storage
 
 		fla_node = x.op 
-		recompute_x = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
+		recompute_fla = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
 			and len(fla_node.inputs) == 4 and fla_node.inputs[1].op is not None
 			and fla_node.inputs[1].op.op.op_name == "FusedRMSNormFlashAttention")
-		if recompute_x:
+		recompute_gqa = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
+			and len(fla_node.inputs) == 4 and fla_node.inputs[1].op is not None
+			and fla_node.inputs[1].op.op.op_name == "FusedRMSNormGQA")
+		recompute_x = recompute_fla or recompute_gqa
+
+		down_bf16 = wdown.requires_grad and np.dtype(wdown.grad.storage.dtype) == np.dtype(np.uint16)
+		gu_bf16 = wgu.requires_grad and np.dtype(wgu.grad.storage.dtype) == np.dtype(np.uint16)
+		capacity = hidden.nbytes // 4
+		if down_bf16:
+			# [N, down_tile_h] + [down_tile_h, C]
+			down_tile_h = min(H, capacity // (N+C))
+			down_dw_relative = N * down_tile_h * 4
+		if gu_bf16:
+			# recompute_x=True: 前部保留X_norm[N, C], 否则X_norm在tmp_dx, 可使用整个hidden
+			gu_dw_relative = N * C * 4 if recompute_x else 0
+			gu_tile_r = min(C, (capacity - gu_dw_relative // 4) // H2)
+
+		if recompute_fla:
 			x_in, attn_out, proj_w, proj_b = fla_node.inputs
 			fa_node = attn_out.op
 			fa_x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = fa_node.inputs
@@ -642,16 +791,73 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			x_buffer_id = tmp_dx.ptr.buffer_id
 			x_offset = tmp_dx.ptr.offset
 			x_norm_storage = hidden
+		elif recompute_gqa:
+			x_in, attn_out, proj_w, proj_b = fla_node.inputs
+			fa_node = attn_out.op
+			fa_x, fa_norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = fa_node.inputs
+			B, T, C = fa_x.shape
+			Hq, Hkv = fa_node.op.n_head, fa_node.op.n_kv_head
+			D = C // Hq
+			CKV = Hkv * D
+			fa_eps_bits = struct.unpack("<i", struct.pack("<f", fa_node.op.eps))[0]
+			fa_q_offset = gu.ptr.offset
+			fa_k_offset = fa_q_offset + B*T*C*4
+			fa_v_offset = fa_k_offset + B*T*CKV*4
+			fa_out_storage = attn_out.grad.storage
+
+			self.ctx.dispatch_with_args_3d("gqa_rms_qkv",
+				[fa_x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id,
+				 wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, fa_norm_weight.storage.ptr.buffer_id],
+				[fa_x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset,
+				 wv.storage.ptr.offset, bv.storage.ptr.offset, fa_q_offset, fa_k_offset, fa_v_offset, fa_norm_weight.storage.ptr.offset],
+				[B, T, C, Hq, fa_eps_bits, Hkv], 256, (B*T+15)//16, 1, 256)
+
+			negative_sin = int(fa_node.op.rope_sign < 0)
+			self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+				[gu.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+				[fa_q_offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+				[B, Hq, T, D, 0, negative_sin], D//2, T, B*Hq, D//2)
+
+			self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+				[gu.ptr.buffer_id, rope_cos.storage.ptr.buffer_id,rope_sin.storage.ptr.buffer_id],
+			    [fa_k_offset,rope_cos.storage.ptr.offset,rope_sin.storage.ptr.offset],
+			    [B, Hkv, T, D, 0, negative_sin], D//2, T, B*Hkv, D//2)
+
+			fa_kernel = 'gqa_from_qkv_d64' if D <= 64 else 'gqa_from_qkv_d128'
+			self.ctx.dispatch_with_args_3d(fa_kernel,
+			    [gu.ptr.buffer_id,gu.ptr.buffer_id,gu.ptr.buffer_id,
+			     fa_out_storage.ptr.buffer_id,gu.ptr.buffer_id],
+			    [fa_q_offset,fa_k_offset,fa_v_offset,fa_out_storage.ptr.offset,fa_q_offset],
+			    [B,Hq,T,C,int(fa_node.op.is_causal),0,Hkv],128,(T+7)//8,B*Hq,128)
+			M_fla = prod(x_in.shape[:-1])
+			K_fla, N_fla = attn_out.shape[-1], proj_w.shape[-1]
+			self.ctx.dispatch_with_args_3d('fused_linear_add_forward_kernel',
+			    [x_in.storage.ptr.buffer_id,fa_out_storage.ptr.buffer_id,proj_w.storage.ptr.buffer_id,
+			     proj_b.storage.ptr.buffer_id,tmp_dx.ptr.buffer_id],
+			    [x_in.storage.ptr.offset,fa_out_storage.ptr.offset,proj_w.storage.ptr.offset,
+			     proj_b.storage.ptr.offset,tmp_dx.ptr.offset],
+			    [M_fla,K_fla,N_fla,0],256,(N_fla+63)//64,(M_fla+63)//64,256)
+			if not hasattr(self, '_recomputed_attention_cache'):
+			    self._recomputed_attention_cache = set()
+			self._recomputed_attention_cache.add(id(attn_out))
+			x_buffer_id, x_offset = tmp_dx.ptr.buffer_id, tmp_dx.ptr.offset
+			x_norm_storage = hidden
 		else:
 			x_buffer_id = x.storage.ptr.buffer_id
 			x_offset = x.storage.ptr.offset
 			x_norm_storage = tmp_dx
 
 		# 5. X_norm = RMSNorm(x)
-		self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-			[x_buffer_id, x_norm_storage.ptr.buffer_id],
-			[x_offset, x_norm_storage.ptr.offset],
-			[C, eps_bits], N * 256, 1, 1, 256)
+		if norm_weight is None:			
+			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+				[x_buffer_id, x_norm_storage.ptr.buffer_id],
+				[x_offset, x_norm_storage.ptr.offset],
+				[C, eps_bits], N * 256, 1, 1, 256)
+		else:
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+				[x_buffer_id, norm_weight.storage.ptr.buffer_id, x_norm_storage.ptr.buffer_id],
+				[x_offset, norm_weight.storage.ptr.offset, x_norm_storage.ptr.offset],
+				[C, eps_bits], N*256, 1, 1, 256)
 
 		# 6. GU = X_norm @ Wgu
 		self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
@@ -659,16 +865,33 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 		# 7. hidden = SiLU(gate)*up
-		self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
-			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
-			[gu.ptr.offset, hidden.ptr.offset],
-			[N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4, 256))
+		if down_bf16:
+			dw_offset = hidden.ptr.offset + down_dw_relative
+			for h0 in range(0, H, down_tile_h):
+				h = min(down_tile_h, H - h0)
+				# hidden头部: FP32 [N, h]
+				self.ctx.dispatch_with_args_3d("swiglu_forward_tile_kernel",
+					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+					[gu.ptr.offset, hidden.ptr.offset],
+					[N, H, h0, h], N*((h+3)//4), 1, 1, min(N*((h+3)//4), 256))
+				# hidden尾部: FP32 [h, C]
+				self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, grad_out.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+					[hidden.ptr.offset, grad_out.storage.ptr.offset, dw_offset],
+					[1, h, C, N, 1, 0, 0, 0], 1.0, 0.0)
+				self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+					[hidden.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id], [dw_offset, wdown.grad.storage.ptr.offset+h0*C*2],
+					[accumulate], h*C, 1, 1, min(h*C, 256))
+		else:
+			self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+				[gu.ptr.offset, hidden.ptr.offset],
+				[N, H], N*((H+3)//4), 1, 1, min(N*((H+3)//4), 256))
 
 		# 8. dWdown = HIDDEN.T @ dOUT
-		if wdown.requires_grad:
+		if wdown.requires_grad and not down_bf16:
 			self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
 				[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
-				[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))
+				[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))	
 
 		# 9. hidden -> dHidden
 		self.ctx.dispatch_gemm_mps([out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
@@ -679,22 +902,47 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		self.ctx.dispatch_with_args_3d("swiglu_backward_inplace_kernel",
 			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
 			[gu.ptr.offset, hidden.ptr.offset],
-			[N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4, 256))
+			[N, H], N*H, 1, 1, 256)
 
 		if recompute_x:
-			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-				[tmp_dx.ptr.buffer_id, hidden.ptr.buffer_id],
-				[tmp_dx.ptr.offset, hidden.ptr.offset],
-				[C, eps_bits], N*256, 1, 1, 256)
+			if norm_weight is None:
+				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+					[tmp_dx.ptr.buffer_id, hidden.ptr.buffer_id],
+					[tmp_dx.ptr.offset, hidden.ptr.offset],
+					[C, eps_bits], N*256, 1, 1, 256)
+			else:
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+					[tmp_dx.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+					[tmp_dx.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
+					[C, eps_bits], N*256, 1, 1, 256)
 			x_norm_storage = hidden
 		else:
 			x_norm_storage = tmp_dx
 
 		# 11. dWgu = X_norm.T @ dGU
 		if wgu.requires_grad:
-			self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
-				[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
-				[1, C, H2, N, 1, 0, 0, 0], 1.0, float(accumulate))
+			if gu_bf16:
+				dw_offset = hidden.ptr.offset + gu_dw_relative
+				for c0 in range(0, C, gu_tile_r):
+					r = min(gu_tile_r, C - c0)
+					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, hidden.ptr.buffer_id],
+						[x_norm_storage.ptr.offset+c0*4, gu.ptr.offset, dw_offset],
+						[1, r, H2, N, 1, 0, 0, 0, 0, C*4], 1.0, 0.0)
+					self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+						[hidden.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id], [dw_offset, wgu.grad.storage.ptr.offset+c0*H2*2],
+						[accumulate], r*H2, 1, 1, min(r*H2, 256))
+			else:
+				main_rows = (N // 16) * 16
+				tail_rows = N - main_rows
+				if main_rows > 0:
+					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+						[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+						[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
+				if tail_rows:
+					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_tail",
+						[x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+						[x_norm_storage.ptr.offset+main_rows*C*4, gu.ptr.offset+main_rows*H2*4, wgu.grad.storage.ptr.offset],
+						[tail_rows, H2, C, int(accumulate or main_rows > 0)], (H2+3)//4, C, 1, min((H2+3)//4, 128))
 
 		# 12. dX_norm
 		if recompute_x:
@@ -707,13 +955,25 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			[1, N, C, H2, 0, 1, 0, 0], 1.0, 0.0)
 
 		# 13. RMSNorm backward
-		if recompute_x:
+		if norm_weight is not None and norm_weight.requires_grad:
+			norm_grad_bf16 = np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_dgamma",
+				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+				[x_offset, dx_norm_storage.ptr.offset, norm_weight.grad.storage.ptr.offset],
+				[N, C, eps_bits, int(accumulate), int(norm_grad_bf16)], C, 1, 1, min(C, 256))
+
+		if norm_weight is None:
 			self.ctx.dispatch_with_args_3d("rmsnorm_backward",
 				[x_buffer_id, dx_norm_storage.ptr.buffer_id, tmp_dx.ptr.buffer_id, residual_grad.ptr.buffer_id],
 				[x_offset, dx_norm_storage.ptr.offset, tmp_dx.ptr.offset, residual_grad.ptr.offset],
 				[N, C, eps_bits], 256, (N+7)//8, 1, 256)
 		else:
-			self.ctx.dispatch_with_args_3d("rmsnorm_backward",
-				[x_buffer_id, dx_norm_storage.ptr.buffer_id, dx_norm_storage.ptr.buffer_id, residual_grad.ptr.buffer_id],
-				[x_offset, dx_norm_storage.ptr.offset, dx_norm_storage.ptr.offset, residual_grad.ptr.offset],
+			inp_bufs = [x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id,
+			            tmp_dx.ptr.buffer_id if recompute_x else dx_norm_storage.ptr.buffer_id, 
+			residual_grad.ptr.buffer_id]
+			inp_offs = [x_offset, dx_norm_storage.ptr.offset, norm_weight.storage.ptr.offset, 
+			            tmp_dx.ptr.offset if recompute_x else dx_norm_storage.ptr.offset, residual_grad.ptr.offset]
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_backward",
+				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, tmp_dx.ptr.buffer_id, residual_grad.ptr.buffer_id],
+				[x_offset, dx_norm_storage.ptr.offset, norm_weight.storage.ptr.offset, tmp_dx.ptr.offset, residual_grad.ptr.offset],
 				[N, C, eps_bits], 256, (N+7)//8, 1, 256)

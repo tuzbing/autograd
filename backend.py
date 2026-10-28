@@ -6,8 +6,10 @@ import struct
 from op import AddOp, MulOp, MatMulOp, ViewOp, ReshapeOp, PermuteOp, TransposeOp, ContiguousOp
 from op import ExpOp, LogOp, RsqrtOp, SoftmaxOp, GELUOp, CrossEntropyLossOp, LayerNormOp, GatherOp, ScaledDotProductAttenOp
 from op import FusedLinearCrossEntropyOp, FusedMLPOp, FusedQKVProjOp, AttnOutContiguousOp, FusedRMSNormMLPOp, FlashAttentionOp 
-from op import FusedRMSNormFlashAttentionOp, FusedLinearAddOp
-from utils import xavier_uniform, reduce_broadcast_grad, tensor_to_numpy, is_materialized, grad_shape_matches, mul_bcast_kind, f32_bits
+from op import FusedRMSNormFlashAttentionOp, FusedLinearAddOp, KVCacheAttentionOp, LMHeadOp, RolloutTopkOp, RolloutSampleOp
+from op import LastPositionLMHeadOp, DecodeStateOp, DecodeFinishedOp
+from op import FusedRMSNormGQAOp, FusedRMSNormLinearCrossEntropyOp
+from utils import xavier_uniform, reduce_broadcast_grad, tensor_to_numpy, is_materialized, grad_shape_matches, mul_bcast_kind, f32_bits, bf16_bits
 
 import metal_ext
 
@@ -25,6 +27,9 @@ class Backend:
 		raise NotImplementedError()
 
 	def fill_storage(self, storage, value):
+		raise NotImplementedError()
+
+	def fill_storage2(self, storage, value):
 		raise NotImplementedError()
 
 	def fill_scalar(self, tensor, value):
@@ -706,6 +711,178 @@ def cpu_fused_linear_ce_backward(inputs, outputs, scratch=None):
 			np.matmul(P_slice.T, X_slice, out=tmp_dw)
 			np.add(w.grad.storage.data, tmp_dw, out=w.grad.storage.data)
 
+def cpu_fused_rmsnorm_linear_ce_forward(inputs, outputs, scratch=None):
+	x, w, norm_weight, targets = inputs[:4]
+	row_scale = inputs[4] if len(inputs) == 5 else None
+	out_loss = outputs[0]
+	op = out_loss.op.op
+
+	X = x.storage.data.reshape(-1, x.shape[-1])
+	W = w.storage.data
+	G = norm_weight.storage.data
+	Y = targets.storage.data.reshape(-1)
+
+	N, C = X.shape
+	V = W.shape[0]
+
+	L = scratch["logits"].data.reshape(N, V)
+	Z = scratch["x_norm"].data.reshape(N, C)
+	R = scratch["inv_rms"].data.reshape(N, 1)
+	M = scratch["max"].data.reshape(N, 1)
+	S = scratch["sum"].data.reshape(N, 1)
+	TL = scratch["target_logits"].data.reshape(N, 1)
+
+	scales = None
+	if row_scale is not None:
+		scales = row_scale.storage.data.reshape(-1)
+
+	# RMSNorm: z = x * rsqrt(mean(x^2) + eps) * gamma
+	np.multiply(X, X, out=Z)
+	np.mean(Z, axis=1, keepdims=True, out=R)
+	np.add(R, np.float32(op.eps), out=R)
+	np.sqrt(R, out=R)
+	np.reciprocal(R, out=R)
+
+	np.multiply(X, R, out=Z)
+	np.multiply(Z, G, out=Z)
+
+	# logits = z @ W.T
+	np.matmul(Z, W.T, out=L)
+
+	# 先保存 max 和 sum，L 保持原始 logits，
+	# 使 CPU 参考路径直接依据数学定义计算 CE。
+	TL.fill(np.float32(0.0))
+	valid = (Y >= 0) & (Y < V)
+	valid_rows = np.flatnonzero(valid)
+	if valid_rows.size:
+		TL[valid_rows, 0] = L[valid_rows, Y[valid_rows]]
+
+	np.max(L, axis=1, keepdims=True, out=M)
+	np.subtract(L, M, out=L)
+	np.exp(L, out=L)
+	np.sum(L, axis=1, keepdims=True, out=S)
+
+	row_loss = M[:, 0] + np.log(S[:, 0]) - TL[:, 0]
+	row_loss[~valid] = np.float32(0.0)
+
+	if scales is None:
+		out_loss.storage.data[0] = (
+			np.sum(row_loss, dtype=np.float32)
+			/ np.float32(N)
+		)
+	else:
+		# 当前 Metal row_scaled kernel:
+		# row_loss_kernel = CE * row_scale * N
+		# forward_reduce = sum(row_loss_kernel) / N
+		out_loss.storage.data[0] = np.sum(
+			row_loss * scales,
+			dtype=np.float32,
+		)
+
+def cpu_fused_rmsnorm_linear_ce_backward(inputs, outputs, scratch=None):
+	x, w, norm_weight, targets = inputs[:4]
+	row_scale = inputs[4] if len(inputs) == 5 else None
+	out_loss = outputs[0]
+	op = out_loss.op.op
+
+	if out_loss.grad is None:
+		return
+
+	X = x.storage.data.reshape(-1, x.shape[-1])
+	W = w.storage.data
+	G = norm_weight.storage.data
+	Y = targets.storage.data.reshape(-1)
+
+	N, C = X.shape
+	V = W.shape[0]
+	grad_out = float(out_loss.grad.storage.data[0])
+
+	L = scratch["logits"].data.reshape(N, V)
+	Z = scratch["x_norm"].data.reshape(N, C)
+	DZ = scratch["dx_norm"].data.reshape(N, C)
+	R = scratch["inv_rms"].data.reshape(N, 1)
+	M = scratch["max"].data.reshape(N, 1)
+	S = scratch["sum"].data.reshape(N, 1)
+	TX = scratch["tmp_x"].data.reshape(N, C)
+	TDW = scratch["tmp_dw"].data.reshape(V, C)
+	TDG = scratch["tmp_dgamma"].data.reshape(C)
+
+	scales = None
+	if row_scale is not None:
+		scales = row_scale.storage.data.reshape(-1)
+
+	# 1. 完整 RMSNorm forward。
+	np.multiply(X, X, out=Z)
+	np.mean(Z, axis=1, keepdims=True, out=R)
+	np.add(R, np.float32(op.eps), out=R)
+	np.sqrt(R, out=R)
+	np.reciprocal(R, out=R)
+
+	np.multiply(X, R, out=Z)
+	np.multiply(Z, G, out=Z)
+
+	# 2. 完整 logits 和 softmax。
+	np.matmul(Z, W.T, out=L)
+	np.max(L, axis=1, keepdims=True, out=M)
+	np.subtract(L, M, out=L)
+	np.exp(L, out=L)
+	np.sum(L, axis=1, keepdims=True, out=S)
+	np.divide(L, S, out=L)
+
+	# 3. dlogits。
+	for row in range(N):
+		target = int(Y[row])
+
+		if target < 0 or target >= V:
+			L[row, :].fill(0.0)
+			continue
+
+		L[row, target] -= 1.0
+
+		if scales is None:
+			scale = grad_out / float(N)
+		else:
+			scale = grad_out * float(scales[row])
+
+		np.multiply(L[row, :], scale, out=L[row, :])
+
+	# 4. dW = dlogits.T @ z。
+	if w.requires_grad:
+		np.matmul(L.T, Z, out=TDW)
+		np.add(w.grad.storage.data, TDW, out=w.grad.storage.data)
+
+	if not (x.requires_grad or norm_weight.requires_grad):
+		return
+
+	# 5. dZ = dlogits @ W。
+	np.matmul(L, W, out=DZ)
+
+	# x_hat = X * inv_rms
+	np.multiply(X, R, out=TX)
+
+	# 6. dgamma = sum(dZ * x_hat)。
+	if norm_weight.requires_grad:
+		np.multiply(TX, DZ, out=TX)
+		np.sum(TX, axis=0, out=TDG)
+		np.add(norm_weight.grad.storage.data, TDG, out=norm_weight.grad.storage.data)
+
+	# 7. dX = inv_rms * (dZ * gamma - x_hat * mean(dZ * gamma * x_hat))。
+	if x.requires_grad:
+		np.multiply(DZ, G, out=DZ)
+
+		np.multiply(X, R, out=TX)
+
+		np.multiply(TX, DZ, out=TX)
+		np.mean(TX, axis=1, keepdims=True, out=M)
+
+		np.multiply(X, R, out=TX)
+		np.multiply(TX, M, out=TX)
+
+		np.subtract(DZ, TX, out=DZ)
+		np.multiply(DZ, R, out=DZ)
+
+		np.add(x.grad.storage.data.reshape(N, C), DZ, out=x.grad.storage.data.reshape(N, C))
+
 def cpu_fused_mlp_forward(inputs, outputs, scratch=None):
     x, w1, b1, w2, b2 = inputs
     out = outputs[0]
@@ -893,7 +1070,12 @@ def cpu_attn_out_contiguous_backward(inputs, outputs, scratch=None):
 	np.add(x.grad.storage.data.reshape(B, H, T, D), grad_out_view, out=x.grad.storage.data.reshape(B, H, T, D))
 
 def cpu_fused_rmsnorm_mlp_forward(inputs, outputs, scratch=None):
-    x, wgu, wdown = inputs
+    if len(inputs) == 3:
+    	x, wgu, wdown = inputs
+    	norm_weight = None
+    elif len(inputs) == 4:
+    	x, norm_weight, wgu, wdown = inputs
+
     out = outputs[0]
     eps = out.op.op.eps
 
@@ -920,6 +1102,9 @@ def cpu_fused_rmsnorm_mlp_forward(inputs, outputs, scratch=None):
     # X_norm = X * inv_rms
     np.multiply(X, inv_rms, out=X_norm)
 
+    if norm_weight is not None:
+    	np.multiply(X_norm, norm_weight.storage.data.reshape(1, C), out=X_norm)
+
     # GU = X_norm @ Wgu
     np.matmul(X_norm, Wgu, out=GU)
 
@@ -927,7 +1112,6 @@ def cpu_fused_rmsnorm_mlp_forward(inputs, outputs, scratch=None):
     U = GU[:, H:]
 
     # HIDDEN = SiLU(G) * U
-    # 先在 HIDDEN 中计算 sigmoid(G)
     np.negative(G, out=HIDDEN)
     np.exp(HIDDEN, out=HIDDEN)
     np.add(HIDDEN, 1.0, out=HIDDEN)
@@ -943,7 +1127,12 @@ def cpu_fused_rmsnorm_mlp_forward(inputs, outputs, scratch=None):
     np.matmul(HIDDEN, Wdown, out=OUT)
 
 def cpu_fused_rmsnorm_mlp_backward(inputs, outputs, scratch=None,):
-    x, wgu, wdown = inputs
+    if len(inputs) == 3:
+    	x, wgu, wdown = inputs
+    	norm_weight = None
+    elif len(inputs) == 4:
+    	x, norm_weight, wgu, wdown = inputs
+
     out = outputs[0]
 
     if out.grad is None:
@@ -951,48 +1140,41 @@ def cpu_fused_rmsnorm_mlp_backward(inputs, outputs, scratch=None,):
 
     eps = out.op.op.eps
 
-    X = x.storage.data.reshape(
-        -1,
-        x.shape[-1],
-    )
+    X = x.storage.data.reshape(-1, x.shape[-1])
     Wgu = wgu.storage.data
     Wdown = wdown.storage.data
-    DOUT = out.grad.storage.data.reshape(
-        -1,
-        x.shape[-1],
-    )
+    DOUT = out.grad.storage.data.reshape(-1, x.shape[-1])
 
     N, C = X.shape
     H = Wgu.shape[1] // 2
 
     inv_rms = scratch["inv_rms"].data.reshape(N, 1)
     X_norm = scratch["x_norm"].data.reshape(N, C)
+    DX_NORM = scratch["dx_norm"].data.reshape(N, C)
+
     GU = scratch["gu"].data.reshape(N, 2 * H)
     D_HIDDEN = scratch["dhidden"].data.reshape(N, H)
     GATE = scratch["gate"].data.reshape(N, H)
     SIGMOID = scratch["sigmoid"].data.reshape(N, H)
-    D_X_NORM = scratch["dx_norm"].data.reshape(N, C)
 
-    # RMSNorm forward 重算。
+    # inv_rms = 1 / sqrt(mean(X*X)+eps)
     np.multiply(X, X, out=X_norm)
-    np.mean(
-        X_norm,
-        axis=-1,
-        keepdims=True,
-        out=inv_rms,
-    )
+    np.mean(X_norm, axis=-1, keepdims=True, out=inv_rms)
     np.add(inv_rms, eps, out=inv_rms)
     np.sqrt(inv_rms, out=inv_rms)
     np.reciprocal(inv_rms, out=inv_rms)
+
+    # X_norm = x_hat * gamma; 无gamma时为x_hat
     np.multiply(X, inv_rms, out=X_norm)
+
+    if norm_weight is not None:
+    	np.multiply(X_norm, norm_weight.storage.data.reshape(1, C), out=X_norm)
 
     # GU = X_norm @ Wgu
     np.matmul(X_norm, Wgu, out=GU)
 
     G = GU[:, :H]
     U = GU[:, H:]
-
-    # 单独保存原始 gate。
     np.copyto(GATE, G)
 
     # SIGMOID = sigmoid(GATE)
@@ -1001,130 +1183,70 @@ def cpu_fused_rmsnorm_mlp_backward(inputs, outputs, scratch=None,):
     np.add(SIGMOID, 1.0, out=SIGMOID)
     np.reciprocal(SIGMOID, out=SIGMOID)
 
-    # D_HIDDEN 暂存 forward hidden。
+    # hidden = SiLU(GATE)*U
     np.multiply(GATE, SIGMOID, out=D_HIDDEN)
     np.multiply(D_HIDDEN, U, out=D_HIDDEN)
 
+    # dWdown = hidden.T @ DOUT
     if wdown.requires_grad:
         TMP_DWDOWN = scratch["tmp_dwdown"].data
-        np.matmul(
-            D_HIDDEN.T,
-            DOUT,
-            out=TMP_DWDOWN,
-        )
-        np.add(
-            wdown.grad.storage.data,
-            TMP_DWDOWN,
-            out=wdown.grad.storage.data,
-        )
+        np.matmul(D_HIDDEN.T, DOUT, out=TMP_DWDOWN)
+        np.add(wdown.grad.storage.data, TMP_DWDOWN, out=wdown.grad.storage.data)
 
     # D_HIDDEN = DOUT @ Wdown.T
-    np.matmul(
-        DOUT,
-        Wdown.T,
-        out=D_HIDDEN,
-    )
+    np.matmul(DOUT, Wdown.T, out=D_HIDDEN)
 
     # GU 将被原地改写为 DGU。
     D_GATE = GU[:, :H]
     D_UP = GU[:, H:]
 
-    # 先计算 dGate。
-    #
-    # D_GATE =
-    # sigmoid(g) * (1 + g*(1-sigmoid(g)))
-    np.subtract(
-        1.0,
-        SIGMOID,
-        out=D_GATE,
-    )
-    np.multiply(
-        D_GATE,
-        GATE,
-        out=D_GATE,
-    )
-    np.add(
-        D_GATE,
-        1.0,
-        out=D_GATE,
-    )
-    np.multiply(
-        D_GATE,
-        SIGMOID,
-        out=D_GATE,
-    )
+    # dGate D_GATE = sigmoid(g) * (1 + g*(1-sigmoid(g)))
+    np.subtract(1.0, SIGMOID, out=D_GATE)
+    np.multiply(D_GATE, GATE, out=D_GATE)
+    np.add(D_GATE, 1.0, out=D_GATE)
+    np.multiply(D_GATE, SIGMOID, out=D_GATE)
 
     # D_GATE *= U
-    # 此时 U 尚未被覆盖。
-    np.multiply(
-        D_GATE,
-        U,
-        out=D_GATE,
-    )
-    np.multiply(
-        D_GATE,
-        D_HIDDEN,
-        out=D_GATE,
-    )
+    np.multiply(D_GATE, U, out=D_GATE)
+    np.multiply(D_GATE, D_HIDDEN, out=D_GATE)
 
-    # 再计算 dUp。
-    # 原始 gate 保存在 GATE，SIGMOID 也仍然有效。
-    np.multiply(
-        GATE,
-        SIGMOID,
-        out=D_UP,
-    )
-    np.multiply(
-        D_UP,
-        D_HIDDEN,
-        out=D_UP,
-    )
+    # 再计算 dUp。原始 gate 保存在 GATE，SIGMOID 也仍然有效。
+    np.multiply(GATE, SIGMOID, out=D_UP)
+    np.multiply(D_UP, D_HIDDEN, out=D_UP)
 
-    DGU = GU
-
+    # dWgu = X_norm.T @ dGU
     if wgu.requires_grad:
         TMP_DWGU = scratch["tmp_dwgu"].data
-        np.matmul(
-            X_norm.T,
-            DGU,
-            out=TMP_DWGU,
-        )
-        np.add(
-            wgu.grad.storage.data,
-            TMP_DWGU,
-            out=wgu.grad.storage.data,
-        )
+        np.matmul(X_norm.T, GU, out=TMP_DWGU)
+        np.add(wgu.grad.storage.data, TMP_DWGU, out=wgu.grad.storage.data)
 
-    np.matmul(
-        DGU,
-        Wgu.T,
-        out=D_X_NORM,
-    )
+    # dX_norm = dGU @ Wgu.T
+    np.matmul(GU, Wgu.T, out=DX_NORM)
 
-    # RMSNorm backward，无额外数组分配。
-    for row in range(N):
-        dot = 0.0
+    if norm_weight is not None:
+    	np.multiply(X, inv_rms, out=X_norm)
 
-        for col in range(C):
-            dot += (
-                D_X_NORM[row, col]
-                * X_norm[row, col]
-            )
+    	if norm_weight.requires_grad:
+    		np.multiply(DX_NORM, X_norm, out=X_norm)
 
-        mean_dot = dot / C
+    		tmp_dgamma = scratch["tmp_dwgu"].data.reshape(-1)[:C]
+    		np.sum(X_norm, axis=0, out=tmp_dgamma)
+    		np.add(norm_weight.grad.storage.data, tmp_dgamma, out=norm_weight.grad.storage.data)
 
-        for col in range(C):
-            D_X_NORM[row, col] = (
-                D_X_NORM[row, col]
-                - X_norm[row, col] * mean_dot
-            ) * inv_rms[row, 0]
+    	# dX_hat = dX_norm * gamma
+    	np.multiply(DX_NORM, norm_weight.storage.data.reshape(1, C), out=DX_NORM)
+
+    mean_dy_xhat = GU.reshape(-1)[:N].reshape(N, 1)
+    np.multiply(X, inv_rms, out=X_norm)
+    np.multiply(DX_NORM, X_norm, out=X_norm)
+    np.mean(X_norm, axis=-1, keepdims=True, out=mean_dy_xhat)
+    np.multiply(X, inv_rms, out=X_norm)
+    np.multiply(X_norm, mean_dy_xhat, out=X_norm)
+    np.subtract(DX_NORM, X_norm, out=DX_NORM)
+    np.multiply(DX_NORM, inv_rms, out=DX_NORM)
 
     if x.requires_grad:
-        np.add(
-            x.grad.storage.data.reshape(N, C),
-            D_X_NORM,
-            out=x.grad.storage.data.reshape(N, C),
-        )
+    	np.add(x.grad.storage.data.reshape(N, C), DX_NORM, out=x.grad.storage.data.reshape(N, C))
 
 def cpu_flash_attention_forward(inputs, outputs, scratch=None):
     x, wq, bq, wk, bk, wv, bv = inputs
@@ -1590,6 +1712,302 @@ def cpu_fused_rms_fa_backward(inputs, outputs, scratch=None):
 
         x.grad.storage.data[...] += dX
 
+def cpu_fused_rms_gqa_forward(inputs, outputs, scratch=None):
+    x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+    out = outputs[0]
+    op = out.op.op
+
+    B, T, C = x.shape
+    H = op.n_head
+    HKV = op.n_kv_head
+    D = C // H
+    group_size = H // HKV
+    half_D = D // 2
+
+    X = x.storage.data.reshape(B, T, C)
+    z = scratch["z"].data
+    inv = scratch["inv"].data
+    tmp_x = scratch["tmp_x"].data
+    q = scratch["q"].data
+    k = scratch["k"].data
+    v = scratch["v"].data
+
+    # 1. 带权 RMSNorm。
+    np.multiply(X, X, out=tmp_x)
+    np.mean(tmp_x, axis=-1, keepdims=True, out=inv)
+    np.add(inv, np.float32(op.eps), out=inv)
+    np.sqrt(inv, out=inv)
+    np.reciprocal(inv, out=inv)
+
+    np.multiply(X, inv, out=z)
+    np.multiply(z, norm_weight.storage.data, out=z)
+
+    # 2. QKV 投影：Q 宽度 C，K/V 宽度 HKV*D。
+    z_flat = z.reshape(B * T, C)
+
+    for dest, weight, bias in ((q, wq, bq), (k, wk, bk), (v, wv, bv)):
+        dest_flat = dest.reshape(B * T, -1)
+        np.matmul(z_flat, weight.storage.data, out=dest_flat)
+        np.add(dest_flat, bias.storage.data, out=dest_flat)
+
+    # 3. split-half RoPE，Q/K 分别按各自头数处理。
+    cos = rope_cos.storage.data[:T]
+    sin = rope_sin.storage.data[:T]
+    rope0 = scratch["rope0"].data
+    rope1 = scratch["rope1"].data
+
+    for data, heads in ((q, H), (k, HKV)):
+        for batch in range(B):
+            for head in range(heads):
+                lo = data[batch, :, head, :half_D]
+                hi = data[batch, :, head, half_D:]
+
+                np.multiply(lo, cos, out=rope0)
+                np.multiply(hi, sin, out=rope1)
+                if op.rope_sign == 1:
+                    np.subtract(rope0, rope1, out=rope0)
+                else:
+                    np.add(rope0, rope1, out=rope0)
+
+                # lo 尚未覆盖，可以继续计算第二半。
+                np.multiply(lo, sin, out=rope1)
+                np.multiply(hi, cos, out=hi)
+                if op.rope_sign == 1:
+                    np.add(hi, rope1, out=hi)
+                else:
+                    np.subtract(hi, rope1, out=hi)
+
+                np.copyto(lo, rope0)
+
+    # 4. GQA：直接读取所属 KV 头，不复制 K/V。
+    probs = scratch["p"].data
+    row = scratch["row"].data
+    scale = np.float32(D ** -0.5)
+    context = out.storage.data.reshape(B, T, H, D)
+
+    for batch in range(B):
+        for head in range(H):
+            kv_head = head // group_size
+            Q = q[batch, :, head, :]
+            K = k[batch, :, kv_head, :]
+            V = v[batch, :, kv_head, :]
+
+            np.matmul(Q, K.T, out=probs)
+            np.multiply(probs, scale, out=probs)
+
+            if op.is_causal:
+                for token in range(T):
+                    probs[token, token + 1:] = -np.inf
+
+            np.max(probs, axis=-1, keepdims=True, out=row)
+            np.subtract(probs, row, out=probs)
+            np.exp(probs, out=probs)
+            np.sum(probs, axis=-1, keepdims=True, out=row)
+            np.divide(probs, row, out=probs)
+
+            np.matmul(probs, V, out=context[batch, :, head, :])
+
+def cpu_fused_rms_gqa_backward(inputs, outputs, scratch=None):
+    out = outputs[0]
+    if out.grad is None:
+        return
+
+    x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+    op = out.op.op
+
+    B, T, C = x.shape
+    H = op.n_head
+    HKV = op.n_kv_head
+    D = C // H
+    group_size = H // HKV
+    half_D = D // 2
+    scale = np.float32(D ** -0.5)
+
+    X = x.storage.data.reshape(B, T, C)
+    z = scratch["z"].data
+    inv = scratch["inv"].data
+    tmp_x = scratch["tmp_x"].data
+    q = scratch["q"].data
+    k = scratch["k"].data
+    v = scratch["v"].data
+
+    dq = scratch["dq"].data
+    dk = scratch["dk"].data
+    dv = scratch["dv"].data
+    dz = scratch["dz"].data
+
+    probs = scratch["p"].data
+    dp = scratch["dp"].data
+    ds = scratch["ds"].data
+    row = scratch["row"].data
+    tmp_kv = scratch["tmp_kv"].data
+
+    cos = rope_cos.storage.data[:T]
+    sin = rope_sin.storage.data[:T]
+    rope0 = scratch["rope0"].data
+    rope1 = scratch["rope1"].data
+
+    # 1. 重算带权 RMSNorm。
+    np.multiply(X, X, out=tmp_x)
+    np.mean(tmp_x, axis=-1, keepdims=True, out=inv)
+    np.add(inv, np.float32(op.eps), out=inv)
+    np.sqrt(inv, out=inv)
+    np.reciprocal(inv, out=inv)
+
+    np.multiply(X, inv, out=z)
+    np.multiply(z, norm_weight.storage.data, out=z)
+
+    # 2. 重算 QKV。
+    z_flat = z.reshape(B * T, C)
+
+    for dest, weight, bias in ((q, wq, bq), (k, wk, bk), (v, wv, bv)):
+        dest_flat = dest.reshape(B * T, -1)
+        np.matmul(z_flat, weight.storage.data, out=dest_flat)
+        np.add(dest_flat, bias.storage.data, out=dest_flat)
+
+    # 3. 重算前向 RoPE。
+    for data, heads in ((q, H), (k, HKV)):
+        for batch in range(B):
+            for head in range(heads):
+                lo = data[batch, :, head, :half_D]
+                hi = data[batch, :, head, half_D:]
+
+                np.multiply(lo, cos, out=rope0)
+                np.multiply(hi, sin, out=rope1)
+                if op.rope_sign == 1:
+                    np.subtract(rope0, rope1, out=rope0)
+                else:
+                    np.add(rope0, rope1, out=rope0)
+
+                np.multiply(lo, sin, out=rope1)
+                np.multiply(hi, cos, out=hi)
+                if op.rope_sign == 1:
+                    np.add(hi, rope1, out=hi)
+                else:
+                    np.subtract(hi, rope1, out=hi)
+
+                np.copyto(lo, rope0)
+
+    # 4. 重算概率，计算 attention 梯度。
+    d_out = out.grad.storage.data.reshape(B, T, H, D)
+    dk.fill(0)
+    dv.fill(0)
+
+    for batch in range(B):
+        for head in range(H):
+            kv_head = head // group_size
+            Q = q[batch, :, head, :]
+            K = k[batch, :, kv_head, :]
+            V = v[batch, :, kv_head, :]
+            dO = d_out[batch, :, head, :]
+
+            np.matmul(Q, K.T, out=probs)
+            np.multiply(probs, scale, out=probs)
+
+            if op.is_causal:
+                for token in range(T):
+                    probs[token, token + 1:] = -np.inf
+
+            np.max(probs, axis=-1, keepdims=True, out=row)
+            np.subtract(probs, row, out=probs)
+            np.exp(probs, out=probs)
+            np.sum(probs, axis=-1, keepdims=True, out=row)
+            np.divide(probs, row, out=probs)
+
+            # dV 累加同组 Q 头的贡献。
+            np.matmul(probs.T, dO, out=tmp_kv)
+            np.add(dv[batch, :, kv_head, :], tmp_kv, out=dv[batch, :, kv_head, :])
+
+            # dS = scale * P * (dP - sum(P*dP))。
+            np.matmul(dO, V.T, out=dp)
+            np.multiply(probs, dp, out=ds)
+            np.sum(ds, axis=-1, keepdims=True, out=row)
+            np.subtract(dp, row, out=ds)
+            np.multiply(ds, probs, out=ds)
+            np.multiply(ds, scale, out=ds)
+
+            np.matmul(ds, K, out=dq[batch, :, head, :])
+
+            # dK 累加同组 Q 头的贡献。
+            np.matmul(ds.T, Q, out=tmp_kv)
+            np.add(dk[batch, :, kv_head, :], tmp_kv, out=dk[batch, :, kv_head, :])
+
+    # 5. RoPE backward：使用前向旋转的转置。
+    for data, heads in ((dq, H), (dk, HKV)):
+        for batch in range(B):
+            for head in range(heads):
+                lo = data[batch, :, head, :half_D]
+                hi = data[batch, :, head, half_D:]
+
+                np.multiply(lo, cos, out=rope0)
+                np.multiply(hi, sin, out=rope1)
+                if op.rope_sign == 1:
+                    np.add(rope0, rope1, out=rope0)
+                else:
+                    np.subtract(rope0, rope1, out=rope0)
+
+                np.multiply(lo, sin, out=rope1)
+                np.multiply(hi, cos, out=hi)
+                if op.rope_sign == 1:
+                    np.subtract(hi, rope1, out=hi)
+                else:
+                    np.add(hi, rope1, out=hi)
+
+                np.copyto(lo, rope0)
+
+    # 6. 投影参数梯度，以及带权归一化输出的梯度 dZ。
+    tmp_w = scratch["tmp_w"].data.reshape(-1)
+    tmp_b = scratch["tmp_b"].data
+    tmp_x_flat = tmp_x.reshape(B * T, C)
+    dz_flat = dz.reshape(B * T, C)
+
+    need_dz = x.requires_grad or norm_weight.requires_grad
+    if need_dz:
+        dz.fill(0)
+
+    for grad, weight, bias in ((dq, wq, bq), (dk, wk, bk), (dv, wv, bv)):
+        grad_flat = grad.reshape(B * T, -1)
+        width = grad_flat.shape[1]
+
+        if weight.requires_grad:
+            work = tmp_w[:C * width].reshape(C, width)
+            np.matmul(z_flat.T, grad_flat, out=work)
+            np.add(weight.grad.storage.data, work, out=weight.grad.storage.data)
+
+        if bias.requires_grad:
+            np.sum(grad_flat, axis=0, out=tmp_b[:width])
+            np.add(bias.grad.storage.data, tmp_b[:width], out=bias.grad.storage.data)
+
+        if need_dz:
+            np.matmul(grad_flat, weight.storage.data.T, out=tmp_x_flat)
+            np.add(dz_flat, tmp_x_flat, out=dz_flat)
+
+    if not need_dz:
+        return
+
+    # 7. 所有 dW 已完成，z 复用为不带权的 x_hat。
+    # 直接由 X 和 inv 计算，不除以 norm_weight。
+    np.multiply(X, inv, out=z)
+
+    if norm_weight.requires_grad:
+        np.multiply(dz, z, out=tmp_x)
+        np.sum(tmp_x, axis=(0, 1), out=tmp_b)
+        np.add(norm_weight.grad.storage.data, tmp_b, out=norm_weight.grad.storage.data)
+
+    # 8. RMSNorm 输入梯度，累加到已有残差梯度。
+    if x.requires_grad:
+        np.multiply(dz, norm_weight.storage.data, out=dz)
+        np.multiply(dz, z, out=tmp_x)
+
+        rms_dot = scratch["dot"].data
+        np.mean(tmp_x, axis=-1, keepdims=True, out=rms_dot)
+
+        np.multiply(z, rms_dot, out=tmp_x)
+        np.subtract(dz, tmp_x, out=tmp_x)
+        np.multiply(tmp_x, inv, out=tmp_x)
+
+        np.add(x.grad.storage.data, tmp_x, out=x.grad.storage.data)
+
 def cpu_adamw_step(p_storage, g_storage, m_storage, v_storage, tmp_view,
 	lr, lr_t, b1, b2, eps, weight_decay):
 	p_data = p_storage.data
@@ -1731,40 +2149,347 @@ def cpu_fused_linear_add_backward(inputs, outputs, scratch=None):
     if out.grad is None:
         return
 
-    d_out = out.grad.storage.data.reshape(
-        -1,
-        out.shape[-1],
-    )
+    d_out = out.grad.storage.data.reshape(-1, out.shape[-1])
 
-    act_value = act.storage.data.reshape(
-        -1,
-        act.shape[-1],
-    )
+    if w.requires_grad and act.op is not None and act.op.op.op_name == "FusedRMSNormGQA":
+    	fa_x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = act.op.inputs
+    	fa_op = act.op.op
+    	B, T, C = fa_x.shape
+    	H = fa_op.n_head
+    	HKV = fa_op.n_kv_head
+    	D = C // H
+    	group_size = H // HKV
+    	half_D = D // 2 
+
+    	X = fa_x.storage.data.reshape(B, T, C)
+    	z = scratch["z"].data
+    	inv = scratch["inv"].data
+    	tmp_x = scratch["tmp_x"].data
+    	q = scratch["q"].data
+    	k = scratch["k"].data
+    	v = scratch["v"].data
+
+    	# 1. 重算带权RMSNorm
+    	np.multiply(X, X, out=tmp_x)
+    	np.mean(tmp_x, axis=-1, keepdims=True, out=inv)
+    	np.add(inv, np.float32(fa_op.eps), out=inv)
+    	np.sqrt(inv, out=inv)
+    	np.reciprocal(inv, out=inv)
+
+    	np.multiply(X, inv, out=z)
+    	np.multiply(z, norm_weight.storage.data, out=z)
+
+    	# 2. 重算QKV
+    	z_flat = z.reshape(B*T, C)
+    	for dest, weight, bias in ((q, wq, bq), (k, wk, bk), (v, wv, bv)):
+    		dest_flat = dest.reshape(B*T, -1)
+    		np.matmul(z_flat, weight.storage.data, out=dest_flat)
+    		np.add(dest_flat, bias.storage.data, out=dest_flat)
+
+    	# 3. 重算ROPE
+    	cos = rope_cos.storage.data[:T]
+    	sin = rope_sin.storage.data[:T]
+    	rope0 = scratch["rope0"].data
+    	rope1 = scratch["rope1"].data
+
+    	for data, heads in ((q, H), (k, HKV)):
+    		for batch in range(B):
+    			for head in range(heads):
+    				lo = data[batch, :, head, :half_D]
+    				hi = data[batch, :, head, half_D:]
+
+    				np.multiply(lo, cos, out=rope0)
+    				np.multiply(hi, sin, out=rope1)
+    				if fa_op.rope_sign == 1:
+    					np.subtract(rope0, rope1, out=rope0)
+    				else:
+    					np.add(rope0, rope1, out=rope0)
+
+    				np.multiply(lo, sin, out=rope1)
+    				np.multiply(hi, cos, out=hi)
+    				if fa_op.rope_sign == 1:
+    					np.add(hi, rope1, out=hi)
+    				else:
+    					np.subtract(hi, rope1, out=hi)
+    				np.copyto(lo, rope0)
+
+    	# 4. 重算GQA输出到预分配的fa_out
+    	probs = scratch["p"].data
+    	row = scratch["row"].data
+    	scale = np.float32(D ** -0.5)
+    	context = scratch["fa_out"].data.reshape(B, T, H, D)
+
+    	for batch in range(B):
+    		for head in range(H):
+    			kv_head = head // group_size
+    			Q = q[batch, :, head, :]
+    			K = k[batch, :, kv_head, :]
+    			V = v[batch, :, kv_head, :]
+
+    			np.matmul(Q, K.T, out=probs)
+    			np.multiply(probs, scale, out=probs)
+    			if fa_op.is_causal:
+    				for token in range(T):
+    					probs[token, token+1:] = -np.inf
+
+    			np.max(probs, axis=-1, keepdims=True, out=row)
+    			np.subtract(probs, row, out=probs)
+    			np.exp(probs, out=probs)
+    			np.sum(probs, axis=-1, keepdims=True, out=row)
+    			np.divide(probs, row, out=probs)
+    			np.matmul(probs, V, out=context[batch, :, head, :])
+
+    	act_value = scratch["fa_out"].data.reshape(-1, act.shape[-1])
+    else:
+    	act_value = act.storage.data.reshape(-1, act.shape[-1])
 
     if x.requires_grad:
-        x.grad.storage.data.reshape(
-            -1,
-            x.shape[-1],
-        )[...] += d_out
+        x.grad.storage.data.reshape(-1, x.shape[-1])[...] += d_out
 
     if act.requires_grad:
-        act.grad.storage.data.reshape(
-            -1,
-            act.shape[-1],
-        )[...] += (
-            d_out @ w.storage.data.T
-        ).astype(np.float32)
+        act.grad.storage.data.reshape(-1, act.shape[-1])[...] += (d_out @ w.storage.data.T).astype(np.float32)
 
     if w.requires_grad:
-        w.grad.storage.data[...] += (
-            act_value.T @ d_out
-        ).astype(np.float32)
+        w.grad.storage.data[...] += (act_value.T @ d_out).astype(np.float32)
 
     if b.requires_grad:
-        b.grad.storage.data[...] += np.sum(
-            d_out,
-            axis=0,
-        ).astype(np.float32)
+        b.grad.storage.data[...] += np.sum(d_out, axis=0).astype(np.float32)
+
+def cpu_kv_cache_attention_forward(inputs, outputs, scratch=None):
+	x, wq, bq, wk, bk, wv, bv, k_cache, v_cache, position, rope_cos, rope_sin = inputs
+
+	out = outputs[0]
+	op = out.op.op
+
+	B, T, C = x.shape
+	H = op.n_head
+	D = C // H
+	S = k_cache.shape[1]
+	start = position.storage.data[0]
+	end = start + T
+
+	X = x.storage.data
+	z = scratch["x_norm"].data
+	inv = scratch["inv_rms"].data
+	q = scratch["q"].data
+	k = scratch["k"].data
+	v = scratch["v"].data
+
+	np.multiply(X, X, out=z)
+	np.mean(z, axis=-1, keepdims=True, out=inv)
+	np.add(inv, out.op.op.eps, out=inv)
+	np.sqrt(inv, out=inv)
+	np.reciprocal(inv, out=inv)
+	np.multiply(X, inv, out=z)
+
+	z2 = z.reshape(B*T, C)
+	for dst, weight, bias in ((q, wq, bq), (k, wk, bk), (v, wv, bv)):
+		dst2 = dst.reshape(B*T, C)
+		np.matmul(z2, weight.storage.data, out=dst2)
+		np.add(dst2, bias.storage.data, out=dst2)
+
+	work = z.reshape(B, T, H, D)
+	cos = rope_cos.storage.data[start:end][None, :, None, :]
+	sin = rope_sin.storage.data[start:end][None, :, None, :]
+
+	rope_lo = scratch["rope_lo"].data
+	rope_hi = scratch["rope_hi"].data
+	q0 = scratch["rope_q0"].data
+	q1 = scratch["rope_q1"].data 
+	k0 = scratch["rope_k0"].data
+	k1 = scratch["rope_k1"].data 
+
+	np.copyto(q0, q[..., : D//2])
+	np.copyto(q1, q[..., D//2:])
+	np.copyto(k0, k[..., : D//2])
+	np.copyto(k1, k[..., D//2:])
+
+	np.multiply(q0, cos, out=q[..., :D//2])
+	np.multiply(q1, sin, out=rope_lo)
+	np.add(q[..., :D//2], rope_lo, out=q[..., :D//2])
+
+	np.multiply(q1, cos, out=q[..., D // 2:])
+	np.multiply(q0, sin, out=rope_lo)
+	np.subtract(q[..., D // 2:], rope_lo, out=q[..., D // 2:])
+
+	np.multiply(k0, cos, out=k[..., :D // 2])
+	np.multiply(k1, sin, out=rope_hi)
+	np.add(k[..., :D // 2], rope_hi, out=k[..., :D // 2])
+
+	np.multiply(k1, cos, out=k[..., D // 2:])
+	np.multiply(k0, sin, out=rope_hi)
+	np.subtract(k[..., D // 2:], rope_hi, out=k[..., D // 2:])
+
+	K = k_cache.storage.data
+	V = v_cache.storage.data
+	np.copyto(K[:, start:end], k)
+	np.copyto(V[:, start:end], v)
+
+	output = out.storage.data.reshape(B, T, H, D)
+	score_buffer = scratch["scores"].data
+	stat_buffer = scratch["row_stat"].data
+	R = score_buffer.shape[0]
+	scale = np.float32(1.0 / np.sqrt(D))
+
+	for batch in range(B):
+		for head in range(H):
+			for first in range(0, T, R):
+				rows = min(R, T-first)
+				keys = start + first + rows
+				scores = score_buffer[:rows, :keys]
+				stat = stat_buffer[:rows]
+
+				np.matmul(q[batch, first:first+rows, head, :], K[batch, :keys, head, :].T, out=scores)
+				np.multiply(scores, scale, out=scores)
+
+				for row in range(rows):
+					scores[row, start+first+row+1:] = -np.inf
+
+				np.max(scores, axis=-1, keepdims=True, out=stat)
+				np.subtract(scores, stat, out=scores)
+				np.exp(scores, out=scores)
+				np.sum(scores, axis=-1, keepdims=True, out=stat)
+				np.divide(scores, stat, out=scores)
+				np.matmul(scores, V[batch, :keys, head, :], out=output[batch, first:first+rows, head, :])
+
+def cpu_kv_cache_attention_backward(inputs, outputs, scratch=None):
+	return
+
+def cpu_lm_head_forward(inputs, outputs, scratch=None):
+	x, weight = inputs
+	out = outputs[0]
+
+	x_2d = x.storage.data.reshape(-1, x.shape[-1])
+	w_data = weight.storage.data
+	out_2d = out.storage.data.reshape(-1, out.shape[-1])
+	np.matmul(x_2d, w_data.T, out=out_2d)
+
+def cpu_last_position_lm_head_forward(inputs, outputs, scratch=None):
+	x, weight, position = inputs
+	out = outputs[0]
+
+	row = int(position.storage.data[0])
+
+	T = x.shape[1]
+	C = x.shape[-1]
+	V = weight.shape[0]
+
+	# x_2d = x.storage.data.reshape(T, C)
+	# out_2d = out.storage.data.reshape(T, V)
+	# np.matmul(x_2d[row:row+1, :], weight.storage.data.T, out=out_2d[row:row+1,:])
+
+	x_row = x.storage.data.reshape(T, C)[row:row+1, :]
+	out_row = out.storage.data.reshape(1, V)
+	np.matmul(x_row, weight.storage.data.T, out=out_row)
+
+def cpu_rollout_topk_forward(inputs, outputs, scratch=None):
+	logits, top_k, logits_position = inputs
+	values_out, indices_out = outputs
+
+	logits_data = logits.storage.data
+	position_data = logits_position.storage.data
+
+	op = values_out.op.op 
+
+	if logits_data.ndim == 2:
+		batch, vocab = logits_data.shape
+		time = 1
+		logits_3d = logits_data.reshape(batch, 1, vocab)
+	elif logits.ndim == 3:
+		batch, time, vocab = logits_data.shape
+		logits_3d = logits_data
+	else:
+		raise ValueError(f"RolloutTopk must be [B, V] or [B, T, V], got {logits_data.shape}")
+
+	selected_time = 0
+	selected_logits = logits_3d[:, selected_time, :]
+
+	batch = selected_logits.shape[0]
+	k_max = values_out.shape[-1]
+	requested_k = top_k.storage.data.reshape(-1)[0]
+	k = min(requested_k, k_max, vocab)
+
+	values_np = values_out.storage.data
+	indices_np = indices_out.storage.data
+
+	key = np.empty((batch, vocab), dtype=[('value', selected_logits.dtype), ('index', np.int64)])
+	key['value'] = -selected_logits
+	key['index'] = np.arange(vocab, dtype=np.int64)[None, :]
+
+	order = np.argsort(key, axis=-1, order=['value', 'index'], kind='stable')[:, :k]
+
+	values_np[:, :k] = np.take_along_axis(selected_logits, order, axis=-1)
+	indices_np[:, :k] = order.astype(np.int32, copy=False)
+
+def cpu_rollout_sample_forward(inputs, outputs, scratch=None):
+	topk_values, topk_indices, rng_state, finished, temperature, top_k, next_tokens, generated_ids, lengths, position, step = inputs
+	finished_all = outputs[0]
+	op = next_tokens.op.op
+
+	values = topk_values.storage.data
+	indices = topk_indices.storage.data
+
+	rng = rng_state.storage.data
+	done = finished.storage.data.reshape(-1)
+	tokens = next_tokens.storage.data.reshape(-1)
+	generated = generated_ids.shape.data
+
+	len = lengths.storage.data.reshape(-1)
+	pos = position.storage.data.reshape(-1)
+	step_data = step.storage.data.reshape(-1)
+
+	B = tokens.size
+	K_MAX = values.shape[1]
+	capacity = generated.shape[1]
+	current_step = step_data[0]
+	temp = temperature.reshape.storage.data.reshape(-1)[0]
+	requested_k = top_k.storage.data.reshape(-1)[0]
+	K = min(requested_k, K_MAX)
+
+	for row in range(B):
+		if done[row] != 0:
+			tokens[row] = op.eos_token
+			continue
+
+	temperature = temperature.storage.data.reshape(-1)[0]
+	K = int(top_k.storage.data.reshape(-1)[0])
+	K = min(K, values.shape[-1])
+
+	rng = np.random.default_rng(int(state.reshape(-1)[0]) & 0xFFFFFFFF)
+
+	for row in range(values.shape[0]):
+		if done[row] != 0:
+			out[row] = op.eos_token
+			continue
+		row_values = values[row, :K].astype(np.float64)
+		row_indices = indices[row, :K]
+
+		if temperature <= 0.0:
+			out[row] = row_indices[np.argmax(row_values)]
+			continue
+
+		scaled = row_values / temperature
+		scaled -= np.max(scaled)
+
+		probs = np.exp(scaled)
+		probs /= np.sum(probs)
+
+		selected = int(rng.choice(K, p=probs))
+		out[row] = row_indices[selected]
+
+	state[0] = np.uint32((state[0] + 1) & 0xFFFFFFFF)
+
+def cpu_decode_finished_forward(inputs, outputs, scratch=None):
+	next_ids, finished, step, config = inputs
+	out = outputs[0]
+
+	finished_data = finished.storage.data.reshape(-1)
+	# step_data = step.storage.data.reshape(-1)
+	# config_data = config.storage.data.reshape(-1)
+
+	# budget = int(config_data[0])
+	done = np.all(finished_data != 0)
+	out.storage.data.reshape(-1)[0] = 1 if done else 0
 
 class CPUBackend(Backend):
 	def __init__(self):
@@ -1786,13 +2511,21 @@ class CPUBackend(Backend):
 			CrossEntropyLossOp: cpu_crossentropy_forward,
 			ScaledDotProductAttenOp: cpu_sdpa_forward,
 			FusedLinearCrossEntropyOp: cpu_fused_linear_ce_forward,
+			FusedRMSNormLinearCrossEntropyOp: cpu_fused_rmsnorm_linear_ce_forward,
 			FusedMLPOp: cpu_fused_mlp_forward,
 			FusedQKVProjOp: cpu_fused_qkv_proj_forward,
 			AttnOutContiguousOp: cpu_attn_out_contiguous_forward,
 			FusedRMSNormMLPOp: cpu_fused_rmsnorm_mlp_forward,
 			FlashAttentionOp: cpu_flash_attention_forward,
 			FusedRMSNormFlashAttentionOp: cpu_fused_rms_fa_forward,
+			FusedRMSNormGQAOp: cpu_fused_rms_gqa_forward,
 			FusedLinearAddOp: cpu_fused_linear_add_forward,
+			KVCacheAttentionOp: cpu_kv_cache_attention_forward,
+			LMHeadOp: cpu_lm_head_forward,
+			LastPositionLMHeadOp: cpu_last_position_lm_head_forward,
+			RolloutTopkOp: cpu_rollout_topk_forward,
+			RolloutSampleOp: cpu_rollout_sample_forward,
+			DecodeFinishedOp: cpu_decode_finished_forward,
 		}
 		self.backward_kernels = {
 			AddOp: cpu_add_backward,
@@ -1812,13 +2545,16 @@ class CPUBackend(Backend):
 			CrossEntropyLossOp: cpu_crossentropy_backward,
 			ScaledDotProductAttenOp: cpu_sdpa_backward,
 			FusedLinearCrossEntropyOp: cpu_fused_linear_ce_backward,
+			FusedRMSNormLinearCrossEntropyOp: cpu_fused_rmsnorm_linear_ce_backward,
 			FusedMLPOp: cpu_fused_mlp_backward,
 			FusedQKVProjOp: cpu_fused_qkv_proj_backward,
 			AttnOutContiguousOp: cpu_attn_out_contiguous_backward,
 			FusedRMSNormMLPOp: cpu_fused_rmsnorm_mlp_backward,
 			FlashAttentionOp: cpu_flash_attention_backward,
 			FusedRMSNormFlashAttentionOp: cpu_fused_rms_fa_backward,
+			FusedRMSNormGQAOp: cpu_fused_rms_gqa_backward,
 			FusedLinearAddOp: cpu_fused_linear_add_backward,
+			KVCacheAttentionOp: cpu_kv_cache_attention_backward,
 		}
 
 	def get_forward_kernel(self, op):
@@ -1852,6 +2588,9 @@ class CPUBackend(Backend):
 	def fill_storage(self, storage, value):
 		storage.data.fill(value)
 
+	def fill_storage2(self, storage, value):
+		storage.data.fill(value)
+
 	def copy_from_host(self, tensor, host_np):
 		np.copyto(tensor.storage.data, host_np)
 
@@ -1872,8 +2611,10 @@ class MetalBackend(Backend):
 		self.ctx = metal_ext.MetalContext()
 		self.numpy_view_funcs = {
 			np.dtype(np.float32): self.ctx.numpy_view_float32,
+			np.dtype(np.float16): self.ctx.numpy_view_float16,
 			np.dtype(np.int32): self.ctx.numpy_view_int32,
 			np.dtype(np.uint8): self.ctx.numpy_view_uint8,
+			np.dtype(np.uint32): self.ctx.numpy_view_uint32,
 		}
 		self.forward_kernels = {
 			# AddOp: self.metal_add_forward,
@@ -1893,13 +2634,22 @@ class MetalBackend(Backend):
 			CrossEntropyLossOp: self.metal_crossentropy_forward,
 			ScaledDotProductAttenOp: self.metal_sdpa_forward,
 			FusedLinearCrossEntropyOp: self.metal_fused_linear_ce_forward,
+			FusedRMSNormLinearCrossEntropyOp: self.metal_fused_rmsnorm_linear_ce_forward,
 			FusedMLPOp: self.metal_fused_mlp_forward,
 			FusedQKVProjOp: self.metal_fused_qkv_proj_forward,
 			AttnOutContiguousOp: self.metal_attn_out_contiguous_forward,
 			FusedRMSNormMLPOp: self.metal_fused_rmsnorm_mlp_forward,
 			FlashAttentionOp: self.metal_flash_attention_forward,
 			FusedRMSNormFlashAttentionOp: self.metal_fused_rms_fa_forward,
+			FusedRMSNormGQAOp: self.metal_fused_rms_gqa_forward,
 			FusedLinearAddOp: self.metal_fused_linear_add_forward,
+			KVCacheAttentionOp: self.metal_kv_cache_attention_forward,
+			LMHeadOp: self.metal_lm_head_forward,
+			LastPositionLMHeadOp: self.metal_last_position_lm_head_forward,
+			RolloutTopkOp: self.metal_rollout_topk_forward,
+			RolloutSampleOp: self.metal_rollout_sample_forward,
+			DecodeStateOp: self.metal_decode_state_forward,
+			DecodeFinishedOp: self.metal_decode_finished_forward,
 		}
 		self.backward_kernels = {
 			# AddOp: self.metal_add_backward,
@@ -1919,13 +2669,16 @@ class MetalBackend(Backend):
 			CrossEntropyLossOp: self.metal_crossentropy_backward,
 			ScaledDotProductAttenOp: self.metal_sdpa_backward,
 			FusedLinearCrossEntropyOp: self.metal_fused_linear_ce_backward,
+			FusedRMSNormLinearCrossEntropyOp: self.metal_fused_rmsnorm_linear_ce_backward,
 			FusedMLPOp: self.metal_fused_mlp_backward,
 			FusedQKVProjOp: self.metal_fused_qkv_proj_backward,
 			AttnOutContiguousOp: self.metal_attn_out_contiguous_backward,
 			FusedRMSNormMLPOp: self.metal_fused_rmsnorm_mlp_backward,
 			FlashAttentionOp: self.metal_flash_attention_backward,
 			FusedRMSNormFlashAttentionOp: self.metal_fused_rms_fa_backward,
+			FusedRMSNormGQAOp: self.metal_fused_rms_gqa_backward,
 			FusedLinearAddOp: self.metal_fused_linear_add_backward,
+			KVCacheAttentionOp: self.metal_kv_cache_attention_backward,
 		}
 
 	def metal_mul_forward(self, inputs, outputs, scratch=None):
@@ -2022,6 +2775,16 @@ class MetalBackend(Backend):
 	def metal_gather_forward(self, inputs, outputs, scratch=None):
 		indices, weight = inputs[0], inputs[1]
 		out = outputs[0]
+
+		if out.grad is not None and weight.requires_grad:
+			if not getattr(self, "accumulate_parameter_grads", False):
+				self.ctx.dispatch_with_args_3d("fill_scalar_kernel2",
+					[weight.grad.storage.ptr.buffer_id], [weight.grad.storage.ptr.offset],
+					[0, np.dtype(weight.grad.storage.dtype).itemsize], prod(weight.grad.shape), 1, 1, min(prod(weight.grad.shape), 256))
+				# self.ctx.dispatch_with_args_3d("fill_scalar_kernel",
+				# 	[weight.grad.storage.ptr.buffer_id], [weight.grad.storage.ptr.offset],
+				# 	[0], prod(weight.grad.shape), 1, 1, min(prod(weight.grad.shape), 256))
+
 		buffer_ids = [indices.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id]
 		offsets = [indices.storage.ptr.offset, weight.storage.ptr.offset, out.storage.ptr.offset]
 		C = weight.shape[-1]
@@ -2033,15 +2796,21 @@ class MetalBackend(Backend):
 		indices, weight = inputs[0], inputs[1]
 		out = outputs[0]
 		if out.grad is None or not weight.requires_grad: return
-		if not getattr(self, "accumulate_parameter_grads", False):
-			self.ctx.dispatch_with_args_3d('fill_scalar_kernel',
-				[weight.grad.storage.ptr.buffer_id], [weight.grad.storage.ptr.offset], 
-				[0], prod(weight.grad.shape), 1, 1, min(prod(weight.grad.shape), 256))
+		# if not getattr(self, "accumulate_parameter_grads", False):
+		# 	self.ctx.dispatch_with_args_3d('fill_scalar_kernel',
+		# 		[weight.grad.storage.ptr.buffer_id], [weight.grad.storage.ptr.offset], 
+		# 		[0], prod(weight.grad.shape), 1, 1, min(prod(weight.grad.shape), 256))
 		buffer_ids = [indices.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, weight.grad.storage.ptr.buffer_id]
 		offsets = [indices.storage.ptr.offset, out.grad.storage.ptr.offset, weight.grad.storage.ptr.offset]
 		C = weight.shape[-1]
-		self.ctx.dispatch_with_args_3d('gather_backward_kernel', buffer_ids, offsets,
-			[C], prod(out.shape), 1, 1, min(prod(out.shape), 256))
+		grad_bf16 = np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16)
+		if grad_bf16:
+			rows = prod(indices.shape)
+			self.ctx.dispatch_with_args_3d("gather_backward_bf16_kernel",
+				buffer_ids, offsets, [rows, C], 32, (C+127)//128, rows, 32)
+		else:
+			self.ctx.dispatch_with_args_3d('gather_backward_kernel', buffer_ids, offsets,
+				[C], prod(out.shape), 1, 1, min(prod(out.shape), 256))
 
 	def make_kernel(self, kernel_name):
 		def _kernel(inputs, outputs, scratch=None):
@@ -2279,6 +3048,7 @@ class MetalBackend(Backend):
 
 	def metal_fused_linear_ce_forward(self, inputs, outputs, scratch=None):
 		x, w, targets = inputs[0], inputs[1], inputs[2]
+		row_scale = inputs[3] if len(inputs) == 4 else None
 		out_loss = outputs[0]
 		
 		N = x.shape[0] * x.shape[1] if len(x.shape) == 3 else x.shape[0]
@@ -2289,11 +3059,18 @@ class MetalBackend(Backend):
 		logits = scratch["logits"]
 		chunk_rows = min(logits.shape[0], N)
 		itemsize = np.dtype(x.dtype).itemsize
+		dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
 
 		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
-		scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
-		scale_bits = struct.unpack("<i", struct.pack("<f", scale))[0]
+		# scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
+		# scale_bits = struct.unpack("<I", struct.pack("<f", scale))[0]
 		need_grad = x.requires_grad or w.requires_grad
+		if row_scale is None:
+			kernel_name = "fused_linear_ce_logits_to_dlogits"
+			scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
+			scale_bits = struct.unpack("<I", struct.pack("<f", scale))[0]
+		else:
+			kernel_name = "fused_linear_ce_logits_to_dlogits_row_scaled"
 
 		for row_base in range(0, N, chunk_rows):
 			rows = min(chunk_rows, N - row_base)
@@ -2306,22 +3083,28 @@ class MetalBackend(Backend):
 				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
 
 			# 2) row_loss/lse/dlogits
-			self.ctx.dispatch_with_args_3d("fused_linear_ce_logits_to_dlogits",
-				[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
-				[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
-				[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			if row_scale is None:
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
+					[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
+					[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			else:
+				inp_vars = [logits, targets.storage, row_loss, lse, row_scale.storage]
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+					[rows, V, row_base, N, int(need_grad)], 256, rows, 1, 256)
 
 			if not need_grad:
 				continue
 
-			# 3) dX = dlogits @ W
+			# 3) dX = dlogits([rows, V]) @ W([V, C])
 			if x.requires_grad:
 				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 					[logits.ptr.offset, w.storage.ptr.offset, x.grad.storage.ptr.offset+row_base*C*itemsize],
 					[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
 
-			# 4) dW += dlogits.T@X
-			if w.requires_grad:
+			# 4) dW += dlogits.T([V, rows])@X([rows, C])
+			if w.requires_grad and not dw_bf16:
 				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 					[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
 					[1, V, C, rows, 1, 0, 0, 0], 1.0, 1.0 if accumulate or row_base != 0 else 0.0)
@@ -2331,7 +3114,188 @@ class MetalBackend(Backend):
 			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
 			[N], 256, 1, 1, 256)
 
+		if not dw_bf16:
+			return
+
+		# 前半区存放dlogits, 后半区存放dW
+		capacity = logits.nbytes // 4
+		tile_rows = min(chunk_rows, capacity - C)
+		tile_v = min(V, capacity // (tile_rows + C))
+		dw_offset = logits.ptr.offset + tile_rows * tile_v * 4
+		for vocab_base in range(0, V, tile_v):
+			cols = min(tile_v, V - vocab_base)
+			w_offset = w.storage.ptr.offset + vocab_base * C * 4
+
+			for row_base in range(0, N, tile_rows):
+				rows = min(tile_rows, N - row_base)
+				x_offset = x.storage.ptr.offset + row_base*C*4
+
+				# 1. 重算当前token块, 词表块的logits
+				self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w_offset, logits.ptr.offset],
+					[rows, C, cols], 256, (rows+63)//64, (cols+95)//96, 256)
+
+				# 2. 使用阶段一保存的全词表LSE原地生成当前块的dlogits
+				count = rows * cols
+				self.ctx.dispatch_with_args_3d("ce_tile_logits_to_dlogits",
+					[logits.ptr.buffer_id, lse.ptr.buffer_id, targets.storage.ptr.buffer_id],
+					[logits.ptr.offset, lse.ptr.offset, targets.storage.ptr.offset],
+					[cols, vocab_base, V, row_base, scale_bits], count, 1, 1, min(count, 256))
+
+				# 3. dW_tile += dlogits_tile.T @ X_chunk
+				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[logits.ptr.offset, x_offset, dw_offset], [1, cols, C, rows, 1, 0, 0, 0], 1.0, 0.0 if row_base == 0 else 1.0)
+
+			# 4. 转换成BF16
+			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+				[logits.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+				[dw_offset, w.grad.storage.ptr.offset + vocab_base*C*2],
+				[int(accumulate)], cols*C, 1, 1, min(cols*C, 256))
+
 	def metal_fused_linear_ce_backward(self, inputs, outputs, scratch=None):
+		return
+
+	def metal_fused_rmsnorm_linear_ce_forward(self, inputs, outputs, scratch=None):
+		x, w, norm_weight, targets = inputs[:4]
+		row_scale = inputs[4] if len(inputs) == 5 else None
+		out_loss = outputs[0]
+		op = out_loss.op.op
+
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		V = w.shape[0]
+
+		row_loss = scratch["row_loss"]
+		lse = scratch["lse"]
+		logits = scratch["logits"]
+		x_norm = scratch["x_norm"]
+		dx_norm = scratch["dx_norm"]
+		inv_rms = scratch["inv_rms"]
+
+		chunk_rows = min(logits.shape[0], N)
+		itemsize = np.dtype(x.dtype).itemsize
+		eps_bits = f32_bits(op.eps)
+
+		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
+		need_grad = out_loss.grad is not None and (x.requires_grad or w.requires_grad or norm_weight.requires_grad)
+		need_dz = need_grad and (x.requires_grad or norm_weight.requires_grad)
+		dw_bf16 = need_grad and w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+		dgamma_bf16 = need_grad and norm_weight.requires_grad and np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
+		if dgamma_bf16:
+			dgamma_acc_offset = x.grad.storage.ptr.offset + (N-1)*C*4
+
+		if row_scale is None:
+			kernel_name = "fused_linear_ce_logits_to_dlogits"
+			scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
+			scale_bits = f32_bits(scale)
+			scale_storage = row_loss
+		else:
+			kernel_name = "fused_linear_ce_logits_to_dlogits_row_scaled"
+			scale_bits = 0
+			scale_storage = row_scale.storage
+
+		for row_base in range(0, N, chunk_rows):
+			rows = min(chunk_rows, N - row_base)
+			x_offset = x.storage.ptr.offset + row_base*C*itemsize
+
+			# 1) Z = RMSNorm(X_chunk, gamma), 同时保存每行inv_rms
+			self.ctx.dispatch_with_args_3d("gqa_rms_recompute",
+				[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, x_norm.ptr.buffer_id, inv_rms.ptr.buffer_id],
+				[x_offset, norm_weight.storage.ptr.offset, x_norm.ptr.offset, inv_rms.ptr.offset],
+				[rows, C, eps_bits], 128, (rows+3)//4, 1, 128)
+
+			# 2) logits = Z @ W.T
+			self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+				[x_norm.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+				[x_norm.ptr.offset, w.storage.ptr.offset, logits.ptr.offset],
+				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+
+			# 3) row_loss/lse以及原地logits->dlogits
+			if row_scale is None:
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
+					[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
+					[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			else:
+				inp_vars = [logits, targets.storage, row_loss, lse, row_scale.storage]
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+					[rows, V, row_base, N, int(need_grad)], 256, rows, 1, 256)
+
+			if not need_grad:
+				continue
+
+			# 4) 先完成dW, 后覆盖Z
+			if w.requires_grad:
+				if dw_bf16:
+					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+						[logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_norm.ptr.offset, w.grad.storage.ptr.offset],
+						[rows, C, V, int(accumulate or row_base != 0)], C, V, 1, min(C, 256))
+				else:
+					main_rows = (rows // 16) * 16
+					tail_rows = rows - main_rows
+					add_dw = bool(accumulate or row_base != 0)
+					if main_rows > 0:
+						self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+							[logits.ptr.offset, x_norm.ptr.offset, w.grad.storage.ptr.offset],
+							[1, V, C, main_rows, 1, 0, 0, 0], 1.0, 1.0 if add_dw else 0.0)
+					if tail_rows > 0:
+						tail_logits_offset = logits.ptr.offset + main_rows * V * itemsize
+						tail_x_offset = x_norm.ptr.offset + main_rows * C * itemsize
+						self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_tail",
+							[logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+							[tail_logits_offset, tail_x_offset, w.grad.storage.ptr.offset],
+							[tail_rows, C, V, int(add_dw or main_rows > 0)], (C+3)//4, V, 1, min((C+3)//4, 128))
+
+			if not need_dz:
+				continue
+
+			# 恢复target概率: dlogits[target] = scale * P[target]
+			self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_restore_target",
+				[x_norm.ptr.buffer_id, w.storage.ptr.buffer_id, targets.storage.ptr.buffer_id, lse.ptr.buffer_id, scale_storage.ptr.buffer_id, logits.ptr.buffer_id],
+				[x_norm.ptr.offset, w.storage.ptr.offset, targets.storage.ptr.offset, lse.ptr.offset, scale_storage.ptr.offset, logits.ptr.offset],
+				[rows, C, V, row_base, scale_bits, int(row_scale is not None)], 32, rows, 1, 32)
+
+			# 5) dZ = dlogits @ W
+			self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, dx_norm.ptr.buffer_id],
+				[logits.ptr.offset, w.storage.ptr.offset, dx_norm.ptr.offset],
+				[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
+
+			# 7) dZ = scale * P @ W - scale * W[target]
+			self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_subtract_target",
+				[w.storage.ptr.buffer_id, targets.storage.ptr.buffer_id, scale_storage.ptr.buffer_id, dx_norm.ptr.buffer_id],
+				[w.storage.ptr.offset, targets.storage.ptr.offset, scale_storage.ptr.offset, dx_norm.ptr.offset],
+				[rows, C, V, row_base, scale_bits, int(row_scale is not None)], C, rows, 1, min(C, 256))
+
+			# 8) dgamma = sum(dZ * X * inv_rms)
+			if norm_weight.requires_grad:
+				if dgamma_bf16:
+					self.ctx.dispatch_with_args_3d("gqa_rms_dgamma_bf16",
+						[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, inv_rms.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[x_offset, dx_norm.ptr.offset, inv_rms.ptr.offset, norm_weight.grad.storage.ptr.offset, dgamma_acc_offset],
+						[rows, C, int(accumulate), int(row_base == 0), int(row_base+rows == N)], C, 1, 1, min(C, 256))
+				else:
+					inp_vars = [x.storage, dx_norm, inv_rms, norm_weight.grad.storage]
+					self.ctx.dispatch_with_args_3d("gqa_rms_dgamma",
+						[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, inv_rms.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id,],
+						[x_offset, dx_norm.ptr.offset, inv_rms.ptr.offset, norm_weight.grad.storage.ptr.offset],
+						[rows, C, int(accumulate or row_base != 0)], C, 1, 1, min(C, 256))
+
+			# 7) 直接写入
+			if x.requires_grad:
+				self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dx",
+					[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, inv_rms.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+					[x_offset, dx_norm.ptr.offset, norm_weight.storage.ptr.offset, inv_rms.ptr.offset, x.grad.storage.ptr.offset + row_base*C*itemsize],
+					[rows, C], 32, rows, 1, 32)
+
+		self.ctx.dispatch_with_args_3d("fused_linear_ce_forward_reduce",
+			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
+			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
+			[N], 256, 1, 1, 256)
+
+	def metal_fused_rmsnorm_linear_ce_backward(self, inputs, outputs, scratch=None):
 		return
 
 	def metal_fused_mlp_forward(self, inputs, outputs, scratch=None):
@@ -2455,7 +3419,12 @@ class MetalBackend(Backend):
 		self.ctx.dispatch_with_args("attn_out_contiguous_backward_kernel", buffer_ids, offsets, [B, H, T, D], grid_size)
 
 	def metal_fused_rmsnorm_mlp_forward(self, inputs, outputs, scratch=None):
-	    x, wgu, wdown = inputs
+	    if len(inputs) == 3:
+	    	x, wgu, wdown = inputs
+	    	norm_weight = None
+	    elif len(inputs) == 4:
+	    	x, norm_weight, wgu, wdown = inputs
+
 	    out = outputs[0]
 
 	    N = prod(x.shape[:-1])
@@ -2463,86 +3432,48 @@ class MetalBackend(Backend):
 	    H2 = wgu.shape[-1]
 	    H = H2 // 2
 
-	    eps_bits = struct.unpack(
-	        "<i",
-	        struct.pack("<f", out.op.op.eps),
-	    )[0]
+	    eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
 
 	    gu = scratch["gu"]
 	    hidden = scratch["hidden"]
 
 	    # 使用 out 暂存 RMSNorm 输出，避免额外的 x_norm scratch
-	    self.ctx.dispatch_with_args_3d(
-	        "rmsnorm_forward",
-	        [
-	            x.storage.ptr.buffer_id,
-	            out.storage.ptr.buffer_id,
-	        ],
-	        [
-	            x.storage.ptr.offset,
-	            out.storage.ptr.offset,
-	        ],
-	        [C, eps_bits],
-	        N * 256,
-	        1,
-	        1,
-	        256,
-	    )
+	    if norm_weight is None:
+		    self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+		        [x.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+		        [x.storage.ptr.offset, hidden.ptr.offset],
+		        [C, eps_bits], N * 256, 1, 1, 256)
+	    else:
+		    self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+		    	[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+		    	[x.storage.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
+		    	[C, eps_bits], N*256, 1, 1, 256)
 
 	    # GU = X_norm @ Wgu
 	    self.ctx.dispatch_gemm_mps(
-	        [
-	            out.storage.ptr.buffer_id,
-	            wgu.storage.ptr.buffer_id,
-	            gu.ptr.buffer_id,
-	        ],
-	        [
-	            out.storage.ptr.offset,
-	            wgu.storage.ptr.offset,
-	            gu.ptr.offset,
-	        ],
-	        [1, N, H2, C, 0, 0, 0, 0],
-	        1.0,
-	        0.0,
-	    )
+	    	[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+	        [hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+	        [1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 	    # HIDDEN = SiLU(gate) * up
-	    self.ctx.dispatch_with_args_3d(
-	        "swiglu_forward_kernel",
-	        [
-	            gu.ptr.buffer_id,
-	            hidden.ptr.buffer_id,
-	        ],
-	        [
-	            gu.ptr.offset,
-	            hidden.ptr.offset,
-	        ],
-	        [N, H],
-	        N*(H+3)//4,
-	        1,
-	        1,
-	        min(N*(H+3)//4 , 256),
-	    )
+	    self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+	        [gu.ptr.buffer_id, hidden.ptr.buffer_id],
+	        [gu.ptr.offset, hidden.ptr.offset],
+	        [N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4 , 256))
 
 	    # OUT = HIDDEN @ Wdown
 	    self.ctx.dispatch_gemm_mps(
-	        [
-	            hidden.ptr.buffer_id,
-	            wdown.storage.ptr.buffer_id,
-	            out.storage.ptr.buffer_id,
-	        ],
-	        [
-	            hidden.ptr.offset,
-	            wdown.storage.ptr.offset,
-	            out.storage.ptr.offset,
-	        ],
-	        [1, N, C, H, 0, 0, 0, 0],
-	        1.0,
-	        0.0,
-	    )
+	        [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+	        [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+	        [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
 
 	def metal_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
-		x, wgu, wdown = inputs
+		if len(inputs) == 3:
+			x, wgu, wdown = inputs
+			norm_weight = None
+		elif len(inputs) == 4:
+			x, norm_weight, wgu, wdown = inputs
+
 		out = outputs[0]
 		grad_out = out.grad
 		if grad_out is None: return
@@ -2561,10 +3492,27 @@ class MetalBackend(Backend):
 		residual_grad = grad_out.storage
 
 		fla_node = x.op 
-		recompute_x = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
+		recompute_fla = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
 			and len(fla_node.inputs) == 4 and fla_node.inputs[1].op is not None
 			and fla_node.inputs[1].op.op.op_name == "FusedRMSNormFlashAttention")
-		if recompute_x:
+		recompute_gqa = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd"
+			and len(fla_node.inputs) == 4 and fla_node.inputs[1].op is not None
+			and fla_node.inputs[1].op.op.op_name == "FusedRMSNormGQA")
+		recompute_x = recompute_fla or recompute_gqa
+
+		down_bf16 = wdown.requires_grad and np.dtype(wdown.grad.storage.dtype) == np.dtype(np.uint16)
+		gu_bf16 = wgu.requires_grad and np.dtype(wgu.grad.storage.dtype) == np.dtype(np.uint16)
+		capacity = hidden.nbytes // 4
+		if down_bf16:
+			# [N, down_tile_h] + [down_tile_h, C]
+			down_tile_h = min(H, capacity // (N+C))
+			down_dw_relative = N * down_tile_h * 4
+		if gu_bf16:
+			# recompute_x=True: 前部保留X_norm[N, C], 否则X_norm在tmp_dx, 可使用整个hidden
+			gu_dw_relative = N * C * 4 if recompute_x else 0
+			gu_tile_r = min(C, (capacity - gu_dw_relative // 4) // H2)
+
+		if recompute_fla:
 			x_in, attn_out, proj_w, proj_b = fla_node.inputs
 			fa_node = attn_out.op
 			fa_x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = fa_node.inputs
@@ -2620,16 +3568,73 @@ class MetalBackend(Backend):
 			x_buffer_id = tmp_dx.ptr.buffer_id
 			x_offset = tmp_dx.ptr.offset
 			x_norm_storage = hidden
+		elif recompute_gqa:
+			x_in, attn_out, proj_w, proj_b = fla_node.inputs
+			fa_node = attn_out.op
+			fa_x, fa_norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = fa_node.inputs
+			B, T, C = fa_x.shape
+			Hq, Hkv = fa_node.op.n_head, fa_node.op.n_kv_head
+			D = C // Hq
+			CKV = Hkv * D
+			fa_eps_bits = struct.unpack("<i", struct.pack("<f", fa_node.op.eps))[0]
+			fa_q_offset = gu.ptr.offset
+			fa_k_offset = fa_q_offset + B*T*C*4
+			fa_v_offset = fa_k_offset + B*T*CKV*4
+			fa_out_storage = attn_out.grad.storage
+
+			self.ctx.dispatch_with_args_3d("gqa_rms_qkv",
+				[fa_x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id,
+				 wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, fa_norm_weight.storage.ptr.buffer_id],
+				[fa_x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset,
+				 wv.storage.ptr.offset, bv.storage.ptr.offset, fa_q_offset, fa_k_offset, fa_v_offset, fa_norm_weight.storage.ptr.offset],
+				[B, T, C, Hq, fa_eps_bits, Hkv], 256, (B*T+15)//16, 1, 256)
+
+			negative_sin = int(fa_node.op.rope_sign < 0)
+			self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+				[gu.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+				[fa_q_offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+				[B, Hq, T, D, 0, negative_sin], D//2, T, B*Hq, D//2)
+
+			self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+				[gu.ptr.buffer_id, rope_cos.storage.ptr.buffer_id,rope_sin.storage.ptr.buffer_id],
+			    [fa_k_offset,rope_cos.storage.ptr.offset,rope_sin.storage.ptr.offset],
+			    [B, Hkv, T, D, 0, negative_sin], D//2, T, B*Hkv, D//2)
+
+			fa_kernel = 'gqa_from_qkv_d64' if D <= 64 else 'gqa_from_qkv_d128'
+			self.ctx.dispatch_with_args_3d(fa_kernel,
+			    [gu.ptr.buffer_id,gu.ptr.buffer_id,gu.ptr.buffer_id,
+			     fa_out_storage.ptr.buffer_id,gu.ptr.buffer_id],
+			    [fa_q_offset,fa_k_offset,fa_v_offset,fa_out_storage.ptr.offset,fa_q_offset],
+			    [B,Hq,T,C,int(fa_node.op.is_causal),0,Hkv],128,(T+7)//8,B*Hq,128)
+			M_fla = prod(x_in.shape[:-1])
+			K_fla, N_fla = attn_out.shape[-1], proj_w.shape[-1]
+			self.ctx.dispatch_with_args_3d('fused_linear_add_forward_kernel',
+			    [x_in.storage.ptr.buffer_id,fa_out_storage.ptr.buffer_id,proj_w.storage.ptr.buffer_id,
+			     proj_b.storage.ptr.buffer_id,tmp_dx.ptr.buffer_id],
+			    [x_in.storage.ptr.offset,fa_out_storage.ptr.offset,proj_w.storage.ptr.offset,
+			     proj_b.storage.ptr.offset,tmp_dx.ptr.offset],
+			    [M_fla,K_fla,N_fla,0],256,(N_fla+63)//64,(M_fla+63)//64,256)
+			if not hasattr(self, '_recomputed_attention_cache'):
+			    self._recomputed_attention_cache = set()
+			self._recomputed_attention_cache.add(id(attn_out))
+			x_buffer_id, x_offset = tmp_dx.ptr.buffer_id, tmp_dx.ptr.offset
+			x_norm_storage = hidden
 		else:
 			x_buffer_id = x.storage.ptr.buffer_id
 			x_offset = x.storage.ptr.offset
 			x_norm_storage = tmp_dx
 
 		# 5. X_norm = RMSNorm(x)
-		self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-			[x_buffer_id, x_norm_storage.ptr.buffer_id],
-			[x_offset, x_norm_storage.ptr.offset],
-			[C, eps_bits], N * 256, 1, 1, 256)
+		if norm_weight is None:			
+			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+				[x_buffer_id, x_norm_storage.ptr.buffer_id],
+				[x_offset, x_norm_storage.ptr.offset],
+				[C, eps_bits], N * 256, 1, 1, 256)
+		else:
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+				[x_buffer_id, norm_weight.storage.ptr.buffer_id, x_norm_storage.ptr.buffer_id],
+				[x_offset, norm_weight.storage.ptr.offset, x_norm_storage.ptr.offset],
+				[C, eps_bits], N*256, 1, 1, 256)
 
 		# 6. GU = X_norm @ Wgu
 		self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
@@ -2637,16 +3642,33 @@ class MetalBackend(Backend):
 			[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 		# 7. hidden = SiLU(gate)*up
-		self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
-			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
-			[gu.ptr.offset, hidden.ptr.offset],
-			[N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4, 256))
+		if down_bf16:
+			dw_offset = hidden.ptr.offset + down_dw_relative
+			for h0 in range(0, H, down_tile_h):
+				h = min(down_tile_h, H - h0)
+				# hidden头部: FP32 [N, h]
+				self.ctx.dispatch_with_args_3d("swiglu_forward_tile_kernel",
+					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+					[gu.ptr.offset, hidden.ptr.offset],
+					[N, H, h0, h], N*((h+3)//4), 1, 1, min(N*((h+3)//4), 256))
+				# hidden尾部: FP32 [h, C]
+				self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, grad_out.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+					[hidden.ptr.offset, grad_out.storage.ptr.offset, dw_offset],
+					[1, h, C, N, 1, 0, 0, 0], 1.0, 0.0)
+				self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+					[hidden.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id], [dw_offset, wdown.grad.storage.ptr.offset+h0*C*2],
+					[accumulate], h*C, 1, 1, min(h*C, 256))
+		else:
+			self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+				[gu.ptr.offset, hidden.ptr.offset],
+				[N, H], N*((H+3)//4), 1, 1, min(N*((H+3)//4), 256))
 
 		# 8. dWdown = HIDDEN.T @ dOUT
-		if wdown.requires_grad:
+		if wdown.requires_grad and not down_bf16:
 			self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
 				[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
-				[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))
+				[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))	
 
 		# 9. hidden -> dHidden
 		self.ctx.dispatch_gemm_mps([out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
@@ -2657,22 +3679,47 @@ class MetalBackend(Backend):
 		self.ctx.dispatch_with_args_3d("swiglu_backward_inplace_kernel",
 			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
 			[gu.ptr.offset, hidden.ptr.offset],
-			[N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4, 256))
+			[N, H], N*H, 1, 1, 256)
 
 		if recompute_x:
-			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-				[tmp_dx.ptr.buffer_id, hidden.ptr.buffer_id],
-				[tmp_dx.ptr.offset, hidden.ptr.offset],
-				[C, eps_bits], N*256, 1, 1, 256)
+			if norm_weight is None:
+				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+					[tmp_dx.ptr.buffer_id, hidden.ptr.buffer_id],
+					[tmp_dx.ptr.offset, hidden.ptr.offset],
+					[C, eps_bits], N*256, 1, 1, 256)
+			else:
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+					[tmp_dx.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+					[tmp_dx.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
+					[C, eps_bits], N*256, 1, 1, 256)
 			x_norm_storage = hidden
 		else:
 			x_norm_storage = tmp_dx
 
 		# 11. dWgu = X_norm.T @ dGU
 		if wgu.requires_grad:
-			self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
-				[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
-				[1, C, H2, N, 1, 0, 0, 0], 1.0, float(accumulate))
+			if gu_bf16:
+				dw_offset = hidden.ptr.offset + gu_dw_relative
+				for c0 in range(0, C, gu_tile_r):
+					r = min(gu_tile_r, C - c0)
+					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, hidden.ptr.buffer_id],
+						[x_norm_storage.ptr.offset+c0*4, gu.ptr.offset, dw_offset],
+						[1, r, H2, N, 1, 0, 0, 0, 0, C*4], 1.0, 0.0)
+					self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+						[hidden.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id], [dw_offset, wgu.grad.storage.ptr.offset+c0*H2*2],
+						[accumulate], r*H2, 1, 1, min(r*H2, 256))
+			else:
+				main_rows = (N // 16) * 16
+				tail_rows = N - main_rows
+				if main_rows > 0:
+					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+						[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+						[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
+				if tail_rows:
+					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_tail",
+						[x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+						[x_norm_storage.ptr.offset+main_rows*C*4, gu.ptr.offset+main_rows*H2*4, wgu.grad.storage.ptr.offset],
+						[tail_rows, H2, C, int(accumulate or main_rows > 0)], (H2+3)//4, C, 1, min((H2+3)//4, 128))
 
 		# 12. dX_norm
 		if recompute_x:
@@ -2685,15 +3732,27 @@ class MetalBackend(Backend):
 			[1, N, C, H2, 0, 1, 0, 0], 1.0, 0.0)
 
 		# 13. RMSNorm backward
-		if recompute_x:
+		if norm_weight is not None and norm_weight.requires_grad:
+			norm_grad_bf16 = np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_dgamma",
+				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+				[x_offset, dx_norm_storage.ptr.offset, norm_weight.grad.storage.ptr.offset],
+				[N, C, eps_bits, int(accumulate), int(norm_grad_bf16)], C, 1, 1, min(C, 256))
+
+		if norm_weight is None:
 			self.ctx.dispatch_with_args_3d("rmsnorm_backward",
 				[x_buffer_id, dx_norm_storage.ptr.buffer_id, tmp_dx.ptr.buffer_id, residual_grad.ptr.buffer_id],
 				[x_offset, dx_norm_storage.ptr.offset, tmp_dx.ptr.offset, residual_grad.ptr.offset],
 				[N, C, eps_bits], 256, (N+7)//8, 1, 256)
 		else:
-			self.ctx.dispatch_with_args_3d("rmsnorm_backward",
-				[x_buffer_id, dx_norm_storage.ptr.buffer_id, dx_norm_storage.ptr.buffer_id, residual_grad.ptr.buffer_id],
-				[x_offset, dx_norm_storage.ptr.offset, dx_norm_storage.ptr.offset, residual_grad.ptr.offset],
+			inp_bufs = [x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id,
+			            tmp_dx.ptr.buffer_id if recompute_x else dx_norm_storage.ptr.buffer_id, 
+			residual_grad.ptr.buffer_id]
+			inp_offs = [x_offset, dx_norm_storage.ptr.offset, norm_weight.storage.ptr.offset, 
+			            tmp_dx.ptr.offset if recompute_x else dx_norm_storage.ptr.offset, residual_grad.ptr.offset]
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_backward",
+				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, tmp_dx.ptr.buffer_id, residual_grad.ptr.buffer_id],
+				[x_offset, dx_norm_storage.ptr.offset, norm_weight.storage.ptr.offset, tmp_dx.ptr.offset, residual_grad.ptr.offset],
 				[N, C, eps_bits], 256, (N+7)//8, 1, 256)
 
 	def metal_flash_attention_forward(self, inputs, outputs, scratch=None):
@@ -2847,12 +3906,11 @@ class MetalBackend(Backend):
 		return f"fused_rms_fa_forward_block{capacity}", 256, (seq_len+31)//32, 256
 
 	def fa_from_qkv_dispatch(self, head_dim, seq_len):
-		if head_dim <= 0 or head_dim > 512:
+		if head_dim <= 0 or head_dim > 128:
 			raise ValueError(f"fused attention requires 0 < head_dim <= 512, got {head_dim}")
-		if head_dim <= 128:
-			return "fused_fa_from_qkv", 128, (seq_len+7)//8, 128
-		capacity = 256 if head_dim <= 256 else 512
-		return f"fused_fa_from_qkv_block{capacity}", 32, seq_len, 32
+		if head_dim <= 64:
+			return "fused_fa_from_qkv_d64", 128, (seq_len+7)//8, 128
+		return "fused_fa_from_qkv_d128", 128, (seq_len+7)//8, 128
 
 	def fa_bwd_dq_dispatch(self, head_dim, seq_len):
 		if head_dim <= 0 or head_dim > 128:
@@ -2888,6 +3946,7 @@ class MetalBackend(Backend):
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset,
 				wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset],
 			[B, T, C, H, eps_bits], 256, (B * T + 15) // 16, 1, 256)
+
 		# RoPE
 		self.ctx.dispatch_with_args_3d("rope_qk_inplace",
 			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -2979,25 +4038,45 @@ class MetalBackend(Backend):
 			[B, T, C, eps_bits], 128, (B * T + 3) // 4, 1, 128)
 
 		# 7. dWq, dWk, dWv
-		if wq.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dq.ptr.buffer_id, wq.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dq.ptr.offset, wq.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
-		if wk.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dk.ptr.buffer_id, wk.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dk.ptr.offset, wk.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
-		if wv.requires_grad:
-			self.ctx.dispatch_gemm_mps(
-				[q.ptr.buffer_id, dv.ptr.buffer_id, wv.grad.storage.ptr.buffer_id],
-				[q.ptr.offset, dv.ptr.offset, wv.grad.storage.ptr.offset],
-				[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
+		for weight, dweigt in ((wq, dq), (wk, dk), (wv, dv)):
+			if not weight.requires_grad:
+				continue
+			dw_bf16 = np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16)
+			if dw_bf16:
+				dw_capacity = (v.ptr.offset + v.nbytes - k.ptr.offset) // 4
+				dw_tile_rows = min(C, dw_capacity // C)
+
+				for row0 in range(0, C, dw_tile_rows):
+					tile_rows = min(dw_tile_rows, C - row0)
+					# tmp[tile_rows, C] = Z[:, row0:row0+tile_rows].T @ dweight
+					self.ctx.dispatch_gemm_mps([q.ptr.buffer_id, dweigt.ptr.buffer_id, k.ptr.buffer_id],
+						[q.ptr.offset+row0*4, dweigt.ptr.offset, k.ptr.offset],
+						[1, tile_rows, C, B*T, 1, 0, 0, 0, 0, C*4], 1.0, 0.0)
+					self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+						[k.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+						[k.ptr.offset, weight.grad.storage.ptr.offset+row0*C*2],
+						[accumulate], tile_rows*C, 1, 1, min(tile_rows*C, 256))
+			else:
+				self.ctx.dispatch_gemm_mps(
+					[q.ptr.buffer_id, dweigt.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+					[q.ptr.offset, dweigt.ptr.offset, weight.grad.storage.ptr.offset],
+					[1, C, C, B*T, 1, 0, 0, 0], 1.0, float(accumulate))
 
 		# 8. dbq/dbk/dbv
 		if bq.requires_grad or bk.requires_grad or bv.requires_grad:
-			self.ctx.dispatch_with_args_3d('fused_qkv_bias_grad',
+			bq_bf16 = bq.requires_grad and np.dtype(bq.grad.storage.dtype) == np.dtype(np.uint16)
+			bk_bf16 = bk.requires_grad and np.dtype(bk.grad.storage.dtype) == np.dtype(np.uint16)
+			bv_bf16 = bv.requires_grad and np.dtype(bv.grad.storage.dtype) == np.dtype(np.uint16)
+			bf16_mask = int(bq_bf16) | (int(bk_bf16) << 1) | (int(bv_bf16) << 2)
+			if bf16_mask:
+				bias_kernel = "fused_qkv_bias_grad_bf16"
+				enable_mask = int(bq.requires_grad) | (int(bk.requires_grad) << 1) | (int(bv.requires_grad) << 2)
+				bias_args = [B*T, C, accumulate, enable_mask, bf16_mask]
+			else:
+				bias_kernel = "fused_qkv_bias_grad"
+				bias_args = [B*T, C, accumulate]
+
+			self.ctx.dispatch_with_args_3d(bias_kernel,
 				[dq.ptr.buffer_id, dk.ptr.buffer_id, dv.ptr.buffer_id, 
 					bq.grad.storage.ptr.buffer_id if bq.requires_grad else 0,
 					bk.grad.storage.ptr.buffer_id if bk.requires_grad else 0,
@@ -3006,7 +4085,7 @@ class MetalBackend(Backend):
 					bq.grad.storage.ptr.offset if bq.requires_grad else 0,
 					bk.grad.storage.ptr.offset if bk.requires_grad else 0,
 					bv.grad.storage.ptr.offset if bv.requires_grad else 0],
-				[B*T, C, accumulate], 128, (C + 3) // 4, 1, 128)
+				bias_args, 128, (C + 3) // 4, 1, 128)
 
 		# 9. dZ =  dQ*Wq + dK*Wk + dV*Wv
 		if x.requires_grad:
@@ -3026,6 +4105,178 @@ class MetalBackend(Backend):
 				[x.storage.ptr.buffer_id, k.ptr.buffer_id, lse.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 				[x.storage.ptr.offset, k.ptr.offset, lse.ptr.offset, x.grad.storage.ptr.offset],
 				[B*T, C], 32, B*T, 1, 32)
+
+	def metal_fused_rms_gqa_forward(self, inputs, outputs, scratch=None):
+		x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+		out = outputs[0]
+		op = out.op.op 
+
+		B, T, C = x.shape
+		H, HKV = op.n_head, op.n_kv_head
+		D = C // H
+		eps_bits = struct.unpack("<i", struct.pack("<f", op.eps))[0]
+		q, k, v = scratch["q"], scratch["k"], scratch["v"]
+		inp_vars = [x.storage, wq.storage, bq.storage, wk.storage, bk.storage, wv.storage, bv.storage, q, k, v, norm_weight.storage]
+		self.ctx.dispatch_with_args_3d("gqa_rms_qkv",
+			[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+			[B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+		negative_sin = int(op.rope_sign < 0)
+		inp_vars2 = [q, rope_cos.storage, rope_sin.storage]
+		self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+			[e.ptr.buffer_id for e in inp_vars2], [e.ptr.offset for e in inp_vars2],
+			[B, H, T, D, 0, negative_sin], D//2, T, B*H, D//2)
+		inp_vars3 = [k, rope_cos.storage, rope_sin.storage]
+		self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
+			[e.ptr.buffer_id for e in inp_vars3], [e.ptr.offset for e in inp_vars3],
+			[B, HKV, T, D, 0, negative_sin], D//2, T, B*HKV, D//2)
+		fa_kernel = "gqa_from_qkv_d64" if D <= 64 else "gqa_from_qkv_d128"
+		self.ctx.dispatch_with_args_3d(fa_kernel,
+			[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.storage.ptr.buffer_id, q.ptr.buffer_id],
+			[q.ptr.offset, k.ptr.offset, v.ptr.offset, out.storage.ptr.offset, q.ptr.offset],
+			[B, H, T, C, int(op.is_causal), 0, HKV], 128, (T+7)//8, B*H, 128)
+
+	def metal_fused_rms_gqa_backward(self, inputs, outputs, scratch=None):
+		x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+		out = outputs[0]
+		if out.grad is None:
+			return
+		op = out.op.op
+		B, T, C = x.shape
+		H, HKV = op.n_head, op.n_kv_head
+		D = C // H
+		eps_bits = struct.unpack("<i", struct.pack("<f", op.eps))[0]
+		N, CKV = B*T, HKV*D
+
+		accumulate = int(bool(getattr(self, 'accumulate_parameter_grads', False)))
+		q, k, v = scratch['q'], scratch['k'], scratch['v']
+		dq, dk, dv = scratch['dq'], scratch['dk'], scratch['dv']
+		lse, d_val = scratch['lse'], scratch['d_val']
+
+		# 1. 重算 QKV 以及 RoPE。
+		self.ctx.dispatch_with_args_3d('gqa_rms_qkv',
+		    [x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, norm_weight.storage.ptr.buffer_id],
+		    [x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset, norm_weight.storage.ptr.offset],
+		    [B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+		negative_sin = int(op.rope_sign < 0)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [q.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [q.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, H, T, D, 0, negative_sin], D//2, T, B*H, D//2)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [k.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, HKV, T, D, 0, negative_sin], D//2, T, B*HKV, D//2)
+
+		# 2. 重算 O/LSE：O 暂存到完整大小的 dq，不能复用较小的 dk。
+		fa_kernel = "gqa_from_qkv_d64" if D <= 64 else "gqa_from_qkv_d128"
+		self.ctx.dispatch_with_args_3d(fa_kernel,
+		    [q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, dq.ptr.buffer_id, lse.ptr.buffer_id],
+		    [q.ptr.offset, k.ptr.offset, v.ptr.offset, dq.ptr.offset, lse.ptr.offset],
+		    [B, H, T, C, int(op.is_causal), 1, HKV], 128, (T+7)//8, B*H, 128)
+		self.ctx.dispatch_with_args_3d('fused_fa_bwd_prepare',
+		    [dq.ptr.buffer_id, out.grad.storage.ptr.buffer_id, d_val.ptr.buffer_id],
+		    [dq.ptr.offset, out.grad.storage.ptr.offset, d_val.ptr.offset],
+		    [B, H, T, C], 128, (T+3)//4, B*H, 128)
+
+		# 3. O 已被消费，dq 可以写入 dQ。
+		self.ctx.dispatch_with_args_3d('gqa_bwd_dq',
+		    [q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dq.ptr.buffer_id, lse.ptr.buffer_id, d_val.ptr.buffer_id],
+		    [q.ptr.offset, k.ptr.offset, v.ptr.offset, out.grad.storage.ptr.offset, dq.ptr.offset, lse.ptr.offset, d_val.ptr.offset],
+		    [B, H, T, C, int(op.is_causal), HKV], 128*((D+63)//64), (T+31)//32, B*H, 128)
+
+		# 4. 每个 KV 头/key tile 的 threadgroup 内累加所属 Q 头，直接写紧凑 dK/dV。
+		self.ctx.dispatch_with_args_3d('gqa_bwd_dkv',
+		    [q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dk.ptr.buffer_id, dv.ptr.buffer_id, lse.ptr.buffer_id, d_val.ptr.buffer_id],
+		    [q.ptr.offset, k.ptr.offset, v.ptr.offset, out.grad.storage.ptr.offset, dk.ptr.offset, dv.ptr.offset, lse.ptr.offset, d_val.ptr.offset],
+		    [B, H, T, C, int(op.is_causal), HKV], 128, (T+31)//32, B*HKV, 128)
+		negative_sin = int(op.rope_sign > 0)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [dq.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [dq.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, H, T, D, 1, negative_sin], D//2, T, B*H, D//2)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [dk.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [dk.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, HKV, T, D, 1, negative_sin], D//2, T, B*HKV, D//2)
+
+		# 5. attention 反向结束，q 复用为带权 Z，lse 复用为 inv_rms。
+		self.ctx.dispatch_with_args_3d('gqa_rms_recompute',
+		    [x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, q.ptr.buffer_id, lse.ptr.buffer_id],
+		    [x.storage.ptr.offset, norm_weight.storage.ptr.offset, q.ptr.offset, lse.ptr.offset],
+		    [N, C, eps_bits], 128, (N+3)//4, 1, 128)
+
+		for weight, dproj, cols in ((wq, dq, C), (wk, dk, CKV), (wv, dv, CKV)):
+			if not weight.requires_grad:
+				continue
+			dw_bf16 = np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16)
+			if dw_bf16:
+				dw_capacity = (v.ptr.offset + v.nbytes - k.ptr.offset) // 4
+				dw_tile_rows = min(C, dw_capacity // cols)
+
+				if N <= 32 or dw_tile_rows == 0:
+					# [N, V] = Z, [N, C_kernel] = dproj
+					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+						[q.ptr.buffer_id, dproj.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+						[q.ptr.offset, dproj.ptr.offset, weight.grad.storage.ptr.offset],
+						[N, cols, C, accumulate], cols, C, 1, min(cols, 256))
+					continue
+
+				for row0 in range(0, C, dw_tile_rows):
+					tile_rows = min(dw_tile_rows, C - row0)
+					self.ctx.dispatch_gemm_mps([q.ptr.buffer_id, dproj.ptr.buffer_id, k.ptr.buffer_id],
+						[q.ptr.offset + row0*4, dproj.ptr.offset, k.ptr.offset],
+						[1, tile_rows, cols, N, 1, 0, 0, 0, 0, C*4], 1.0, 0.0)
+					self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+						[k.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+						[k.ptr.offset, weight.grad.storage.ptr.offset + row0*cols*2],
+						[accumulate], tile_rows*cols, 1, 1, min(tile_rows*cols, 256))
+			else:
+				self.ctx.dispatch_gemm_mps([q.ptr.buffer_id, dproj.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+					[q.ptr.offset, dproj.ptr.offset, weight.grad.storage.ptr.offset],
+					[1, C, cols, N, 1, 0, 0, 0], 1.0, float(accumulate))
+
+		for bias, dproj, cols in ((bq, dq, C), (bk, dk, CKV), (bv, dv, CKV)):
+			if not bias.requires_grad:
+				continue
+			db_bf16 = np.dtype(bias.grad.storage.dtype) == np.dtype(np.uint16)
+			bias_kernel = "bias_grad_reduce_bf16" if db_bf16 else "bias_grad_reduce"
+			self.ctx.dispatch_with_args_3d(bias_kernel,
+				[dproj.ptr.buffer_id, bias.grad.storage.ptr.buffer_id],
+				[dproj.ptr.offset, bias.grad.storage.ptr.offset],
+				[N, cols, accumulate], 256, (cols+15)//16, 1, 256)
+
+		# 6. 所有 dW 完成后，q 的同一空间继续复用为 dZ。
+		# 即使 x 冻结，也要为 norm_weight 计算 dZ。
+		if x.requires_grad or norm_weight.requires_grad:
+		    self.ctx.dispatch_gemm_mps(
+		        [dq.ptr.buffer_id, wq.storage.ptr.buffer_id, q.ptr.buffer_id],
+		        [dq.ptr.offset, wq.storage.ptr.offset, q.ptr.offset],
+		        [1, N, C, C, 0, 1, 0, 0], 1.0, 0.0)
+		    self.ctx.dispatch_gemm_mps(
+		        [dk.ptr.buffer_id, wk.storage.ptr.buffer_id, q.ptr.buffer_id],
+		        [dk.ptr.offset, wk.storage.ptr.offset, q.ptr.offset],
+		        [1, N, C, CKV, 0, 1, 0, 0], 1.0, 1.0)
+		    self.ctx.dispatch_gemm_mps(
+		        [dv.ptr.buffer_id, wv.storage.ptr.buffer_id, q.ptr.buffer_id],
+		        [dv.ptr.offset, wv.storage.ptr.offset, q.ptr.offset],
+		        [1, N, C, CKV, 0, 1, 0, 0], 1.0, 1.0)
+		    if norm_weight.requires_grad:
+		    	dnorm_weight_bf16 = np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
+		    	if dnorm_weight_bf16:
+		    		self.ctx.dispatch_with_args_3d("gqa_rms_dgamma_bf16",
+		    			[x.storage.ptr.buffer_id, q.ptr.buffer_id, lse.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id, k.ptr.buffer_id],
+		    			[x.storage.ptr.offset, q.ptr.offset, lse.ptr.offset, norm_weight.grad.storage.ptr.offset, k.ptr.offset],
+		    			[N, C, accumulate, 1, 1], C, 1, 1, 256)
+		    	else:
+			        self.ctx.dispatch_with_args_3d('gqa_rms_dgamma',
+			            [x.storage.ptr.buffer_id, q.ptr.buffer_id, lse.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+			            [x.storage.ptr.offset, q.ptr.offset, lse.ptr.offset, norm_weight.grad.storage.ptr.offset],
+			            [N, C, accumulate], C, 1, 1, 256)
+		    if x.requires_grad:
+		        self.ctx.dispatch_with_args_3d('gqa_rms_dx',
+		            [x.storage.ptr.buffer_id, q.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, lse.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+		            [x.storage.ptr.offset, q.ptr.offset, norm_weight.storage.ptr.offset, lse.ptr.offset, x.grad.storage.ptr.offset],
+		            [N, C], 32, N, 1, 32)
 
 	def metal_recompute_fused_rms_fa(self, act, scratch, out_buf):
 		x, wq, bq, wk, bk, wv, bv = act.op.inputs
@@ -3054,6 +4305,34 @@ class MetalBackend(Backend):
 			[out_buf.ptr.offset, k.ptr.offset, v.ptr.offset],
 			[B, H, T, C, int(act.op.op.is_causal)], fa_grid_x, fa_grid_y, B*H, fa_threads)
 
+	def metal_recompute_fused_rms_gqa(self, act, scratch, out_buf):
+		inputs = act.op.inputs
+		op = act.op.op
+		x, norm_weight, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+		B, T, C = x.shape
+		H, HKV = op.n_head, op.n_kv_head
+		D = C // H
+		eps_bits = struct.unpack('<i', struct.pack('<f', op.eps))[0]
+		q, k, v = scratch['fa_q'], scratch['fa_k'], scratch['fa_v']
+		self.ctx.dispatch_with_args_3d('gqa_rms_qkv',
+		    [x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, norm_weight.storage.ptr.buffer_id],
+		    [x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset, norm_weight.storage.ptr.offset],
+		    [B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+		negative_sin = int(op.rope_sign < 0)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [q.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [q.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, H, T, D, 0, negative_sin], D//2, T, B*H, D//2)
+		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
+		    [k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+		    [k.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+		    [B, HKV, T, D, 0, negative_sin], D//2, T, B*HKV, D//2)
+		fa_kernel = "gqa_from_qkv_d64" if D <= 64 else "gqa_from_qkv_d128"
+		self.ctx.dispatch_with_args_3d(fa_kernel,
+		    [q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out_buf.ptr.buffer_id, q.ptr.buffer_id],
+		    [q.ptr.offset, k.ptr.offset, v.ptr.offset, out_buf.ptr.offset, q.ptr.offset],
+		    [B, H, T, C, int(op.is_causal), 0, HKV], 128, (T+7)//8, B*H, 128)
+
 	def metal_fused_linear_add_forward(self, inputs, outputs, scratch=None):
 	    x, act, w, b = inputs
 	    out = outputs[0]
@@ -3081,6 +4360,17 @@ class MetalBackend(Backend):
 	    K_dim = act.shape[-1]
 	    N_dim = w.shape[-1]
 	    accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
+
+	    dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+	    db_bf16 = b.requires_grad and np.dtype(b.grad.storage.dtype) == np.dtype(np.uint16)
+	    if dw_bf16:
+	    	fa_k = scratch["fa_k"]
+	    	fa_v = scratch["fa_v"]
+	    	dw_buffer_id = fa_k.ptr.buffer_id
+	    	dw_offset = fa_k.ptr.offset
+	    	dw_capacity = (fa_v.ptr.offset + fa_v.nbytes - dw_offset) // 4
+	    	dw_tile_k = min(K_dim, dw_capacity // N_dim)
+
 	    if act.op is not None and act.op.op.op_name == "FusedRMSNormFlashAttention":
 	    	cached = getattr(self, "_recomputed_attention_cache", None)
 	    	if cached is not None and id(act) in cached:
@@ -3089,12 +4379,31 @@ class MetalBackend(Backend):
 	    	else:
 	    		act_buf = act.grad.storage
 	    		self.metal_recompute_fused_rms_fa(act, scratch, act_buf)
+	    elif act.op is not None and act.op.op.op_name == "FusedRMSNormGQA":
+	    	cached = getattr(self, "_recomputed_attention_cache", None)
+	    	if cached is not None and id(act) in cached:
+	    		cached.remove(id(act))
+	    		act_buf = act.grad.storage
+	    	else:
+	    		act_buf = scratch["fa_out"]
+	    		self.metal_recompute_fused_rms_gqa(act,scratch,act_buf)
 	    else:
 	        act_buf = act.storage
 	    if w.requires_grad:
-	        self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-	        	[act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
-	        	[1, K_dim, N_dim, B_dim*M_dim, 1, 0, 0, 0], 1.0, float(accumulate))
+	    	if dw_bf16:
+	    		for k0 in range(0, K_dim, dw_tile_k):
+	    			tile_k = min(dw_tile_k, K_dim - k0)
+	    			self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dw_buffer_id],
+	    				[act_buf.ptr.offset + k0*4, out.grad.storage.ptr.offset, dw_offset],
+	    				[1, tile_k, N_dim, B_dim*M_dim, 1, 0, 0, 0, 0, K_dim*4], 1.0, 0.0)
+	    			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+	    				[dw_buffer_id, w.grad.storage.ptr.buffer_id],
+	    				[dw_offset, w.grad.storage.ptr.offset + k0*N_dim*2],
+	    				[accumulate], tile_k*N_dim, 1, 1, min(tile_k*N_dim, 256))
+	    	else:
+		        self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+		        	[act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+		        	[1, K_dim, N_dim, B_dim*M_dim, 1, 0, 0, 0], 1.0, float(accumulate))
 	    if x.requires_grad:
 	        self.ctx.dispatch_strided(
 	            "strided_add_backward_kernel",
@@ -3112,11 +4421,175 @@ class MetalBackend(Backend):
 	        	[1, B_dim*M_dim, K_dim, N_dim, 0, 1, 0, 0], 1.0, 0.0)
 
 	    if b.requires_grad:
-	        self.ctx.dispatch_with_args_3d("bias_grad_reduce",
+	        bias_kernel = "bias_grad_reduce_bf16" if db_bf16 else "bias_grad_reduce"
+	        self.ctx.dispatch_with_args_3d(bias_kernel,
 	        	[out.grad.storage.ptr.buffer_id, b.grad.storage.ptr.buffer_id],
 	        	[out.grad.storage.ptr.offset, b.grad.storage.ptr.offset], 
-	        	# [prod(x.shape[:-1]), N_dim, accumulate], N_dim, 1, 1, min(N_dim, 256))
 	        	[prod(x.shape[:-1]), N_dim, accumulate], 256, (N_dim+15)//16, 1, 256)
+
+	def metal_kv_cache_attention_forward(self, inputs, outputs, scratch=None):
+		x, wq, bq, wk, bk, wv, bv, k_cache, v_cache, position, rope_cos, rope_sin = inputs
+
+		out = outputs[0]
+		B, T, C = x.shape
+		H = out.op.op.n_head
+		D = C // H 
+		S = k_cache.shape[1]
+		cache_B = k_cache.shape[0]
+
+		q = scratch["q"]
+		k = scratch["k"]
+		v = scratch["v"]
+		eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
+
+		# RMSNorm + QKV projection
+		self.ctx.dispatch_with_args_3d("fused_rms_fa_qkv",
+			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+			wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
+			q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
+			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+			wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
+			q.ptr.offset, k.ptr.offset, v.ptr.offset],
+			[B, T, C, H, eps_bits], 256, (B*T+15)//16, 1, 256)
+
+		# Q/K RoPE
+		row_positions = out.op.op.mode == "decode" and position.shape != (1,)
+		if out.op.op.mode == "prefill" and cache_B > B:
+			rope_name = "kv_cache_rope_store_broadcast"
+			half_dim = D // 2
+			source_work_items = H * T * half_dim
+			inp_vars = [q, k, v, k_cache.storage, v_cache.storage, position.storage, rope_cos.storage, rope_sin.storage]
+			self.ctx.dispatch_with_args_3d("kv_cache_rope_store_broadcast",
+				[e.ptr.buffer_id for e in inp_vars],
+				[e.ptr.offset for e in inp_vars],
+				[B, H, T, D, S, cache_B], 128, (source_work_items + 127) // 128, 1, 128)
+		else:
+			rope_name = "kv_cache_rope_store_rows" if row_positions else "kv_cache_rope_store"
+			self.ctx.dispatch_with_args_3d(rope_name,
+				[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, k_cache.storage.ptr.buffer_id, v_cache.storage.ptr.buffer_id,
+					position.storage.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+				[q.ptr.offset, k.ptr.offset, v.ptr.offset, k_cache.storage.ptr.offset, v_cache.storage.ptr.offset,
+					position.storage.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+				[B, H, T, D, S], 128, (B*H*T*(D//2)+127)//128, 1, 128)
+
+		if out.op.op.mode == "prefill":
+			name, gx, gy, threads = self.fa_from_qkv_dispatch(D, T)
+			self.ctx.dispatch_with_args_3d(name,
+				[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.storage.ptr.buffer_id, q.ptr.buffer_id],
+				[q.ptr.offset, k.ptr.offset, v.ptr.offset, out.storage.ptr.offset, q.ptr.offset],
+				[B, H, T, C, 1, 0], gx, gy, B*H, threads)
+		else:
+			if row_positions:
+				name = "kv_cache_fa_forward_rows_d64" if D <= 64 else "kv_cache_fa_forward_rows_d128"
+			else:
+				name = "kv_cache_fa_forward_d64" if D <= 64 else "kv_cache_fa_forward_d128"
+			self.ctx.dispatch_with_args_3d(name,
+				[q.ptr.buffer_id, k_cache.storage.ptr.buffer_id, v_cache.storage.ptr.buffer_id, position.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+				[q.ptr.offset, k_cache.storage.ptr.offset, v_cache.storage.ptr.offset, position.storage.ptr.offset, out.storage.ptr.offset],
+				[B, H, T, C, S], 128, T, B*H, 128)
+
+	def metal_kv_cache_attention_backward(self, inputs, outputs, scratch=None):
+		return
+
+	def metal_lm_head_forward(self, inputs, outputs, scratch=None):
+		x, weight = inputs 
+		out = outputs[0]
+
+		M = prod(x.shape[:-1])
+		K = x.shape[-1]
+		N = weight.shape[0]
+
+		self.ctx.dispatch_gemm_mps([x.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+			[x.storage.ptr.offset, weight.storage.ptr.offset, out.storage.ptr.offset],
+			[1, M, N, K, 0, 1, 0, 0], 1.0, 0.0)
+
+	def metal_last_position_lm_head_forward(self, inputs, outputs, scratch=None):
+		x, weight, position = inputs
+		out = outputs[0]
+
+		row = int(self.numpy_view(position)[0])
+		T = x.shape[1]
+		C = x.shape[-1]
+		V = weight.shape[0]
+
+		x_offset = x.storage.ptr.offset + row * C * 4
+		out_offset = out.storage.ptr.offset
+		self.ctx.dispatch_gemm_mps([x.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+			[x_offset, weight.storage.ptr.offset, out_offset],
+			[1, 1, V, C, 0, 1, 0, 0], 1.0, 0.0)
+
+	def metal_rollout_topk_forward(self, inputs, outputs, scratch=None):
+		logits, top_k, logits_position = inputs
+		topk_values, topk_indices = outputs
+
+		op = topk_values.op.op
+
+		batch = logits.shape[0]
+		vocab = logits.shape[1]
+
+		if logits.ndim == 2:
+			batch, vocab = logits.shape
+			time = 1
+		elif logits.ndim == 3:
+			batch, time, vocab = logits.shape
+
+		k_max = topk_values.shape[-1]
+
+		self.ctx.dispatch_with_args_3d("rollout_topk_select",
+			[logits.storage.ptr.buffer_id, topk_values.storage.ptr.buffer_id, topk_indices.storage.ptr.buffer_id, 
+				top_k.storage.ptr.buffer_id, logits_position.storage.ptr.buffer_id],
+			[logits.storage.ptr.offset, topk_values.storage.ptr.offset, topk_indices.storage.ptr.offset, 
+				top_k.storage.ptr.offset, logits_position.storage.ptr.offset],
+			[batch, vocab, k_max, op.mode_id, time], batch*128, 1, 1, 128)
+
+	def metal_rollout_sample_forward(self, inputs, outputs, scratch=None):
+		topk_values, topk_indices, rng_state, rng_raw, finished, temperature, top_k, next_tokens, generated_ids, lengths, position, step, logits = inputs
+		finished_all = outputs[0]
+		op = finished_all.op.op 
+
+		B = next_tokens.shape[0]
+		K = topk_values.shape[1]
+		max_tokens = generated_ids.shape[1]
+		V = logits.shape[-1]
+		T = logits.shape[1] if logits.ndim == 3 else 1
+		values, indices = scratch["sort_values"], scratch["sort_indices"]
+		P = values.shape[1]
+
+		self.ctx.dispatch_with_args_3d("rollout_sample_from_topk",
+			[topk_values.storage.ptr.buffer_id, topk_indices.storage.ptr.buffer_id, rng_state.storage.ptr.buffer_id, rng_raw.storage.ptr.buffer_id,
+				finished.storage.ptr.buffer_id, next_tokens.storage.ptr.buffer_id, generated_ids.storage.ptr.buffer_id,
+				lengths.storage.ptr.buffer_id, position.storage.ptr.buffer_id, step.storage.ptr.buffer_id,
+				finished_all.storage.ptr.buffer_id, temperature.storage.ptr.buffer_id, top_k.storage.ptr.buffer_id,
+				logits.storage.ptr.buffer_id, position.storage.ptr.buffer_id, values.ptr.buffer_id, indices.ptr.buffer_id],
+			[topk_values.storage.ptr.offset, topk_indices.storage.ptr.offset, rng_state.storage.ptr.offset, rng_raw.storage.ptr.offset,
+				finished.storage.ptr.offset, next_tokens.storage.ptr.offset, generated_ids.storage.ptr.offset,
+				lengths.storage.ptr.offset, position.storage.ptr.offset, step.storage.ptr.offset + op.step_offset,
+				finished_all.storage.ptr.offset, temperature.storage.ptr.offset, top_k.storage.ptr.offset,
+				logits.storage.ptr.offset, position.storage.ptr.offset, values.ptr.offset, indices.ptr.offset],
+			[B, K, op.mode_id, max_tokens, op.eos_token, op.bos_token, V, T, P], B*256, 1, 1, 256)
+
+	def metal_decode_state_forward(self, inputs, outputs, scratch=None):
+		_, tokens, masks, metadata, finished, config, positions, steps, candidates, next_tokens, global_step = inputs
+		out = outputs[0]
+
+		op = out.op.op
+		B, S = tokens.shape
+		inp_vars = [tokens.storage, masks.storage, metadata.storage, finished.storage, config.storage, positions.storage,
+		            steps.storage, candidates.storage, next_tokens.storage, global_step.storage, out.storage]
+		self.ctx.dispatch_with_args_3d("rollout_decode_state",
+			[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+			[B, S, op.phase, op.offset], B, 1, 1, min(B, 256))
+
+	def metal_decode_finished_forward(self, inputs, outputs, scratch=None):
+		next_ids, finished, step, config = inputs
+		out = outputs[0]
+
+		B = finished.shape[0]
+
+		self.ctx.dispatch_with_args_3d("rollout_decode_finished",
+			[finished.storage.ptr.buffer_id, step.storage.ptr.buffer_id, config.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+			[finished.storage.ptr.offset, step.storage.ptr.offset, config.storage.ptr.offset, out.storage.ptr.offset],
+			[B], 1, 1, 1, 1)
 
 	def get_forward_kernel(self, op):
 		op_type = type(op)
@@ -3186,7 +4659,6 @@ class MetalBackend(Backend):
 		if x.shape == y.shape:
 			def _bwd(inputs, outputs, scratch=None):
 				if outputs[0].grad is None: return
-
 				do_x = inputs[0].requires_grad
 				do_y = inputs[1].requires_grad
 				if do_x and inputs[0].grad.storage.ptr.buffer_id == outputs[0].grad.storage.ptr.buffer_id \
@@ -3257,6 +4729,12 @@ class MetalBackend(Backend):
 		self.ctx.fill_scalar("fill_scalar_kernel", [buffer_id], [offset], float(value), grid_size)
 		# self.ctx.dispatch_with_args_3d('fill_scalar_kernel', [buffer_id], [offset], [f32_bits(value)], grid_size, 1, 1, min(grid_size, 256))
 
+	def fill_storage2(self, storage, value):
+		dtype = np.dtype(storage.dtype)
+		value_bits = bf16_bits(value) if dtype == np.dtype(np.uint16) else f32_bits(value)
+		self.ctx.fill_scalar2("fill_scalar_kernel2",
+			[storage.ptr.buffer_id], [storage.ptr.offset], value_bits, dtype.itemsize, prod(storage.shape))
+
 	def numpy_view(self, tensor):
 		buffer_id = tensor.storage.ptr.buffer_id
 		offset = tensor.storage.ptr.offset
@@ -3266,43 +4744,134 @@ class MetalBackend(Backend):
 		return view_func(buffer_id, offset, tuple(tensor.shape))
 
 	def copy_from_host(self, tensor, host_np):
+		if np.dtype(tensor.storage.dtype) == np.dtype(np.uint16):
+			dst = self.ctx.numpy_view_uint8(tensor.storage.ptr.buffer_id, tensor.storage.ptr.offset, (prod(tensor.shape)*2,)).view(np.uint16).reshape(tuple(tensor.shape))
+			values = np.asarray(host_np, dtype=np.float32)
+			bits = values.view(np.uint32)
+			# FP32 -> BF16
+			rounded = (bits + np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)
+			special = ((bits & np.uint32(0x7F800000)) == np.uint32(0x7F800000))
+			nan = special & ((bits & np.uint32(0x007FFFFF)) != np.uint32(0))
+			special_bits = ((bits >> np.uint32(16)) | np.where(nan, np.uint32(0x0040), np.uint32(0)))
+			dst[...] = np.where(special, special_bits, rounded).astype(np.uint16)
+			return
+
 		view = self.numpy_view(tensor)
 		view[:] = host_np
 
 	def copy_to_host(self, tensor):
-		buffer_id = tensor.storage.ptr.buffer_id
-		offset = tensor.storage.ptr.offset
-		shape = tensor.shape 
-		return self.ctx.copy_to_host(buffer_id, offset, shape)
+		if np.dtype(tensor.storage.dtype) == np.dtype(np.uint16):
+			src = self.ctx.numpy_view_uint8(tensor.storage.ptr.buffer_id, tensor.storage.ptr.offset, (prod(tensor.shape)*2,)).view(np.uint16).reshape(tuple(tensor.shape))
+			bits = src.astype(np.uint32)
+			bits <<= np.uint32(16)
+			return bits.view(np.float32)
+
+		return np.array(self.numpy_view(tensor), copy=True)
+
+	def grad_norm_sq(self, p_storage, partial, numel):
+		grad_dtype = np.dtype(p_storage.dtype)
+		n_groups = (numel + 255) // 256
+		self.ctx.dispatch_with_args_3d("grad_norm_sq",
+			[p_storage.ptr.buffer_id, partial.ptr.buffer_id], [p_storage.ptr.offset, partial.ptr.offset],
+			[numel, int(grad_dtype == np.dtype(np.uint16))], n_groups*256, 1, 1, 256)
 
 	def adamw_step(self, p_storage, g_storage, m_storage, v_storage, tmp_storage,
-		lr, lr_t, b1, b2, eps, weight_decay, numel=None, decay_numel=None):
+		lr, lr_t, b1, b2, eps, weight_decay, numel=None, decay_numel=None, grad_scale=1.0, lr_bc1=None, inv_sqrt_bc2=1.0):
 		storages = [p_storage, g_storage, m_storage, v_storage]
 		buffer_ids = [s.ptr.buffer_id for s in storages]
 		offsets = [s.ptr.offset for s in storages]
 		decay_factor = 1.0 - float(lr) * float(weight_decay)
+		grad_dtype = np.dtype(g_storage.dtype)
 		if numel is None:
 			numel = prod(p_storage.shape)
 		if decay_numel is None:
 			decay_numel = numel if weight_decay != 0.0 else 0
 		numel = int(numel)
 		decay_numel = int(decay_numel)
+		update_lr = lr_t if lr_bc1 is None else lr_bc1
 		self.ctx.dispatch_with_args_3d('adamw_step',
 			[p_storage.ptr.buffer_id, g_storage.ptr.buffer_id, m_storage.ptr.buffer_id, v_storage.ptr.buffer_id],
 			[p_storage.ptr.offset, g_storage.ptr.offset, m_storage.ptr.offset, v_storage.ptr.offset],
-			[f32_bits(decay_factor), f32_bits(lr_t), f32_bits(b1), f32_bits(b2), f32_bits(eps), numel, decay_numel],
+			[f32_bits(decay_factor), f32_bits(update_lr), f32_bits(b1), f32_bits(b2), f32_bits(eps), numel, decay_numel, f32_bits(grad_scale), f32_bits(inv_sqrt_bc2), int(grad_dtype == np.dtype(np.uint16))],
 			(numel + 3)// 4, 1, 1, min((numel+3)//4, 256))
 
 	def adamw8bit_step(self, p, g, qm, qv, absmax_m, absmax_v, qmap_m, qmap_v,
-			lr, lr_t, b1, b2, eps, weight_decay, numel, decay_numel, first_step):
+			lr, lr_bc1, inv_sqrt_bc2, b1, b2, eps, weight_decay, numel, decay_numel, first_step, grad_scale=1.0):
 		self.ctx.dispatch_with_args_3d("adamw8bit_step",
 			[p.ptr.buffer_id, g.ptr.buffer_id, qm.ptr.buffer_id, qv.ptr.buffer_id, absmax_m.ptr.buffer_id, absmax_v.ptr.buffer_id,
 				qmap_m.ptr.buffer_id, qmap_v.ptr.buffer_id],
 			[p.ptr.offset, g.ptr.offset, qm.ptr.offset, qv.ptr.offset, absmax_m.ptr.offset, absmax_v.ptr.offset,
 				qmap_m.ptr.offset, qmap_v.ptr.offset],
-			[f32_bits(1.0 - float(lr)*float(weight_decay)), f32_bits(lr_t), f32_bits(b1), f32_bits(b2), f32_bits(eps), 
-				int(numel), int(decay_numel), int(first_step)],
+			[f32_bits(1.0 - float(lr)*float(weight_decay)), f32_bits(lr_bc1), f32_bits(b1), f32_bits(b2), f32_bits(eps), 
+				int(numel), int(decay_numel), int(first_step), f32_bits(inv_sqrt_bc2), int(np.dtype(g.dtype) == np.dtype(np.uint16)), f32_bits(grad_scale)],
 				((numel + 255)//256)*256, 1, 1, 256)
+
+	@staticmethod
+	def _mini_v_group_count(numel, block_elems, cols, head_cols):
+		import operator
+
+		try:
+			numel, block_elems, cols, head_cols = (operator.index(x) for x in (numel, block_elems, cols, head_cols))
+		except TypeError as exc:
+			raise TypeError("AdamW-mini dimensions must be integers") from exc 
+
+		if not 0 < numel <= 0xFFFFFF00:
+			raise ValueError("invalid AdamW-mini numel")
+		if not 0 < block_elems <= numel:
+			raise ValueError("invalid AdamW-mini block_elems")
+		if not 0 < cols <= numel:
+			raise ValueError("invalid AdamW-mini cols")
+		if not 0 <= head_cols <= cols:
+			raise ValueError("invalid AdamW-mini head_cols")
+
+		if head_cols:
+			if numel % cols:
+				raise ValueError("Q/K numel must be divisible by cols")
+			if cols % head_cols:
+				raise ValueError("cols must be divisible by head_cols")
+
+			rows = numel // cols 
+			if block_elems != rows * head_cols:
+				raise ValueError("Q/K block_elems must equal rows*head_cols")
+
+			return cols // head_cols
+		return (numel + block_elems - 1) // block_elems
+
+	def mini_update_v(self, g, v, b2, numel, block_elems, *, cols, head_cols, first_step, grad_scale=1.0):
+		n_v_blocks = self._mini_v_group_count(numel, block_elems, cols, head_cols)
+		grad_dtype = np.dtype(g.dtype)
+		grad_bf16 = grad_dtype == np.dtype(np.uint16)
+		if g.nbytes < numel * grad_dtype.itemsize or v.nbytes < n_v_blocks * 4:
+			raise ValueError("AdamW-mini gradient/v storage is too small")
+		self.ctx.dispatch_with_args_3d("mini_update_v",
+			[g.ptr.buffer_id, v.ptr.buffer_id],
+			[g.ptr.offset, v.ptr.offset],
+			[f32_bits(b2), f32_bits(grad_scale), numel, block_elems, cols, head_cols, int(first_step), int(grad_bf16)],
+			n_v_blocks*256, 1, 1, 256)
+
+	def adamw_mini8bit_step(self, p, g, m, meta, v, lr, lr_bc1, inv_sqrt_bc2, b1, eps, weight_decay, 
+			numel, decay_numel, block_elems, *, cols, head_cols, first_step, seed, stochastic_round, 
+			transpose_m, quantized, grad_scale=1.0):
+		n_v = self._mini_v_group_count(numel, block_elems, cols, head_cols)
+		n_blocks = (numel + 255) // 256
+
+		if not 0 <= decay_numel <= numel:
+			raise ValueError("invalid decay_numel")
+		if transpose_m and numel % cols:
+			raise ValueError("Invalid transposed matrix shape")
+		if meta is None:
+			raise ValueError("mini optimizer requires metadata storage in the current Metal kernel interface")
+
+		grad_bf16 = np.dtype(g.dtype) == np.dtype(np.uint16)
+
+		storages = [p, g, m, meta, v]
+		self.ctx.dispatch_with_args_3d("adamw_mini8bit_step",
+			[s.ptr.buffer_id for s in storages],
+			[s.ptr.offset for s in storages],
+			[f32_bits(1.0 - float(lr) * float(weight_decay)), f32_bits(lr_bc1), f32_bits(inv_sqrt_bc2), f32_bits(b1), f32_bits(eps), f32_bits(grad_scale), 
+				numel, decay_numel, block_elems, cols, head_cols, int(first_step), int(seed)&0xFFFFFFFF, int(stochastic_round), 
+				int(transpose_m), int(quantized), int(grad_bf16)],
+			n_blocks*256, 1, 1, 256)
 
 	def synchronize(self):
 		self.ctx.synchronize()

@@ -6,6 +6,18 @@ import struct
 def f32_bits(x):
 	return struct.unpack('<I', struct.pack('<f', float(x)))[0] 
 
+def f16_bits(x):
+    return struct.unpack("<H", struct.pack("<e", float(x)))[0]
+
+def bf16_bits(x):
+    bits = f32_bits(x)
+    if (bits & 0x7f800000) == 0x7f800000:
+        if bits & 0x007fffff:
+            return ((bits >> 16) | 0x0040) & 0xffff
+        return bits >> 16
+    bias = 0x7fff + ((bits >> 16) & 1)
+    return ((bits + bias) >> 16) & 0xffff
+
 def contiguous_strides(shape):
 	strides = []
 	acc = 1

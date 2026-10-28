@@ -40,11 +40,11 @@ private:
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
 
     // rows, columns, matrices, rowBytes, matrixBytes
-    using MatrixDescriptorKey = std::tuple<NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger>;
+    using MatrixDescriptorKey = std::tuple<NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger, NSUInteger>;
     // buffer_id, buffer offset
     using MatrixViewKey = std::tuple<uintptr_t, NSUInteger, MatrixDescriptorKey>;
     // batch count, M, N, K, transpose A, transpose B, alpha bits, beta bits
-    using GemmKey = std::tuple<NSUInteger, NSUInteger, NSUInteger, NSUInteger, bool, bool, uint32_t, uint32_t>;
+    using GemmKey = std::tuple<NSUInteger, NSUInteger, NSUInteger, NSUInteger, bool, bool, uint32_t, uint32_t, NSUInteger>;
     std::map<MatrixDescriptorKey, MPSMatrixDescriptor*> matrix_descriptor_cache;
     std::map<MatrixViewKey, MPSMatrix*> matrix_view_cache;
     std::map<GemmKey, MPSMatrixMultiplication*> matrix_multiplication_cache;
@@ -74,7 +74,7 @@ public:
         NSString *source = [NSString stringWithUTF8String:buffer.str().c_str()];
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         options.fastMathEnabled = YES;
-        options.languageVersion = MTLLanguageVersion3_0;
+        options.languageVersion = MTLLanguageVersion3_2;
         NSError *compile_error = nil;
         id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&compile_error];
         if (library == nil) {
@@ -85,9 +85,9 @@ public:
         NSArray<NSString*> *kernel_names = @[
             @"add_residual_forward_vec4", @"add_residual_forward", @"add_pos_forward", @"add_bias_forward",
             @"add_residual_backward_vec4", @"add_residual_backward", @"contiguous_backward_kernel", @"pos_emb_grad",
-            @"mul_forward_kernel", @"mul_backward_kernel", @"bias_grad_reduce",
+            @"mul_forward_kernel", @"mul_backward_kernel", @"bias_grad_reduce", @"bias_grad_reduce_bf16",
             @"mul_backward_scalar_dx", @"mul_backward_scalar_dy",
-            @"gather_forward_kernel", @"gather_backward_kernel",
+            @"gather_forward_kernel", @"gather_backward_kernel", @"gather_backward_bf16_kernel",
             @"strided_add_backward_kernel", 
             @"contiguous_forward_kernel", 
             @"rmsnorm_forward", @"layernorm_forward",
@@ -96,27 +96,51 @@ public:
             @"gelu_add_bias_kernel", @"gelu_backward_bias_kernel", 
             @"gelu_forward_kernel", @"gelu_backward_kernel",
             @"swiglu_forward_kernel", @"swiglu_backward_inplace_kernel",
+            @"swiglu_forward_tile_kernel",
             @"fused_rms_fa_forward_block64", @"fused_rms_fa_forward_block128",
             @"fused_linear_add_forward_kernel", 
             @"fused_rmsnorm_mlp_forward_kernel_bm16", @"fused_rmsnorm_mlp_forward_kernel_bm32",
-            @"fill_scalar_kernel",
+            @"fill_scalar_kernel", @"fill_scalar_kernel2",
             @"rope_qk_inplace",
             @"fused_rms_fa_project_kv",
             @"rmsnorm_backward",
+            @"rmsnorm_weighted_forward", @"rmsnorm_weighted_backward", @"rmsnorm_weighted_dgamma",
             @"fused_rms_fa_qkv", 
             @"fused_fa_from_qkv",
+            @"fused_fa_from_qkv_d64", @"fused_fa_from_qkv_d128",
             @"fused_fa_bwd_prepare",  
             @"fused_rms_recompute",
             @"fused_fa_bwd_dq_block64", @"fused_fa_bwd_dq_block128", 
             @"fused_fa_bwd_dkv_block128", 
             @"fused_fa_bwd_dkv_mma64",
-            @"fused_qkv_bias_grad", 
+            @"fused_qkv_bias_grad", @"fused_qkv_bias_grad_bf16",
             @"fused_rmsnorm_bwd_dx",
-            @"fused_linear_ce_logits_to_dlogits",
-            @"fused_linear_ce_forward_reduce", 
-            @"fused_linear_ce_chunk_logits",
-            @"adamw_step", @"adamw8bit_step"
-            ];
+            @"gqa_rms_qkv", @"gqa_from_qkv_d64", @"gqa_from_qkv_d128", @"gqa_bwd_dq", @"gqa_bwd_dkv", @"gqa_rope_inplace", 
+            @"gqa_rms_recompute", @"gqa_rms_dgamma", @"gqa_rms_dx",
+            @"kv_cache_rope_store", @"kv_cache_fa_forward_d64", @"kv_cache_fa_forward_d128", @"kv_cache_rope_store_broadcast",
+            @"kv_cache_rope_store_rows", @"kv_cache_fa_forward_rows_d64", @"kv_cache_fa_forward_rows_d128",
+            @"fused_linear_ce_logits_to_dlogits", @"fused_linear_ce_logits_to_dlogits_row_scaled",
+            @"fused_linear_ce_forward_reduce",
+            @"fused_linear_ce_chunk_logits", 
+            @"ce_tile_logits_to_dlogits", @"fp32_to_bf16",
+            @"fused_rmsnorm_linear_ce_dx",
+            @"fused_rmsnorm_linear_ce_restore_target", 
+            @"fused_rmsnorm_linear_ce_subtract_target",
+            @"fused_rmsnorm_linear_ce_dw_tail",
+            @"fused_rmsnorm_linear_ce_dw_bf16", @"gqa_rms_dgamma_bf16",
+            @"rollout_sample_from_topk", @"rollout_topk_select", @"rollout_decode_state", @"rollout_decode_finished",
+            @"grad_norm_sq",
+            @"adamw_step", @"adamw8bit_step",
+            @"mini_update_v", @"adamw_mini8bit_step",
+            @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
+            @"fp16_gemm_bm32_bn32_bk32_gk256_s2_a0", @"fp16_gemm_bm32_bn32_bk32_gk256_s2_a1",
+            @"fp16_gemm_bm32_bn32_bk32_gk4_s2_a0", @"fp16_gemm_bm32_bn32_bk32_gk4_s2_a1",
+            @"fp16_gemm_bm32_bn32_bk64_gk256_s2_a0", @"fp16_gemm_bm32_bn32_bk64_gk256_s2_a1",
+            @"fp16_gemm_bm32_bn32_bk64_gk4_s2_a0", @"fp16_gemm_bm32_bn32_bk64_gk4_s2_a1",
+            @"fp16_gemm_bm64_bn48_bk64_gk8_s2_a0", @"fp16_gemm_bm64_bn48_bk64_gk8_s2_a1",
+            @"fp16_gemm_bm64_bn128_bk32_gk256_s2_a0", @"fp16_gemm_bm64_bn128_bk32_gk256_s2_a1",
+            @"fp16_gemm_bm128_bn80_bk32_gk4_s2_a0", @"fp16_gemm_bm128_bn80_bk32_gk4_s2_a1",
+        ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
             if (func == nil) {
@@ -124,7 +148,18 @@ public:
                 throw std::runtime_error("Failed to find function in metal library");
             }
             NSError *error = nil;
-            id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
+            // id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
+            id<MTLComputePipelineState> pso = nil;
+            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm32_bn32_bk32"];
+            if (needs544) {
+                MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+                desc.computeFunction = func;
+                desc.maxTotalThreadsPerThreadgroup = 576;
+                pso = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
+            } else {
+                pso = [device newComputePipelineStateWithFunction:func error:&error];
+            }
+
             if (error != nil) {
                 NSLog(@"Error creating pipeline state for %@: %@", name, error);
                 throw std::runtime_error("Failed to create pipeline state");
@@ -430,6 +465,41 @@ public:
         }
     }
 
+    void fill_scalar2(const std::string& kernel_name,
+                  const std::vector<uintptr_t>& buffer_ids,
+                  const std::vector<NSUInteger>& offsets,
+                  uint32_t value_bits, 
+                  uint32_t element_size,
+                  size_t grid_size) {
+        bool owns_enc = false;
+        id<MTLCommandBuffer> current_cmd = cmd;
+        id<MTLComputeCommandEncoder> current_enc = enc;
+        
+        if (current_enc == nil) {
+            current_cmd = [queue commandBuffer];
+            current_enc = [current_cmd computeCommandEncoder];
+            owns_enc = true;
+        }
+
+        id<MTLComputePipelineState> pso = pipelines[kernel_name];
+        [current_enc setComputePipelineState:pso];
+
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)(void*)buffer_ids[0];
+        [current_enc setBuffer:buf offset:offsets[0] atIndex:0];
+        [current_enc setBytes:&value_bits length:sizeof(value_bits) atIndex:1];
+        [current_enc setBytes:&element_size length:sizeof(element_size) atIndex:2];
+
+        MTLSize grid = MTLSizeMake(grid_size, 1, 1);
+        NSUInteger tgSize = std::min((NSUInteger)grid_size, pso.maxTotalThreadsPerThreadgroup);
+        [current_enc dispatchThreads:grid threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
+
+        if (owns_enc) {
+            [current_enc endEncoding];
+            [current_cmd commit];
+            [current_cmd waitUntilCompleted];
+        }
+    }
+
     void dispatch_strided(const std::string& kernel_name,
                           uintptr_t grad_out_id, NSUInteger grad_out_offset,
                           uintptr_t grad_x_id, NSUInteger grad_x_offset,
@@ -498,9 +568,16 @@ public:
             [enc setBytes:&args[i] length:sizeof(uint32_t) atIndex:base_idx + i];
         }
 
-        MTLSize grid = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
-        MTLSize tgSize = MTLSizeMake(tg_size, 1, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        const bool is_fp16_gemm = kernel_name.rfind("fp16_gemm_", 0) == 0;
+        if (is_fp16_gemm) {
+            MTLSize threadgroups = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
+            MTLSize threads_per_threadgroup = MTLSizeMake(tg_size, 1, 1);
+            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
+        } else {
+            MTLSize grid = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
+            MTLSize tgSize = MTLSizeMake(tg_size, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        }
     }
 
     static uint32_t float_bits(float value) {
@@ -509,21 +586,46 @@ public:
         return result;
     }
 
-    MPSMatrixDescriptor* get_matrix_descriptor(NSUInteger rows, NSUInteger columns, NSUInteger matrices, NSUInteger matrix_bytes) {
-        const NSUInteger row_bytes = columns * sizeof(float);
-        const MatrixDescriptorKey key = std::make_tuple(rows, columns, matrices, row_bytes, matrix_bytes);
+    static constexpr uint32_t GEMM_DTYPE_FP32 = 0;
+    static constexpr uint32_t GEMM_DTYPE_FP16 = 1;
+    static NSUInteger dtype_size(NSUInteger data_type) {
+        switch(data_type) {
+            case GEMM_DTYPE_FP32:
+                return sizeof(float);
+            case GEMM_DTYPE_FP16:
+                return sizeof(uint16_t);
+            default:
+                throw std::runtime_error("unsupported GEMM dtype");
+        }
+    }
+    static MPSDataType mps_data_type(NSUInteger data_type) {
+        switch(data_type) {
+            case GEMM_DTYPE_FP32:
+                return MPSDataTypeFloat32;
+            case GEMM_DTYPE_FP16:
+                return MPSDataTypeFloat16;
+            default:
+                throw std::runtime_error("unsupported GEMM dtype");
+        }
+    }
+
+    MPSMatrixDescriptor* get_matrix_descriptor(NSUInteger rows, NSUInteger columns, NSUInteger matrices, NSUInteger matrix_bytes, NSUInteger data_type,
+                                               NSUInteger row_bytes_override=0) {
+        const NSUInteger element_size = dtype_size(data_type);
+        const NSUInteger row_bytes = row_bytes_override != 0 ? row_bytes_override : columns * element_size;
+        const MatrixDescriptorKey key = std::make_tuple(rows, columns, matrices, row_bytes, matrix_bytes, data_type);
         auto found = matrix_descriptor_cache.find(key);
         if (found != matrix_descriptor_cache.end()) {
             return found->second;
         }
-
+        const MPSDataType mps_type = mps_data_type(data_type);
         MPSMatrixDescriptor* descriptor = nil;
         if (matrices == 1) {
             descriptor = [MPSMatrixDescriptor matrixDescriptorWithRows:rows 
-                columns:columns rowBytes:row_bytes dataType:MPSDataTypeFloat32];
+                columns:columns rowBytes:row_bytes dataType:mps_type];
         } else {
             descriptor = [MPSMatrixDescriptor matrixDescriptorWithRows:rows 
-                columns:columns matrices:matrices rowBytes:row_bytes matrixBytes:matrix_bytes dataType:MPSDataTypeFloat32];
+                columns:columns matrices:matrices rowBytes:row_bytes matrixBytes:matrix_bytes dataType:mps_type];
         }
         matrix_descriptor_cache.emplace(key, descriptor);
         return descriptor;
@@ -546,8 +648,8 @@ public:
     }
 
     MPSMatrixMultiplication* get_matrix_multiplication(NSUInteger batch_count, NSUInteger M, NSUInteger N, NSUInteger K,
-        bool transpose_a, bool transpose_b, float alpha, float beta) {
-        auto key = std::make_tuple(batch_count, M, N, K, transpose_a, transpose_b, float_bits(alpha), float_bits(beta));
+        bool transpose_a, bool transpose_b, float alpha, float beta, NSUInteger data_type) {
+        auto key = std::make_tuple(batch_count, M, N, K, transpose_a, transpose_b, float_bits(alpha), float_bits(beta), data_type);
         auto found = matrix_multiplication_cache.find(key);
         if (found != matrix_multiplication_cache.end()) {
             return found->second;
@@ -573,6 +675,9 @@ public:
         const bool transpose_b = args[5] != 0;
         const bool a_is_batched = args[6] != 0;
         const bool b_is_batched = args[7] != 0;
+        const NSUInteger data_type = args.size() >= 9 ? args[8] : GEMM_DTYPE_FP32;
+
+        const NSUInteger element_size = dtype_size(data_type);
 
         const NSUInteger a_rows = transpose_a ? K : M;
         const NSUInteger a_cols = transpose_a ? M : K;
@@ -581,23 +686,25 @@ public:
         const NSUInteger c_rows = M;
         const NSUInteger c_cols = N;
 
-        const NSUInteger a_matrix_bytes = a_is_batched ? a_rows * a_cols * sizeof(float) : 0;
-        const NSUInteger b_matrix_bytes = b_is_batched ? b_rows * b_cols * sizeof(float) : 0;
-        const NSUInteger c_matrix_bytes = c_rows * c_cols * sizeof(float);
+        const NSUInteger a_row_bytes_override = args.size() >= 10 ? args[9] : 0;
 
-        const NSUInteger a_row_bytes = a_cols * sizeof(float);
-        const NSUInteger b_row_bytes = b_cols * sizeof(float);
-        const NSUInteger c_row_bytes = c_cols * sizeof(float);
-        const MatrixDescriptorKey a_key = std::make_tuple(a_rows, a_cols, batch_count, a_row_bytes, a_matrix_bytes);
-        const MatrixDescriptorKey b_key = std::make_tuple(b_rows, b_cols, batch_count, b_row_bytes, b_matrix_bytes);
-        const MatrixDescriptorKey c_key = std::make_tuple(c_rows, c_cols, batch_count, c_row_bytes, c_matrix_bytes);
-        get_matrix_descriptor(a_rows, a_cols, batch_count, a_matrix_bytes);
-        get_matrix_descriptor(b_rows, b_cols, batch_count, b_matrix_bytes);
-        get_matrix_descriptor(c_rows, c_cols, batch_count, c_matrix_bytes);
+        const NSUInteger a_matrix_bytes = a_is_batched ? a_rows * a_cols * element_size : 0;
+        const NSUInteger b_matrix_bytes = b_is_batched ? b_rows * b_cols * element_size : 0;
+        const NSUInteger c_matrix_bytes = c_rows * c_cols * element_size;
+
+        const NSUInteger a_row_bytes = a_row_bytes_override != 0 ? a_row_bytes_override : a_cols * element_size;
+        const NSUInteger b_row_bytes = b_cols * element_size;
+        const NSUInteger c_row_bytes = c_cols * element_size;
+        const MatrixDescriptorKey a_key = std::make_tuple(a_rows, a_cols, batch_count, a_row_bytes, a_matrix_bytes, data_type);
+        const MatrixDescriptorKey b_key = std::make_tuple(b_rows, b_cols, batch_count, b_row_bytes, b_matrix_bytes, data_type);
+        const MatrixDescriptorKey c_key = std::make_tuple(c_rows, c_cols, batch_count, c_row_bytes, c_matrix_bytes, data_type);
+        get_matrix_descriptor(a_rows, a_cols, batch_count, a_matrix_bytes, data_type, a_row_bytes);
+        get_matrix_descriptor(b_rows, b_cols, batch_count, b_matrix_bytes, data_type);
+        get_matrix_descriptor(c_rows, c_cols, batch_count, c_matrix_bytes, data_type);
         MPSMatrix* A = get_matrix_view(buffer_ids[0], offsets[0], a_key);
         MPSMatrix* B = get_matrix_view(buffer_ids[1], offsets[1], b_key);
         MPSMatrix* C = get_matrix_view(buffer_ids[2], offsets[2], c_key);
-        MPSMatrixMultiplication* gemm = get_matrix_multiplication(batch_count, M, N, K, transpose_a, transpose_b, alpha, beta);
+        MPSMatrixMultiplication* gemm = get_matrix_multiplication(batch_count, M, N, K, transpose_a, transpose_b, alpha, beta, data_type);
 
         [enc endEncoding];
         [gemm encodeToCommandBuffer:cmd leftMatrix:A rightMatrix:B resultMatrix:C];
@@ -668,10 +775,13 @@ PYBIND11_MODULE(metal_ext, m) {
         .def("dispatch_with_args_3d", &MetalContext::dispatch_with_args_3d)
         .def("dispatch_gemm_mps", &MetalContext::dispatch_gemm_mps)
         .def("fill_scalar", &MetalContext::fill_scalar)
+        .def("fill_scalar2", &MetalContext::fill_scalar2)
         .def("copy_from_host", &MetalContext::copy_from_host)
         .def("copy_to_host", &MetalContext::copy_to_host)
         .def("numpy_view_float32", &MetalContext::numpy_view_typed<float>)
+        .def("numpy_view_float16", &MetalContext::numpy_view_typed<__fp16>)
         .def("numpy_view_int32", &MetalContext::numpy_view_typed<int32_t>)
         .def("numpy_view_uint8", &MetalContext::numpy_view_typed<uint8_t>)
+        .def("numpy_view_uint32", &MetalContext::numpy_view_typed<uint32_t>)
         .def("synchronize", &MetalContext::synchronize);
 }

@@ -564,7 +564,7 @@ optimizer = AdamW(
     model.parameters(),
     lr=effective_lr,
     weight_decay=args.weight_decay,
-    quant_8bit=False,
+    state_mode="fp32",
 )
 
 
@@ -676,11 +676,14 @@ def approximate_allocated_bytes():
 
     add_storage(optimizer.qmap_m)
     add_storage(optimizer.qmap_v)
-    if optimizer.quant8bit and isinstance(optimizer.dispatches, tuple):
+    if optimizer.state_mode in ("8bit", "mini") and isinstance(optimizer.dispatches, tuple):
         for item in optimizer.dispatches:
             if item[0] == "q8":
-                add_storage(item[5])
-                add_storage(item[6])
+                add_storage(item[5]) # absmax_m
+                add_storage(item[6]) # absmax_v
+            elif item[0] == "mini8bit":
+                add_storage(item[4]) # absmax_m
+
 
     return sum(storages.values())
 
