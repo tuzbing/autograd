@@ -35,12 +35,39 @@ T_MSG_US = 1.0
 REQ_BW_BYTES_PER_US = 64e3
 FRAG_BYTES = 128
 
+MAX_WRITE_REG_SLOTS = 16          # pair_ratio * rm * rn 上限（write 端 acc 寄存器）
+PAIR_RATIO_CANDIDATES = (1, 2, 4)
+RING_BUF_CANDIDATES = (1, 2, 4)
+
+T_MSG_BASE_US = 1.0               # 占位：一条消息的固定开销（轮询、meta、scale load 往返），待标定
+T_MSG_FRAG_US = 0.2               # 占位：每个 fragment 的额外开销，待标定
+
 
 def _ceil_div(a, b):
 	return (a + b - 1) // b
 
 def _align(n, alignment=TG_ALIGN):
 	return _ceil_div(n, alignment) * alignment
+
+def slot_bytes(rm, rn):
+    return rm * rn * 256 + 16     # 与 kernel 的 SLOT_BYTES 一致
+
+def smem_bytes(compute_sg, ring_buf, rm, rn):
+    return _align(compute_sg * ring_buf * (slot_bytes(rm, rn) + ATOMIC_UINT_BYTES))
+
+def _full_subs(extent, block, rfrags_elems, subs):
+    # 镜像 messages_for_tile 在一个维度上的求和：整块贡献 subs，余块贡献 min(rem // (R*8), subs)
+    return (extent // block) * subs + min((extent % block) // rfrags_elems, subs)
+
+def count_messages(M, N, block_m, block_n, rm, rn, group_k):
+    subs_m = block_m // FRAG // rm
+    subs_n = block_n // FRAG // rn
+    nmb = _ceil_div(M, block_m)
+    nnb = _ceil_div(N, block_n)
+    interior = _full_subs(M, block_m, rm * FRAG, subs_m) * _full_subs(N, block_n, rn * FRAG, subs_n)
+    total_subs = nmb * nnb * subs_m * subs_n
+    # interior 子块每组 1 条消息，非 interior 子块每个 fragment 每组 1 条
+    return group_k * (interior + (total_subs - interior) * rm * rn)
 
 def max_resident_threads_by_regs(regs):
     # 对应 Alyssa 文中的阶梯表（Apple7，M1同代架构）
@@ -60,7 +87,7 @@ def estimate_regs_by_thread(reg_tile_m, reg_tile_n, pair_ratio):
     后续用实测反汇编结果拆分成更精确的分项权重。
     """
     compute_slots = reg_tile_m * reg_tile_n + reg_tile_m + reg_tile_n
-    write_slots = pair_ratio
+    write_slots = 2 * pair_ratio * reg_tile_m * reg_tile_n
     regs_compute = REG_BASE + REG_PER_SLOT * compute_slots
     regs_write = REG_BASE + REG_PER_SLOT * write_slots
     return max(regs_compute, regs_write)
@@ -121,33 +148,29 @@ def is_valid_block_tile_params(block_m, block_n, reg_tile_m, reg_tile_n):
     return True
 
 def get_pipeline_shapes(block_k, reg_tile_m, reg_tile_n):
-	pair_ratio = calibrate_pair_ratio(block_k)
 	shapes = []
-	for total_sg in range(4, MAX_SG_PER_TG + 1):
-		# total_sg = compute_sg + write_sg, compute_sg = pair_ratio * write_sg
-		write_sg = total_sg // (pair_ratio + 1)
-		compute_sg = pair_ratio * write_sg
-		if write_sg < 1 or compute_sg < 1:
+	sub_frags = reg_tile_m * reg_tile_n
+	for pair_ratio in PAIR_RATIO_CANDIDATES:
+		if pair_ratio * sub_frags > MAX_WRITE_REG_SLOTS:
 			continue
-		if compute_sg + write_sg > MAX_SG_PER_TG:
-			continue
-		# # 新增:防止因为 ring_buf 过大挤占 smem,被迫把 compute_sg/write_sg 压榨到几乎放弃片上并行的程度
-		# if compute_sg + write_sg < MIN_TOTAL_SG_FRACTION * MAX_SG_PER_TG:
-		# 	continue
-		if not is_valid_pipeline_shape(block_k, compute_sg, write_sg):
-			continue
-		ring_buf = max(2*pair_ratio, 2*reg_tile_m * reg_tile_n)
-
-		promo_bytes = compute_sg * ring_buf * SLOT_BYTES
-		state_bytes = compute_sg * ring_buf * ATOMIC_UINT_BYTES
-		smem_bytes = _align(promo_bytes + state_bytes)
-		if smem_bytes > TG_CAPACITY:
-			continue
-		shapes.append(dict(compute_sg=compute_sg, write_sg=write_sg, ring_buf=ring_buf, pair_ratio=pair_ratio, threadgroup_bytes=smem_bytes))
-
-	# 去重(compute_sg/write_sg组合可能重复)
-	uniq = {(s["compute_sg"], s["write_sg"]): s for s in shapes}
-	return list(uniq.values())
+		for write_sg in range(1, MAX_SG_PER_TG // (pair_ratio + 1) + 1):
+			compute_sg = pair_ratio * write_sg
+			if compute_sg + write_sg > MAX_SG_PER_TG:
+				continue
+			if not is_valid_pipeline_shape(block_k, compute_sg, write_sg):
+				continue
+			for ring_buf in RING_BUF_CANDIDATES:
+				smem = smem_bytes(compute_sg, ring_buf, reg_tile_m, reg_tile_n)
+				if smem > TG_CAPACITY:
+					continue
+				shapes.append({
+					"pair_ratio": pair_ratio,
+					"compute_sg": compute_sg,
+					"write_sg": write_sg,
+					"ring_buf": ring_buf,
+					"threadgroup_bytes": smem,
+					})
+	return shapes
 
 def get_fp16_gemm_config(M, N, K, cd_dtype=np.float32, with_accum=False):
 	cd_dtype = np.dtype(cd_dtype)
@@ -157,7 +180,7 @@ def get_fp16_gemm_config(M, N, K, cd_dtype=np.float32, with_accum=False):
 	group_k = _ceil_div(K, SCALE_GROUP)
 	best = None
 
-	for block_k in (8, 16, 32, 64, 128):
+	for block_k in (128, 64, 32, 16, 8):
 		if SCALE_GROUP % block_k != 0:
 			continue
 		num_k_tiles = _ceil_div(K, block_k)
@@ -200,12 +223,12 @@ def get_fp16_gemm_config(M, N, K, cd_dtype=np.float32, with_accum=False):
 
 							P = min(max_persist_tgs, total_tiles)
 							num_frags = num_m_frags * num_n_frags
-							active_c = min(total_tiles, P * compute_sg)
+							active_c = min(total_tiles, P * compute_sg, 96)
 							active_w = min(P*write_sg, _ceil_div(active_c, pair_ratio))
 
 							bytes_ab_tile = effective_ab_bytes(block_m, block_n, K, elem_ab, reg_tile_m, reg_tile_n)
 							loads_per_tile = bytes_ab_tile / FRAG_BYTES
-							tiles_per_sg = _ceil_div(total_tiles, P * compute_sg)      # 含负载不均
+							tiles_per_sg = _ceil_div(total_tiles, active_c)      # 含负载不均
 							t_load_us = loads_per_tile * tiles_per_sg * T_LOAD_US
 
 							bytes_sfa = block_m * group_k * 4
@@ -214,8 +237,9 @@ def get_fp16_gemm_config(M, N, K, cd_dtype=np.float32, with_accum=False):
 							total_bytes = (bytes_ab_tile + bytes_sfa + bytes_sfb + bytes_cd) * total_tiles
 							t_bw_us = total_bytes / REQ_BW_BYTES_PER_US
 
-							total_msgs = total_tiles * num_frags * group_k
-							t_write_us = total_msgs / active_w * T_MSG_US
+							total_msgs = count_messages(M, N, block_m, block_n, reg_tile_m, reg_tile_n, group_k)
+							t_msg_us = T_MSG_BASE_US + T_MSG_FRAG_US * reg_tile_m * reg_tile_n
+							t_write_us = total_msgs / active_w * t_msg_us
 
 							est_us = max(t_load_us, t_bw_us, t_write_us)
 
