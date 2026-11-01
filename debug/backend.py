@@ -430,9 +430,8 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[C, V, 1, C], 256, group_k, group_n, 256)
 					
 					cfg = scratch.gemm_configs[("dx", rows, False)]
-					num_math_threads = 128 if cfg["block_m"]*cfg["block_n"] <= 64*64 else 512
-					num_threads = 2*32 + num_math_threads
-					print(f"dX NEED KERNEL {fp16_gemm_kernel_name(cfg, False)}")
+					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
+					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {fp16_gemm_kernel_name(cfg, False)}")
 					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
 						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
@@ -464,9 +463,8 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[C, rows, 1, C], 256, group_k, group_n, 256)
 					
 					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
-					num_math_threads = 128 if cfg["block_m"]*cfg["block_n"] <= 64*64 else 512
-					num_threads = 2*32 + num_math_threads
-					print(f"dW NEED KERNEL {fp16_gemm_kernel_name(cfg, with_accum)}")
+					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
+					print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {fp16_gemm_kernel_name(cfg, with_accum)}")
 					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, with_accum),
 						[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],

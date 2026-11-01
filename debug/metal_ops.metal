@@ -13193,7 +13193,66 @@ METAL_FUNC uint fp16_gemm_ab_index(uint row, uint k) {
     return row * BK + (k ^ ((row & ROW_MASK) << 3u));
 }
 
-template<uint BLOCK_M, uint BLOCK_N, uint BLOCK_K, uint NUM_STAGES, bool WITH_ACCUMULATION>
+template <bool CLAMP_MN>
+METAL_FUNC float2 scalar_mma_pair(
+    device const half* a,
+    device const half* b,
+    uint K,
+    uint global_m,
+    uint global_n,
+    uint k_start,
+    uint k_len,
+    uint lane,
+    uint M,
+    uint N
+) {
+    const ushort2 offset = morton_order(ushort(lane));
+    const uint r0 = uint(offset.y);
+    const uint c0 = uint(offset.x);
+    const uint r1 = r0;
+    const uint c1 = c0 + 1u;
+    uint gm0 = global_m + r0;
+    uint gn0 = global_n + c0;
+    uint gm1 = global_m + r1;
+    uint gn1 = global_n + c1;
+
+    bool v0 = true;
+    bool v1 = true;
+
+    if constexpr (CLAMP_MN) {
+        v0 = gm0 < M && gn0 < N;
+        v1 = gm1 < M && gn1 < N;
+        gm0 = min(gm0, M - 1u);
+        gn0 = min(gn0, N - 1u);
+        gm1 = min(gm1, M - 1u);
+        gn1 = min(gn1, N - 1u);
+    }
+
+    device const half* a_row0 = a + ulong(gm0) * ulong(K) + ulong(k_start);
+    device const half* b_row0 = b + ulong(gn0) * ulong(K) + ulong(k_start);
+    device const half* a_row1 = a + ulong(gm1) * ulong(K) + ulong(k_start);
+    device const half* b_row1 = b + ulong(gn1) * ulong(K) + ulong(k_start);
+
+    float2 acc = float2(0.0f);
+    if (v0) {
+        float sum0 = 0.0f;
+        for (uint kk = 0u; kk < k_len; ++kk) {
+            sum0 += float(a_row0[kk]) * float(b_row0[kk]);
+        }
+        acc.x = sum0;
+    }
+    if (v1) {
+        float sum1 = 0.0f;
+        for (uint kk = 0u; kk < k_len; ++kk) {
+            sum1 += float(a_row1[kk]) * float(b_row1[kk]);
+        }
+        acc.y = sum1;
+    }
+    return acc;
+}
+
+template<uint BLOCK_M, uint BLOCK_N, uint BLOCK_K, uint REG_TILE_M, uint REG_TILE_N,
+         uint COMPUTE_SG_NUM, uint WRITE_SG_NUM, uint RING_BUF_SIZE, bool WITH_ACCUMULATION>
 METAL_FUNC void fp16_gemm_impl(
     device const half* a,
     device const half* b,
@@ -13212,476 +13271,355 @@ METAL_FUNC void fp16_gemm_impl(
     threadgroup uchar* smem_buffer
 ) {
     constexpr uint SIMD_WIDTH = 32u;
-    constexpr uint NUM_MATH_THREADS = BLOCK_M*BLOCK_N <= 64u*64u ? 128u : 512u;
-    constexpr uint NUM_MATH_SIMDGROUPS = NUM_MATH_THREADS / SIMD_WIDTH;
-    constexpr uint NUM_LOADER_SIMDGROUPS = 2u;
-    constexpr uint NUM_THREADS = NUM_MATH_THREADS + NUM_LOADER_SIMDGROUPS * SIMD_WIDTH;
+    constexpr uint PAIR_RATIO = COMPUTE_SG_NUM / WRITE_SG_NUM;
+    constexpr uint NUM_THREADS = (COMPUTE_SG_NUM + WRITE_SG_NUM) * SIMD_WIDTH;
+    constexpr uint FRAG = 8u;
+    constexpr uint SCALE_GROUP = 128u;
+    constexpr uint NUM_M_FRAGS   = BLOCK_M / FRAG;
+    constexpr uint NUM_N_FRAGS   = BLOCK_N / FRAG;
+    constexpr uint NUM_FRAGS     = NUM_M_FRAGS * NUM_N_FRAGS;
+
+    static_assert((SCALE_GROUP % BLOCK_K) == 0u, "SCALE_GROUP must be a multiple of BLOCK_K");
+    static_assert((BLOCK_M / FRAG) % REG_TILE_M == 0u,
+                "NUM_M_FRAGS must be divisible by REG_TILE_M so that the interior "
+                "register-tile path always sees a full REG_TILE_M x REG_TILE_N block");
+    static_assert((BLOCK_N / FRAG) % REG_TILE_N == 0u,
+                "NUM_N_FRAGS must be divisible by REG_TILE_N so that the interior "
+                "register-tile path always sees a full REG_TILE_M x REG_TILE_N block");
+
+    // threadgroup memory: raw_accum + tile_id + frag_local + scale_group_id + is_last
+    constexpr uint RAW_ACCUM_BYTES = FRAG*FRAG*sizeof(float);
+    constexpr uint SLOT_BYTES = RAW_ACCUM_BYTES + 4*sizeof(float);
+    constexpr uint PROMO_BYTES = COMPUTE_SG_NUM * RING_BUF_SIZE * SLOT_BYTES;
+    constexpr uint STATE_BYTES = COMPUTE_SG_NUM * RING_BUF_SIZE * sizeof(atomic_uint);
+    threadgroup uchar* promo_buffer = smem_buffer;
+    threadgroup atomic_uint* slot_state = reinterpret_cast<threadgroup atomic_uint*>(smem_buffer + PROMO_BYTES);
 
     const uint sg = tid / SIMD_WIDTH;
     const uint lane = tid % SIMD_WIDTH;
-    const bool is_loader = sg < NUM_LOADER_SIMDGROUPS;
-    const bool is_math = sg >= NUM_LOADER_SIMDGROUPS;
-    const uint math_sg = sg - NUM_LOADER_SIMDGROUPS;
-
-    constexpr uint SCALE_GROUP = 128u;
-    constexpr uint STAGES_PER_SCALE_GROUP = SCALE_GROUP / BLOCK_K;
-    constexpr uint SMEM_CAPACITY = 32768u;
-    constexpr uint SMEM_SYNC_BYTES = 256u;
-
-    // constexpr uint SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(float);
-    constexpr uint SMEM_D_SIZE = 0u;
-    constexpr uint SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(half);
-    constexpr uint SMEM_B_SIZE_PER_STAGE = BLOCK_N * BLOCK_K * sizeof(half);
-    constexpr uint SMEM_SFA_SIZE_PER_STAGE = BLOCK_M * sizeof(float);
-    constexpr uint NUM_SFB_ROWS = (BLOCK_K % BLOCK_N == 0u) ? 1u : 2u;
-    constexpr uint SMEM_A_OFFSET = SMEM_D_SIZE;
-    constexpr uint SMEM_B_OFFSET = SMEM_A_OFFSET + NUM_STAGES * SMEM_A_SIZE_PER_STAGE;
-    constexpr uint SMEM_SFA_OFFSET = SMEM_B_OFFSET + NUM_STAGES * SMEM_B_SIZE_PER_STAGE;
-
-    const uint group_k = (K + SCALE_GROUP - 1u) / SCALE_GROUP;
-    const uint group_n = (N + SCALE_GROUP - 1u) / SCALE_GROUP;
-    // Scale-B 是当前输出 tile 沿完整 K 方向所需的 scale。
-    const uint smem_sfb_bytes = ((group_k * NUM_SFB_ROWS * sizeof(float) + 15u) / 16u) * 16u;
-    const uint smem_sfb_offset = SMEM_SFA_OFFSET + NUM_STAGES * SMEM_SFA_SIZE_PER_STAGE;
-    const uint smem_sync_offset = smem_sfb_offset + smem_sfb_bytes;
-
-    // 每个 stage: 
-    //  full_phase, empty_phase, empty_count; 
-    //  math barrier: math_count, math_phase,;
-    //  loader barrier: loader_count, loader_phase
-    constexpr uint sync_bytes = (3u * NUM_STAGES + 4u) * sizeof(atomic_uint);
-    constexpr uint sync_bytes_aligned = (sync_bytes + 15u) & ~15u;
-    constexpr uint mma_scratch_bytes = NUM_MATH_SIMDGROUPS * 8u * 8u * sizeof(float);
-    const uint smem_mma_scratch_offset = smem_sync_offset + sync_bytes_aligned;
-
-    // threadgroup float* smem_d = reinterpret_cast<threadgroup float*>(smem_buffer);
-    threadgroup half* smem_a = reinterpret_cast<threadgroup half*>(smem_buffer + SMEM_A_OFFSET);
-    threadgroup half* smem_b = reinterpret_cast<threadgroup half*>(smem_buffer + SMEM_B_OFFSET);
-    threadgroup float* smem_sfa = reinterpret_cast<threadgroup float*>(smem_buffer + SMEM_SFA_OFFSET);
-    threadgroup float* smem_sfb = reinterpret_cast<threadgroup float*>(smem_buffer + smem_sfb_offset);
-    threadgroup float* mma_scratch = reinterpret_cast<threadgroup float*>(smem_buffer + smem_mma_scratch_offset);
-
-    // 每个 stage 两个 atomic_uint：full_seq、empty_count
-    threadgroup atomic_uint* full_phase = reinterpret_cast<threadgroup atomic_uint*>(smem_buffer + smem_sync_offset);
-    threadgroup atomic_uint* empty_phase = full_phase + NUM_STAGES;
-    threadgroup atomic_uint* empty_count = empty_phase + NUM_STAGES;
-    threadgroup atomic_uint* math_count = empty_count + NUM_STAGES;
-    threadgroup atomic_uint* math_phase = math_count + 1;
-
-    threadgroup atomic_uint* loader_count = math_phase + 1;
-    threadgroup atomic_uint* loader_phase = loader_count + 1;
-
-    if (tid == 0u) {
-        for (uint stage = 0; stage < NUM_STAGES; ++stage) {
-            atomic_store_explicit(full_phase + stage, 0u, memory_order_relaxed);
-            atomic_store_explicit(empty_phase + stage, 0u, memory_order_relaxed);
-            atomic_store_explicit(empty_count + stage, 0u, memory_order_relaxed);
-        }
-        atomic_store_explicit(math_count, 0u, memory_order_relaxed);
-        atomic_store_explicit(math_phase, 0u, memory_order_relaxed);
-        atomic_store_explicit(loader_count, 0u, memory_order_relaxed);
-        atomic_store_explicit(loader_phase, 0u, memory_order_relaxed);
+    if (tid >= NUM_THREADS || M == 0u || N == 0u || K == 0u || num_m_blocks == 0u || num_n_blocks == 0u) {
+        return;
     }
 
-    // 只在初始化时使用全 threadgroup barrier
+    // 初始化barrier
+    if (tid == 0u) {
+        for (uint row = 0u; row < COMPUTE_SG_NUM; ++row) {
+            for (uint slot = 0u; slot < RING_BUF_SIZE; ++slot) {
+                atomic_store_explicit(slot_state + row * RING_BUF_SIZE + slot, 0u, memory_order_relaxed);
+            }
+        }
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint P = tg_grid.x;
-    const uint block_idx = tg.x;
-    const uint num_blocks = num_m_blocks * num_n_blocks;
-    const uint num_1d_blocks_per_group = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N>(P);
-    const uint num_k_blocks = (K + BLOCK_K - 1u) / BLOCK_K;
+    const uint block_idx        = tg.x;
+    const uint group_k = (K + SCALE_GROUP - 1u) / SCALE_GROUP;
+    const uint persistent_blocks = tg_grid.x;
+    const uint total_tiles = num_m_blocks * num_n_blocks;
+    const uint tile_stride      = persistent_blocks * COMPUTE_SG_NUM;
+    const uint num_k_tiles    = (K + BLOCK_K - 1u) / BLOCK_K;
 
-    // 两条路径各自保存 scheduler 和 pipeline 状态。
-    uint stage_idx = 0u;
-    uint phase = 0u;
+    if (sg < COMPUTE_SG_NUM) {
+        const uint compute_sg = sg;
+        uint my_slot = 0u;
 
-    if (is_loader) { // Producer
-        uint loader_local_phase = 0u; // 每次完成一个K tile的搬运翻转
-        uint m_block_idx;
-        uint n_block_idx;
-        int current_iter = -1;
-        while (get_next_block(current_iter, P, block_idx, num_blocks, num_1d_blocks_per_group, 
-                              num_m_blocks, num_n_blocks, m_block_idx, n_block_idx)) {
-            const uint m_start = get_global_idx(m_block_idx, BLOCK_M);
-            const uint n_start = get_global_idx(n_block_idx, BLOCK_N);
+        // 当前 compute SIMD-group 按固定编号领取 tile。
+        for (uint tile_q = block_idx * COMPUTE_SG_NUM + compute_sg; tile_q < total_tiles; tile_q += tile_stride) {
+            uint m_block_idx = 0u;
+            uint n_block_idx = 0u;
 
-            for (uint k_block_idx = 0u; k_block_idx < num_k_blocks; ++k_block_idx) {
-                const uint stage = stage_idx;
-                const uint k_start = get_global_idx(k_block_idx, BLOCK_K);
+            const uint swizzle_h = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N>(persistent_blocks);
+            get_swizzled_block_idx(swizzle_h, num_m_blocks, num_n_blocks, tile_q, m_block_idx, n_block_idx);
 
-                if (lane == 0u) { // producer等待empty, 轮询当前stage是否可复用
-                    while (atomic_load_explicit(empty_phase + stage, memory_order_relaxed) == (phase ^ 1u)) {
-                    }
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    if (sg == 0u) { // 由loader 0复位
-                        atomic_store_explicit(empty_count + stage, 0u, memory_order_relaxed);
-                    }
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
+            const uint tile_id = tile_q;
+            const uint m_start = m_block_idx * BLOCK_M;
+            const uint n_start = n_block_idx * BLOCK_N;
+            
+            // 一个 compute SIMD-group 独立处理一个完整输出 tile
+            for (uint sub_m = 0u; sub_m < NUM_M_FRAGS; sub_m += REG_TILE_M) {
+                const uint rm = min(REG_TILE_M, NUM_M_FRAGS - sub_m);
+                for (uint sub_n = 0u; sub_n < NUM_N_FRAGS; sub_n += REG_TILE_N) {
+                    const uint rn = min(REG_TILE_N, NUM_N_FRAGS - sub_n);
 
-                threadgroup half* stage_a = smem_a + stage * BLOCK_M * BLOCK_K;
-                threadgroup half* stage_b = smem_b + stage * BLOCK_N * BLOCK_K;
-                threadgroup float* stage_sfa = smem_sfa + stage * BLOCK_M;
+                    const uint global_m_base = m_start + sub_m * FRAG;
+                    const uint global_n_base = n_start + sub_n * FRAG;
+                    const bool sub_interior = (global_m_base + rm*FRAG <= M) && (global_n_base + rn*FRAG <= N);
+                    if (!sub_interior) {
+                        for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                            for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                const uint frag_m = (sub_m + ii) * FRAG;
+                                const uint frag_n = (sub_n + jj) * FRAG;
+                                const uint global_m = m_start + frag_m;
+                                const uint global_n = n_start + frag_n;
+                                const uint frag_local = (sub_m + ii) * NUM_N_FRAGS + (sub_n + jj);
+                                const bool mn_boundary = (global_m + FRAG > M) || (global_n + FRAG > N);
 
-                const uint vector_k = min(BLOCK_K, K - k_start) & ~3u;
-                if (sg == 0u) {
-                    // A：[M,K]
-                    for (uint index = lane; index < BLOCK_M * (vector_k / 4u); index += SIMD_WIDTH) {
-                        const uint local_m = index / (vector_k/4u);
-                        const uint local_k = index % (vector_k/4u)*4u;
-                        const uint global_m = m_start + local_m;
-                        const uint global_k = k_start + local_k;
-                        half4 value = half4(0.0h);
-                        if (global_m < M) {
-                            const ulong offset = ulong(global_m) * K + global_k;
-                            if ((offset & 3ul) == 0ul) {
-                                value = *reinterpret_cast<device const half4*>(a + offset);
-                            } else { // K 非四元素对齐时，部分行的源地址不对齐。
-                                value = half4(a[offset], a[offset + 1u], a[offset + 2u], a[offset + 3u]);
+                                simdgroup_float8x8 acc_frag = simdgroup_float8x8(0.0f);
+                                float2 scalar_accum = float2(0.0f);
+                                bool has_scalar_accum = false;
+
+                                for (uint k_tile = 0u; k_tile < num_k_tiles; ++k_tile) {
+                                    const uint k_block = k_tile * BLOCK_K;
+                                    const uint group_size = min(BLOCK_K, K - k_block);
+                                    const uint scale_group_id = k_block / SCALE_GROUP;
+                                    const bool is_last = (k_tile + 1u == num_k_tiles);
+                                    const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
+
+                                    if (!mn_boundary) {
+                                        for (uint local_k = 0u; local_k < group_size; local_k += FRAG) {
+                                            const uint remaining = group_size - local_k;
+                                            if (remaining >= FRAG) {
+                                                const uint global_k = k_block + local_k;
+                                                simdgroup_half8x8 a_frag, b_frag;
+                                                simdgroup_load(a_frag, a + ulong(global_m)*ulong(K)+ulong(global_k), K);
+                                                simdgroup_load(b_frag, b + ulong(global_n)*ulong(K)+ulong(global_k), K, ulong2(0u,0u), true);
+                                                simdgroup_multiply_accumulate(acc_frag, a_frag, b_frag, acc_frag);
+                                            } else {
+                                                scalar_accum += scalar_mma_pair<false>(a, b, K, global_m, global_n, k_block+local_k, remaining, lane, M, N);
+                                                has_scalar_accum = true;
+                                            }
+                                        }
+                                    } else {
+                                        for (uint local_k = 0u; local_k < group_size; local_k += FRAG) {
+                                            const uint remaining = group_size - local_k;
+                                            const uint scalar_k_len = min(FRAG, remaining);
+                                            scalar_accum += scalar_mma_pair<true>(a, b, K, global_m, global_n, 
+                                                                                  k_block+local_k, scalar_k_len, lane, M, N);
+                                            has_scalar_accum = true;
+                                        }
+                                    }
+
+                                    if (!scale_group_end) continue;
+
+                                    const uint state_index = compute_sg * RING_BUF_SIZE + my_slot;
+                                    threadgroup uchar* slot = promo_buffer + state_index * SLOT_BYTES;
+                                    threadgroup float* raw_accum = reinterpret_cast<threadgroup float*>(slot);
+                                    threadgroup uint* metadata = reinterpret_cast<threadgroup uint*>(slot + RAW_ACCUM_BYTES);
+                                    while (atomic_load_explicit(slot_state + state_index, memory_order_relaxed) != 0u) {}
+
+                                    if (!mn_boundary) {
+                                        simdgroup_store(acc_frag, raw_accum, FRAG, ulong2(0u,0u), false);
+                                    }
+                                    if (has_scalar_accum) {
+                                        const ushort2 offset = morton_order(ushort(lane));
+                                        const uint raw_index = uint(offset.y)*FRAG + uint(offset.x);
+                                        if (mn_boundary) {
+                                            raw_accum[raw_index] = scalar_accum.x;
+                                            raw_accum[raw_index+1u] = scalar_accum.y;
+                                        } else {
+                                            raw_accum[raw_index] += scalar_accum.x;
+                                            raw_accum[raw_index+1u] += scalar_accum.y;
+                                        }
+                                    }
+                                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                                    if (lane == 0u) {
+                                        metadata[0] = tile_id; metadata[1] = frag_local;
+                                        metadata[2] = scale_group_id; metadata[3] = is_last ? 1u : 0u;
+                                        atomic_store_explicit(slot_state + state_index, 1u, memory_order_relaxed);
+                                    }
+                                    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                                    my_slot = (my_slot + 1u) % RING_BUF_SIZE;
+                                    acc_frag = simdgroup_float8x8(0.0f);
+                                    scalar_accum = float2(0.0f);
+                                    has_scalar_accum = false;
+                                }
                             }
                         }
-                        *reinterpret_cast<threadgroup half4*>(stage_a + local_m * BLOCK_K + local_k) = value;
+                        continue;
                     }
-                    for (uint index = lane; index < BLOCK_M * (BLOCK_K - vector_k); index += SIMD_WIDTH) {
-                        const uint local_m = index / (BLOCK_K - vector_k);
-                        const uint local_k = vector_k + index % (BLOCK_K - vector_k);
-                        const uint global_m = m_start + local_m;
-                        const uint global_k = k_start + local_k;
-                        stage_a[local_m * BLOCK_K + local_k] = global_m < M && global_k < K ? a[ulong(global_m) * K + global_k] : half(0.0h);
-                    }
-                    // Scale-A：[M, ceil(K/128)]
-                    if (k_block_idx % STAGES_PER_SCALE_GROUP == 0u) {
-                        const uint scale_k = k_start / SCALE_GROUP;
-                        for (uint local_m = lane * 4u; local_m + 3u < BLOCK_M; local_m += SIMD_WIDTH * 4u) {
-                            const uint global_m = m_start + local_m;
-                            const float4 value = float4(global_m < M ? sa[ulong(global_m) * group_k + scale_k] : 0.0f,
-                                global_m + 1u < M ? sa[ulong(global_m + 1u) * group_k + scale_k] : 0.0f,
-                                global_m + 2u < M ? sa[ulong(global_m + 2u) * group_k + scale_k] : 0.0f,
-                                global_m + 3u < M ? sa[ulong(global_m + 3u) * group_k + scale_k] : 0.0f);
-                            *reinterpret_cast<threadgroup float4*>(stage_sfa + local_m) = value;
-                        }
-                        for (uint local_m = (BLOCK_M & ~3u) + lane; local_m < BLOCK_M; local_m += SIMD_WIDTH) {
-                            const uint global_m = m_start + local_m;
-                            stage_sfa[local_m] = global_m < M ? sa[ulong(global_m) * group_k + scale_k] : 0.0f;
+
+                    simdgroup_float8x8 acc[REG_TILE_M][REG_TILE_N];
+                    for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                        for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                            acc[ii][jj] = simdgroup_float8x8(0.0f);
                         }
                     }
-                } else {
-                    // B：[N,K]，保持不转置。
-                    for (uint index = lane; index < BLOCK_N * (vector_k/4u); index += SIMD_WIDTH) {
-                        const uint local_n = index / (vector_k/4u);
-                        const uint local_k = index % (vector_k/4u)*4u;
-                        const uint global_n = n_start + local_n;
-                        const uint global_k = k_start + local_k;
-                        half4 value = half4(0.0h);
-                        if (global_n < N) {
-                            const ulong offset = ulong(global_n) * K + global_k;
-                            if ((offset & 3ul) == 0ul) {
-                                value = *reinterpret_cast<device const half4*>(b + offset);
-                            } else {
-                                value = half4(b[offset], b[offset + 1u], b[offset + 2u], b[offset + 3u]);
+
+                    for (uint k_tile = 0u; k_tile < num_k_tiles; ++k_tile) {
+                        const uint k_block = k_tile * BLOCK_K;
+                        const uint group_size = min(BLOCK_K, K - k_block);
+                        const uint scale_group_id = k_block / SCALE_GROUP;
+                        const bool is_last = (k_tile + 1u == num_k_tiles);
+                        const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
+                        const uint full_steps = group_size / FRAG;
+
+                        for (uint step = 0u; step < full_steps; ++step) {
+                            const uint global_k = k_block + step * FRAG;
+                            simdgroup_half8x8 a_frag[REG_TILE_M];
+                            simdgroup_half8x8 b_frag[REG_TILE_N];
+
+                            #pragma clang loop unroll(full)
+                            for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                                simdgroup_load(a_frag[ii], a + ulong(global_m_base + ii * FRAG) * ulong(K) + ulong(global_k), K);
+                            }
+                            #pragma clang loop unroll(full)
+                            for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                simdgroup_load(b_frag[jj], b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(global_k), K, ulong2(0u, 0u), true);
+                            }
+                            #pragma clang loop unroll(full)
+                            for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                                #pragma clang loop unroll(full)
+                                for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                    simdgroup_multiply_accumulate(acc[ii][jj], a_frag[ii], b_frag[jj], acc[ii][jj]);
+                                }
                             }
                         }
-                        *reinterpret_cast<threadgroup half4*>(stage_b + local_n * BLOCK_K + local_k) = value;
-                    }
-                    for (uint index = lane; index < BLOCK_N * (BLOCK_K - vector_k); index += SIMD_WIDTH) {
-                        const uint local_n = index / (BLOCK_K - vector_k);
-                        const uint local_k = vector_k + index % (BLOCK_K - vector_k);
-                        const uint global_n = n_start + local_n;
-                        const uint global_k = k_start + local_k;
-                        stage_b[local_n * BLOCK_K + local_k] = global_n < N && global_k < K ? b[ulong(global_n) * K + global_k] : half(0.0h);
-                    }
-                }
 
-                // producer 完成 shared-memory 写入后发布 full。
-                loader_local_phase ^= 1u;
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-                if (lane == 0u) { // producer发布full, 所有搬运线程完成A/B/Scale-A写入后，发布就绪序号
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    const uint previous_count = atomic_fetch_add_explicit(loader_count, 1u, memory_order_relaxed);
-                    if (previous_count == NUM_LOADER_SIMDGROUPS - 1u) {
-                        atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                        atomic_store_explicit(loader_count, 0u, memory_order_relaxed);
-                        atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                        atomic_store_explicit(loader_phase, loader_local_phase, memory_order_relaxed);
-                    } else {
-                        while (atomic_load_explicit(loader_phase, memory_order_relaxed) != loader_local_phase) {
+                        if (!scale_group_end) {
+                            continue;
+                        }
+
+                        const uint tail_start = full_steps * FRAG;
+                        const uint tail_len = group_size - tail_start;
+                        #pragma clang loop unroll(full)
+                        for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                            #pragma clang loop unroll(full)
+                            for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                const uint frag_local = (sub_m + ii) * NUM_N_FRAGS + (sub_n + jj);
+                                const uint state_index = compute_sg * RING_BUF_SIZE + my_slot;
+                                threadgroup uchar* slot = promo_buffer + state_index * SLOT_BYTES;
+                                threadgroup float* raw_accum = reinterpret_cast<threadgroup float*>(slot);
+                                threadgroup uint* metadata = reinterpret_cast<threadgroup uint*>(slot + RAW_ACCUM_BYTES);
+
+                                while (atomic_load_explicit(slot_state + state_index, memory_order_relaxed) != 0u) {}
+
+                                simdgroup_store(acc[ii][jj], raw_accum, FRAG, ulong2(0u, 0u), false);
+
+                                if (tail_len > 0u) {
+                                    const uint gm = global_m_base + ii * FRAG;
+                                    const uint gn = global_n_base + jj * FRAG;
+                                    const float2 tail_scalar = scalar_mma_pair<false>(a, b, K, gm, gn, k_block + tail_start, tail_len, lane, M, N);
+                                    const ushort2 offset = morton_order(ushort(lane));
+                                    const uint raw_index = uint(offset.y) * FRAG + uint(offset.x);
+                                    raw_accum[raw_index]      += tail_scalar.x;
+                                    raw_accum[raw_index + 1u] += tail_scalar.y;
+                                }
+                                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                                if (lane == 0u) {
+                                    metadata[0] = tile_id;
+                                    metadata[1] = frag_local;
+                                    metadata[2] = scale_group_id;
+                                    metadata[3] = is_last ? 1u : 0u;
+                                    atomic_store_explicit(slot_state + state_index, 1u, memory_order_relaxed);
+                                }
+                                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                                my_slot = (my_slot + 1u) % RING_BUF_SIZE;
+                                acc[ii][jj] = simdgroup_float8x8(0.0f);
+                            }
                         }
                     }
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-
-                // 只有 loader 0 的 lane 0 发布 full。
-                if (sg == 0u && lane == 0u) {
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    atomic_store_explicit(full_phase + stage, phase ^ 1u, memory_order_relaxed);
-                }
-
-                ++stage_idx;
-                if (stage_idx == NUM_STAGES) {
-                    stage_idx = 0u;
-                    phase ^= 1u;
                 }
             }
         }
         return;
     }
 
-    if (is_math) { // Math Consumer: SIMD-group 2...NUM_MATH_SIMDGROUP
-        constexpr uint FRAGMENT_M = 8u;
-        constexpr uint FRAGMENT_N = 8u;
-        constexpr uint NUM_N_FRAGMENTS = BLOCK_N / FRAGMENT_N;
-        constexpr uint SIMDGROUPS_PER_MATH_WG = 4u;
-        constexpr uint NUM_MATH_WARPGROUPS = NUM_MATH_SIMDGROUPS / SIMDGROUPS_PER_MATH_WG;
+    const uint write_sg = sg - COMPUTE_SG_NUM;
+    const uint row_begin = write_sg * PAIR_RATIO;
+    thread float2 persistent_accum[PAIR_RATIO];
+    for (uint i = 0u; i < PAIR_RATIO; ++i) {
+        persistent_accum[i] = float2(0.0f);
+    }
 
-        constexpr uint M_ROWS_PER_WG_PER_WAVE = BLOCK_M / NUM_MATH_WARPGROUPS;
-        constexpr uint WAVE_BLOCK_M = M_ROWS_PER_WG_PER_WAVE * NUM_MATH_WARPGROUPS;
-        constexpr uint NUM_M_WAVES = BLOCK_M / WAVE_BLOCK_M;
+    const uint messages_per_tile = NUM_FRAGS * group_k;
+    // 每个 write SIMD-group 对应 PAIR_RATIO 个 compute SIMD-group
+    uint grand_total = 0u; // 每个负责compute SIMD-GROUP会产生的消息数
+    for (uint i = 0u; i < PAIR_RATIO; ++i) {
+        const uint compute_sg_i = row_begin + i;
+        const uint first_tile_q_i = block_idx * COMPUTE_SG_NUM + compute_sg_i;
+        const uint tile_count_i = first_tile_q_i < total_tiles ? (total_tiles - first_tile_q_i + tile_stride - 1u) / tile_stride : 0u;
+        grand_total += tile_count_i * messages_per_tile;
+    }
 
-        constexpr uint FRAGMENTS_PER_WG_PER_WAVE = (M_ROWS_PER_WG_PER_WAVE / FRAGMENT_M) * NUM_N_FRAGMENTS;
-        constexpr uint FRAGMENTS_PER_SIMDGROUP_PER_WAVE = FRAGMENTS_PER_WG_PER_WAVE / SIMDGROUPS_PER_MATH_WG;
-        constexpr uint FRAGMENTS_PER_MATH_GROUP = NUM_M_WAVES * FRAGMENTS_PER_SIMDGROUP_PER_WAVE;
+    const uint swizzle_h = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N>(persistent_blocks);
+    uint cur_row = 0u;
+    uint cur_slot = 0u;
+    uint processed_count = 0u;
+    while (processed_count < grand_total) {
+        const uint compute_sg = row_begin + cur_row;
+        const uint state_index = compute_sg * RING_BUF_SIZE + cur_slot;
 
-        // math SIMD-group 间同步序号
-        uint math_local_phase = 0u;
+        // 非阻塞检查当前槽位；未就绪时直接继续轮询下一个槽位。
+        // const uint ready = atomic_load_explicit(slot_state + state_index, memory_order_acquire);
+        const uint ready = atomic_load_explicit(slot_state + state_index, memory_order_relaxed);
+        if (ready == 1u) {
+            threadgroup uchar* slot = promo_buffer + state_index * SLOT_BYTES;
+            threadgroup const float* raw_accum = reinterpret_cast<threadgroup const float*>(slot);
+            threadgroup const uint* metadata = reinterpret_cast<threadgroup const uint*>(slot + RAW_ACCUM_BYTES);
+            const uint tile_id = metadata[0];
+            const uint frag_local = metadata[1];
+            const uint scale_group_id = metadata[2];
+            const bool is_last = metadata[3] != 0u;
 
-        // math_sg=0..3 -> math_wg_idx=0, math_sg=4..7 -> math_wg_idx=1
-        const uint math_wg_idx = math_sg / SIMDGROUPS_PER_MATH_WG;
-        const uint simdgroup_in_math_wg = math_sg % SIMDGROUPS_PER_MATH_WG;
-
-        uint m_block_idx;
-        uint n_block_idx;
-        int current_iter = -1;
-        while (get_next_block(current_iter, P, block_idx, num_blocks, num_1d_blocks_per_group, 
-                              num_m_blocks, num_n_blocks, m_block_idx, n_block_idx)) {
-            const uint m_start = get_global_idx(m_block_idx, BLOCK_M);
-            const uint n_start = get_global_idx(n_block_idx, BLOCK_N);
-
-            math_local_phase ^= 1u;
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0u) {
-                atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                const uint previous_count = atomic_fetch_add_explicit(math_count, 1u, memory_order_relaxed);
-
-                if (previous_count == NUM_MATH_SIMDGROUPS - 1u) {
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    atomic_store_explicit(math_count, 0u, memory_order_relaxed);
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    atomic_store_explicit(math_phase, math_local_phase, memory_order_relaxed);
-                } else {
-                    while (atomic_load_explicit(math_phase, memory_order_relaxed) != math_local_phase) {
-                    }
-                }
-                atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Math线程加载当前输出tile的Scale-B. 第一个math SIMD-group对应tid [32, 64)
-            const uint first_scale_n = n_start / SCALE_GROUP;
-            const uint scale_n_rows = NUM_SFB_ROWS;
-            if (math_sg == 0u) {
-                const uint load_thread = lane;
-                constexpr uint NUM_SFB_LOAD_THREADS = SIMD_WIDTH;
-                for (uint index = load_thread; index < group_k * scale_n_rows / 4u; index += NUM_SFB_LOAD_THREADS) {
-                    const uint local_n_scale = index*4u / group_k;
-                    const uint local_k_scale = index*4u % group_k;
-                    const uint global_n_scale = first_scale_n + local_n_scale;
-
-                    float4 value = float4(0.0f);
-                    if (global_n_scale < group_n) {
-                        const ulong offset = ulong(global_n_scale) * group_k + local_k_scale;
-                        if ((offset & 3ul) == 0ul && offset + 3ul < ulong(group_n) * group_k) {
-                            value = *reinterpret_cast<device const float4*>(sb + offset);
-                        } else { // 源地址不对齐或跨过最后一个有效 scale：保留有效元素，其余补零。
-                            #pragma unroll
-                            for (uint j = 0u; j < 4u; ++j) {
-                                if (offset + j < ulong(group_n) * group_k) {
-                                    value[j] = sb[offset + j];
-                                }
-                            }
-                        }
-                    }
-                    *reinterpret_cast<threadgroup float4*>(smem_sfb + index * 4u) = value;
-                }
-                for (uint index = ((group_k * scale_n_rows) & ~3u) + load_thread; index < group_k * scale_n_rows; index += NUM_SFB_LOAD_THREADS) {
-                    const uint local_n_scale = index / group_k;
-                    const uint local_k_scale = index % group_k;
-                    const uint global_n_scale = first_scale_n + local_n_scale;
-                    smem_sfb[index] = global_n_scale < group_n ? sb[ulong(global_n_scale) * group_k + local_k_scale] : 0.0f;
-                }
-            }
-
-            // math-only barrier: 所有 math SIMD-group 完成 Scale-B 加载后继续。
-            math_local_phase ^= 1u;
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0u) {
-                atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                const uint previous_count = atomic_fetch_add_explicit(math_count, 1u, memory_order_relaxed);
-
-                if (previous_count == NUM_MATH_SIMDGROUPS - 1u) {
-                    // 最后一个到达者汇集其他 SIMD-group 发布的写入。
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    // 必须先复位计数器，再发布本轮完成。
-                    atomic_store_explicit(math_count, 0u, memory_order_relaxed);
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    atomic_store_explicit(math_phase, math_local_phase, memory_order_relaxed);
-                } else {
-                    while (atomic_load_explicit(math_phase, memory_order_relaxed) != math_local_phase) {
-                    }
-                }
-
-                // 观察完成后，获取所有 math SIMD-group 的共享内存写入。
-                atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-
-            float2 final_accum[FRAGMENTS_PER_MATH_GROUP];
-            float scale_a_group[FRAGMENTS_PER_MATH_GROUP];
-            simdgroup_float8x8 acc_frag[FRAGMENTS_PER_MATH_GROUP];
-            #pragma unroll
-            for (uint f = 0u; f < FRAGMENTS_PER_MATH_GROUP; ++f) {
-                final_accum[f] = float2(0.0f);
-                scale_a_group[f] = 0.0f;
-                acc_frag[f] = simdgroup_float8x8(0.0f);
-            }
-            float scale_b_group0 = 0.0f;
-            float scale_b_group1 = 0.0f;
+            uint m_block_idx = 0u;
+            uint n_block_idx = 0u;
+            get_swizzled_block_idx(swizzle_h, num_m_blocks, num_n_blocks, tile_id, m_block_idx, n_block_idx);
+            const uint m_start = m_block_idx * BLOCK_M;
+            const uint n_start = n_block_idx * BLOCK_N;
+            const uint frag_m = (frag_local / NUM_N_FRAGS) * FRAG;
+            const uint frag_n = (frag_local % NUM_N_FRAGS) * FRAG;
             const ushort2 lane_offset = morton_order(ushort(lane));
+            const uint global_row = m_start + frag_m + uint(lane_offset.y);
+            const uint global_col = n_start + frag_n + uint(lane_offset.x);
+            const uint raw_index = uint(lane_offset.y) * FRAG + uint(lane_offset.x);
 
-            // K 分组计算。math group 同时完成 MMA、释放 stage、promotion。
-            for (uint k_block_idx = 0u; k_block_idx < num_k_blocks; ++k_block_idx) {
-                const uint stage = stage_idx;
-                const uint k_start = get_global_idx(k_block_idx, BLOCK_K);
-                const bool scale_group_start = (k_block_idx % STAGES_PER_SCALE_GROUP) == 0u;
-                const bool scale_group_end = ((k_block_idx + 1u) % STAGES_PER_SCALE_GROUP) == 0u || (k_block_idx + 1u == num_k_blocks);
-
-                if (scale_group_start) {
-                    const uint scale_k = k_start / SCALE_GROUP;
-                    // Scale-B 只在每个 scale group 边界读取一次。
-                    scale_b_group0 = smem_sfb[scale_k];
-                    scale_b_group1 = scale_b_group0;
-                    if constexpr (NUM_SFB_ROWS > 1u) {
-                        scale_b_group1 = smem_sfb[group_k + scale_k];
-                    }
-                }
-
-                if (lane == 0u) { // consumer 等待当前 stage 的 A/B/Scale-A 就绪。
-                    while (atomic_load_explicit(full_phase + stage, memory_order_relaxed) == phase) {
-                    }
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-
-                threadgroup const half* stage_a = smem_a + stage * BLOCK_M * BLOCK_K;
-                threadgroup const half* stage_b = smem_b + stage * BLOCK_N * BLOCK_K;
-                threadgroup const float* stage_sfa = smem_sfa + stage * BLOCK_M;
-                #pragma unroll
-                for (uint f = 0u; f < FRAGMENTS_PER_MATH_GROUP; ++f) {
-                    const uint m_wave = f / FRAGMENTS_PER_SIMDGROUP_PER_WAVE;
-                    const uint fragment_in_wg = (f % FRAGMENTS_PER_SIMDGROUP_PER_WAVE) * SIMDGROUPS_PER_MATH_WG + simdgroup_in_math_wg;
-                    const uint fragment_m = m_wave * WAVE_BLOCK_M + math_wg_idx * M_ROWS_PER_WG_PER_WAVE 
-                                            + (fragment_in_wg / NUM_N_FRAGMENTS) * FRAGMENT_M;
-                    const uint fragment_n = (fragment_in_wg % NUM_N_FRAGMENTS) * FRAGMENT_N;
-
-                    const uint local_m = fragment_m + uint(lane_offset.y);
-                    const uint local_n = fragment_n + uint(lane_offset.x);
-
-                    // 每个 scale group 只从 Scale-A 的第一个 stage 读取一次。
-                    if (scale_group_start) {
-                        scale_a_group[f] = stage_sfa[local_m];
-                    }
-
-                    #pragma unroll
-                    for (uint local_k = 0u; local_k < BLOCK_K; local_k += 8u) {
-                        simdgroup_half8x8 a_frag;
-                        simdgroup_half8x8 b_frag;
-                        // A: [BLOCK_M, BLOCK_K] 行主序, 行跨度 = BLOCK_K
-                        simdgroup_load(a_frag, stage_a + fragment_m * BLOCK_K + local_k, BLOCK_K);
-                        // B 物理存储为 [BLOCK_N, BLOCK_K]（row=n, col=k），
-                        // 需要 transpose_matrix=true 读出 K x N 视角的片段
-                        simdgroup_load(b_frag, stage_b + fragment_n * BLOCK_K + local_k,
-                                       BLOCK_K, ulong2(0, 0), true);
-                        simdgroup_multiply_accumulate(acc_frag[f], a_frag, b_frag, acc_frag[f]);
-                    }
-                }
-
-                // 当前 stage 完成后仍然必须报告 empty。
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-
-                if (lane == 0u) {
-                    atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                    const uint previous_count = atomic_fetch_add_explicit(empty_count + stage, 1u, memory_order_relaxed);
-                    if (previous_count == NUM_MATH_SIMDGROUPS - 1u) {
-                        atomic_thread_fence(mem_flags::mem_threadgroup, memory_order_seq_cst, thread_scope_threadgroup);
-                        atomic_store_explicit(empty_phase + stage, phase ^ 1u, memory_order_relaxed);
-                    }
-                }
-                simdgroup_barrier(mem_flags::mem_threadgroup);
-                // 只在 scale group 结束时进行一次 store/barrier/load/promotion。
-                if (scale_group_end) {
-                    threadgroup float* acc_scratch = mma_scratch + math_sg * 64u;
-
-                    #pragma unroll
-                    for (uint f = 0u; f < FRAGMENTS_PER_MATH_GROUP; ++f) {
-                        simdgroup_store(acc_frag[f], acc_scratch, 8, 0, false);
-                        simdgroup_barrier(mem_flags::mem_threadgroup);
-                        const uint scratch_row = uint(lane_offset.y);
-                        const uint scratch_col = uint(lane_offset.x);
-                        const float2 accum = float2(acc_scratch[scratch_row * 8u + scratch_col], acc_scratch[scratch_row * 8u + scratch_col + 1u]);
-                        const uint m_wave = f / FRAGMENTS_PER_SIMDGROUP_PER_WAVE;
-                        const uint fragment_in_wg = (f % FRAGMENTS_PER_SIMDGROUP_PER_WAVE) * SIMDGROUPS_PER_MATH_WG + simdgroup_in_math_wg;
-                        const uint fragment_m = m_wave * WAVE_BLOCK_M + math_wg_idx * M_ROWS_PER_WG_PER_WAVE
-                                                 + (fragment_in_wg / NUM_N_FRAGMENTS) * FRAGMENT_M;
-                        const uint fragment_n = (fragment_in_wg % NUM_N_FRAGMENTS) * FRAGMENT_N;
-                        const uint local_n = fragment_n + uint(lane_offset.x);
-                        const uint scale_b_row0 = (n_start + local_n) / SCALE_GROUP - first_scale_n;
-                        const uint scale_b_row1 = (n_start + local_n + 1u) / SCALE_GROUP - first_scale_n;
-                        const float scale_b0 = scale_b_row0 == 0u ? scale_b_group0 : scale_b_group1;
-                        const float scale_b1 = scale_b_row1 == 0u ? scale_b_group0 : scale_b_group1;
-                        final_accum[f] += accum * float2(scale_a_group[f] * scale_b0, scale_a_group[f] * scale_b1);
-                        acc_frag[f] = simdgroup_float8x8(0.0f);
-                    }
-                }
-                ++stage_idx;
-                if (stage_idx == NUM_STAGES) {
-                    stage_idx = 0u;
-                    phase ^= 1u;
-                }
+            const float2 raw_value = float2(raw_accum[raw_index], raw_accum[raw_index + 1u]);
+            float scale_a = 0.0f;
+            if (global_row < M) {
+                scale_a = sa[ulong(global_row) * ulong(group_k) + ulong(scale_group_id)];
             }
-            // 当前 Metal 路径保持 FP32 输出。这里对应 DeepGEMM 的输出 store 阶段。
-            for (uint f = 0u; f < FRAGMENTS_PER_MATH_GROUP; ++f) {
-                const uint m_wave = f / FRAGMENTS_PER_SIMDGROUP_PER_WAVE;
-                const uint fragment_in_wg = (f % FRAGMENTS_PER_SIMDGROUP_PER_WAVE) * SIMDGROUPS_PER_MATH_WG + simdgroup_in_math_wg;
-                const uint fragment_m = m_wave * WAVE_BLOCK_M + math_wg_idx * M_ROWS_PER_WG_PER_WAVE 
-                                        + (fragment_in_wg / NUM_N_FRAGMENTS) * FRAGMENT_M;
-                const uint fragment_n = (fragment_in_wg % NUM_N_FRAGMENTS) * FRAGMENT_N;
 
-                const uint local_m = fragment_m + uint(lane_offset.y);
-                const uint local_n = fragment_n + uint(lane_offset.x);
-                const uint global_m = m_start + local_m;
-                const uint global_n = n_start + local_n;
+            float scale_b0 = 0.0f;
+            float scale_b1 = 0.0f;
 
-                if (global_m >= M) continue;
+            if (global_col < N) {
+                const uint b_group0 = global_col / SCALE_GROUP;
+                const uint b_group1 = (global_col + 1u) / SCALE_GROUP;
+                scale_b0 = sb[ulong(b_group0) * ulong(group_k) + ulong(scale_group_id)];
+                scale_b1 = global_col + 1u < N ? sb[ulong(b_group1) * ulong(group_k) + ulong(scale_group_id)] : scale_b0;
+            }
 
-                const ulong global_idx = ulong(global_m) * ulong(N) + ulong(global_n);
-                const float2 value = final_accum[f];
+            const float2 dequantized = raw_value * float2(scale_a * scale_b0, scale_a * scale_b1);
+            persistent_accum[cur_row] += dequantized;
 
-                if (global_n < (N & ~1u)) {
-                    float2 out_value = value;
+            const uint accum_row = cur_row;
+            if (is_last) {
+                if (global_row < M && global_col < N) {
+                    const ulong out_index = ulong(global_row) * ulong(N) + ulong(global_col);
+                    float2 output = persistent_accum[accum_row];
                     if constexpr (WITH_ACCUMULATION) {
-                        out_value += float2(*reinterpret_cast<device const packed_float2*>(c + global_idx));
+                        output += float2(c[out_index], global_col + 1u < N ? c[out_index + 1u] : 0.0f);
                     }
-                    *reinterpret_cast<device packed_float2*>(d + global_idx) = packed_float2(out_value);
+                    if (global_col + 1u < N) {
+                        *reinterpret_cast<device packed_float2*>(d + out_index) = packed_float2(output);
+                    } else {
+                        d[out_index] = output[0];
+                    }
                 }
+                persistent_accum[accum_row] = float2(0.0f);
+            }
 
-                if ((N & 1u) != 0u && global_n == N - 1u) {
-                    float out_value = value[0];
-                    if constexpr (WITH_ACCUMULATION) {
-                        out_value += c[global_idx];
-                    }
-                    d[global_idx] = out_value;
-                }
+            // 所有 lane 完成当前 slot 的读取后，才能释放 slot。
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0u) {
+                // atomic_store_explicit(slot_state + state_index, 0u, memory_order_release);
+                atomic_store_explicit(slot_state + state_index, 0u, memory_order_relaxed);
+            }
+            // 保证整个 write SIMD-group 在 slot 释放后再推进游标。
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            processed_count += 1u;
+        }
+
+        // row 优先，slot 其次。等价于扁平 cursor: flat = cur_slot * PAIR_RATIO + cur_row
+        cur_row += 1u;
+
+        if (cur_row == PAIR_RATIO) {
+            cur_row = 0u;
+            cur_slot += 1u;
+            if (cur_slot == RING_BUF_SIZE) {
+                cur_slot = 0u;
             }
         }
     }
@@ -13691,18 +13629,16 @@ METAL_FUNC constexpr uint align16(uint x) {
     return (x + 15u) & ~15u;
 }
 
-template<uint BM, uint BN, uint BK, uint STAGES, uint GROUP_K, bool ACC>
+template<uint BM, uint BN, uint BK, uint RM, uint RN, uint COMPUTE_SG_NUM, uint WRITE_SG_NUM, uint RING_BUF_SIZE, bool ACC>
 constexpr uint fp16_gemm_smem_bytes() {
-    constexpr uint sfb_rows = (BK % BN == 0u) ? 1u : 2u;
-    constexpr uint stage_bytes = align16(BM * BK * sizeof(half)) + align16(BN * BK * sizeof(half)) + align16(BM * sizeof(float));
-    constexpr uint sfb_bytes = align16(GROUP_K * sfb_rows * sizeof(float));
-    constexpr uint sync_bytes = align16((3u * STAGES + 4u) * sizeof(atomic_uint));
-    constexpr uint num_math_simdgroups = BM*BN <= 64u*64u ? 4u : 16u;
-    constexpr uint mma_scratch_bytes = num_math_simdgroups * 8u * 8u * sizeof(float);
-    return stage_bytes * STAGES + sfb_bytes + sync_bytes + align16(mma_scratch_bytes);
+    constexpr uint RAW_ACCUM_BYTES = 256u;
+    constexpr uint SLOT_BYTES      = 272u;
+    constexpr uint promo_bytes = COMPUTE_SG_NUM * RING_BUF_SIZE * SLOT_BYTES;
+    constexpr uint state_bytes = COMPUTE_SG_NUM * RING_BUF_SIZE * sizeof(atomic_uint);
+    return align16(promo_bytes + state_bytes);
 }
 
-#define DEFINE_FP16_GEMM(BM, BN, BK, GROUP_K, STAGES, ACC, NAME) \
+#define DEFINE_FP16_GEMM(BM, BN, BK, RM, RN, CSG, WSG, RB, ACC, NAME) \
 kernel void NAME( \
     device const half* a [[buffer(0)]], \
     device const half* b [[buffer(1)]], \
@@ -13719,28 +13655,22 @@ kernel void NAME( \
     uint3 tg_grid [[threadgroups_per_grid]], \
     uint3 tid3 [[thread_position_in_threadgroup]]) \
 { \
-    constexpr uint SMEM_BYTES = fp16_gemm_smem_bytes<BM, BN, BK, STAGES, GROUP_K, ACC>(); \
+    constexpr uint SMEM_BYTES = fp16_gemm_smem_bytes<BM, BN, BK, RM, RN, CSG, WSG, RB, ACC>(); \
     threadgroup uchar smem_storage[SMEM_BYTES]; \
-    fp16_gemm_impl<BM, BN, BK, STAGES, ACC>( \
+    fp16_gemm_impl<BM, BN, BK, RM, RN, CSG, WSG, RB, ACC>( \
         a, b, sa, sb, d, c, M, N, K, \
         num_m_blocks, num_n_blocks, tg, tg_grid, tid3.x, \
         reinterpret_cast<threadgroup uchar*>(smem_storage)); \
 }
 
-DEFINE_FP16_GEMM(32, 32, 32, 4, 2, false, fp16_gemm_bm32_bn32_bk32_gk4_s2_a0);
-DEFINE_FP16_GEMM(32, 32, 32, 4, 2, true, fp16_gemm_bm32_bn32_bk32_gk4_s2_a1);
-DEFINE_FP16_GEMM(32, 32, 64, 4, 2, false, fp16_gemm_bm32_bn32_bk64_gk4_s2_a0);
-DEFINE_FP16_GEMM(32, 32, 64, 4, 2, true, fp16_gemm_bm32_bn32_bk64_gk4_s2_a1);
-DEFINE_FP16_GEMM(32, 32, 32, 256, 2, false, fp16_gemm_bm32_bn32_bk32_gk256_s2_a0);
-DEFINE_FP16_GEMM(32, 32, 32, 256, 2, true, fp16_gemm_bm32_bn32_bk32_gk256_s2_a1);
-DEFINE_FP16_GEMM(32, 32, 64, 256, 2, false, fp16_gemm_bm32_bn32_bk64_gk256_s2_a0);
-DEFINE_FP16_GEMM(32, 32, 64, 256, 2, true, fp16_gemm_bm32_bn32_bk64_gk256_s2_a1);
-DEFINE_FP16_GEMM(64, 48, 64, 8, 2, false, fp16_gemm_bm64_bn48_bk64_gk8_s2_a0);
-DEFINE_FP16_GEMM(64, 48, 64, 8, 2, true, fp16_gemm_bm64_bn48_bk64_gk8_s2_a1);
-DEFINE_FP16_GEMM(64, 128, 32, 256, 2, false, fp16_gemm_bm64_bn128_bk32_gk256_s2_a0);
-DEFINE_FP16_GEMM(64, 128, 32, 256, 2, true, fp16_gemm_bm64_bn128_bk32_gk256_s2_a1);
-DEFINE_FP16_GEMM(128, 80, 32, 4, 2, false, fp16_gemm_bm128_bn80_bk32_gk4_s2_a0);
-DEFINE_FP16_GEMM(128, 80, 32, 4, 2, true, fp16_gemm_bm128_bn80_bk32_gk4_s2_a1);
+DEFINE_FP16_GEMM(32, 64, 64, 2, 2, 2, 1, 8, false, fp16_gemm_bm32_bn64_bk64_rm2_rn2_csg2_wsg1_rb8_a0);
+DEFINE_FP16_GEMM(128, 192, 64, 2, 2, 2, 1, 8, false, fp16_gemm_bm128_bn192_bk64_rm2_rn2_csg2_wsg1_rb8_a0);
+DEFINE_FP16_GEMM(128, 192, 64, 2, 2, 2, 1, 8, true, fp16_gemm_bm128_bn192_bk64_rm2_rn2_csg2_wsg1_rb8_a1);
+
+DEFINE_FP16_GEMM(16, 32, 128, 2, 4, 7, 7, 16, false, fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg7_wsg7_rb16_a0);
+DEFINE_FP16_GEMM(16, 32, 128, 2, 4, 7, 7, 16, true, fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg7_wsg7_rb16_a1);
+
+
 
 
 

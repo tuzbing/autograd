@@ -133,13 +133,11 @@ public:
             @"adamw_step", @"adamw8bit_step",
             @"mini_update_v", @"adamw_mini8bit_step",
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
-            @"fp16_gemm_bm32_bn32_bk32_gk256_s2_a0", @"fp16_gemm_bm32_bn32_bk32_gk256_s2_a1",
-            @"fp16_gemm_bm32_bn32_bk32_gk4_s2_a0", @"fp16_gemm_bm32_bn32_bk32_gk4_s2_a1",
-            @"fp16_gemm_bm32_bn32_bk64_gk256_s2_a0", @"fp16_gemm_bm32_bn32_bk64_gk256_s2_a1",
-            @"fp16_gemm_bm32_bn32_bk64_gk4_s2_a0", @"fp16_gemm_bm32_bn32_bk64_gk4_s2_a1",
-            @"fp16_gemm_bm64_bn48_bk64_gk8_s2_a0", @"fp16_gemm_bm64_bn48_bk64_gk8_s2_a1",
-            @"fp16_gemm_bm64_bn128_bk32_gk256_s2_a0", @"fp16_gemm_bm64_bn128_bk32_gk256_s2_a1",
-            @"fp16_gemm_bm128_bn80_bk32_gk4_s2_a0", @"fp16_gemm_bm128_bn80_bk32_gk4_s2_a1",
+            @"fp16_gemm_bm32_bn64_bk64_rm2_rn2_csg2_wsg1_rb8_a0",
+            @"fp16_gemm_bm128_bn192_bk64_rm2_rn2_csg2_wsg1_rb8_a0",
+            @"fp16_gemm_bm128_bn192_bk64_rm2_rn2_csg2_wsg1_rb8_a1",
+            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg7_wsg7_rb16_a0",
+            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg7_wsg7_rb16_a1",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
@@ -150,11 +148,11 @@ public:
             NSError *error = nil;
             // id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
             id<MTLComputePipelineState> pso = nil;
-            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm32_bn32_bk32"];
+            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm128_bn192_bk128_rm1_rn1_csg16_wsg16"];
             if (needs544) {
                 MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
                 desc.computeFunction = func;
-                desc.maxTotalThreadsPerThreadgroup = 576;
+                desc.maxTotalThreadsPerThreadgroup = 1024;
                 pso = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
             } else {
                 pso = [device newComputePipelineStateWithFunction:func error:&error];
