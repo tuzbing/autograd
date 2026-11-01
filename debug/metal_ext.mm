@@ -145,11 +145,11 @@ public:
             NSError *error = nil;
             // id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
             id<MTLComputePipelineState> pso = nil;
-            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm128_bn192_bk128_rm1_rn1_csg16_wsg16"];
+            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1"];
             if (needs544) {
                 MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
                 desc.computeFunction = func;
-                desc.maxTotalThreadsPerThreadgroup = 1024;
+                desc.maxTotalThreadsPerThreadgroup = 64;
                 pso = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
             } else {
                 pso = [device newComputePipelineStateWithFunction:func error:&error];

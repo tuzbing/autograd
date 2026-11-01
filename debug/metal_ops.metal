@@ -13463,11 +13463,44 @@ METAL_FUNC void fp16_gemm_impl(
                         const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
                         const uint full_steps = group_size / FRAG;
 
-                        for (uint step = 0u; step < full_steps; ++step) {
+                        constexpr uint KU = 4u;
+                        uint step = 0u;
+                        for (; step + KU <= full_steps; step += KU) {
+                            simdgroup_half8x8 a_frag[KU][REG_TILE_M];
+                            simdgroup_half8x8 b_frag[KU][REG_TILE_N];
+                            const uint gk0 = k_block + step * FRAG;
+
+                            // 先把 KU 个 step 的所有 load 全发出去，彼此独立
+                            #pragma clang loop unroll(full)
+                            for (uint u = 0u; u < KU; ++u) {
+                                #pragma clang loop unroll(full)
+                                for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                                    simdgroup_load(a_frag[u][ii],
+                                        a + ulong(global_m_base + ii * FRAG) * ulong(K) + ulong(gk0 + u * FRAG), K);
+                                }
+                                #pragma clang loop unroll(full)
+                                for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                    simdgroup_load(b_frag[u][jj],
+                                        b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(gk0 + u * FRAG),
+                                        K, ulong2(0u, 0u), true);
+                                }
+                            }
+                            // 再统一做 KU×RM×RN 个 MMA
+                            #pragma clang loop unroll(full)
+                            for (uint u = 0u; u < KU; ++u) {
+                                #pragma clang loop unroll(full)
+                                for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                                    #pragma clang loop unroll(full)
+                                    for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                        simdgroup_multiply_accumulate(acc[ii][jj], a_frag[u][ii], b_frag[u][jj], acc[ii][jj]);
+                                    }
+                                }
+                            }
+                        }
+                        for (; step < full_steps; ++step) {
                             const uint global_k = k_block + step * FRAG;
                             simdgroup_half8x8 a_frag[REG_TILE_M];
                             simdgroup_half8x8 b_frag[REG_TILE_N];
-
                             #pragma clang loop unroll(full)
                             for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
                                 simdgroup_load(a_frag[ii], a + ulong(global_m_base + ii * FRAG) * ulong(K) + ulong(global_k), K);
@@ -13476,7 +13509,6 @@ METAL_FUNC void fp16_gemm_impl(
                             for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
                                 simdgroup_load(b_frag[jj], b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(global_k), K, ulong2(0u, 0u), true);
                             }
-
                             #pragma clang loop unroll(full)
                             for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
                                 #pragma clang loop unroll(full)
