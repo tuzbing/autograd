@@ -17,7 +17,6 @@ _SPEC.loader.exec_module(_ROOT_BACKEND)
 Backend = _ROOT_BACKEND.Backend
 CPUBackend = _ROOT_BACKEND.CPUBackend
 
-
 def _host_like(tensor, data=None):
 	host = SimpleNamespace()
 	host.shape = tensor.shape
@@ -431,8 +430,11 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					
 					cfg = scratch.gemm_configs[("dx", rows, False)]
 					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
-					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {fp16_gemm_kernel_name(cfg, False)}")
-					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
+					# dbg_kernel_name = "fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0"
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
+					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
+					# self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
+					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
 						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
 						[rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
@@ -464,8 +466,11 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					
 					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
 					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
-					print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {fp16_gemm_kernel_name(cfg, with_accum)}")
-					self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, with_accum),
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
+					# dbg_kernel_name = "fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a1" if with_accum else "fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a0"
+					print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {dbg_kernel_name}")
+					# self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, with_accum),
+					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
 						[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
 						[V, C, rows, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)

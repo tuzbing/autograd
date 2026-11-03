@@ -13233,22 +13233,14 @@ METAL_FUNC float2 scalar_mma_pair(
     device const half* a_row1 = a + ulong(gm1) * ulong(K) + ulong(k_start);
     device const half* b_row1 = b + ulong(gn1) * ulong(K) + ulong(k_start);
 
-    float2 acc = float2(0.0f);
-    if (v0) {
-        float sum0 = 0.0f;
-        for (uint kk = 0u; kk < k_len; ++kk) {
-            sum0 += float(a_row0[kk]) * float(b_row0[kk]);
-        }
-        acc.x = sum0;
+    float s0 = 0.0f, s1 = 0.0f;
+    #pragma clang loop unroll(disable)
+    for (uint kk = 0u; kk < k_len; ++kk) {
+        const float av = float(a_row0[kk]);
+        s0 += av * float(b_row0[kk]);
+        s1 += av * float(b_row1[kk]);
     }
-    if (v1) {
-        float sum1 = 0.0f;
-        for (uint kk = 0u; kk < k_len; ++kk) {
-            sum1 += float(a_row1[kk]) * float(b_row1[kk]);
-        }
-        acc.y = sum1;
-    }
-    return acc;
+    return float2(v0 ? s0 : 0.0f, v1 ? s1 : 0.0f);
 }
 
 template<uint BLOCK_M, uint BLOCK_N, uint REG_TILE_M, uint REG_TILE_N>
@@ -13316,7 +13308,7 @@ METAL_FUNC void fp16_gemm_impl(
 
     const uint sg = tid / SIMD_WIDTH;
     const uint lane = tid % SIMD_WIDTH;
-    if (tid >= NUM_THREADS || M == 0u || N == 0u || K == 0u || num_m_blocks == 0u || num_n_blocks == 0u) {
+    if (M == 0u || N == 0u || K == 0u || num_m_blocks == 0u || num_n_blocks == 0u) {
         return;
     }
 
@@ -13329,6 +13321,7 @@ METAL_FUNC void fp16_gemm_impl(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= NUM_THREADS) return;
 
     const uint block_idx        = tg.x;
     const uint group_k = (K + SCALE_GROUP - 1u) / SCALE_GROUP;
@@ -13341,6 +13334,7 @@ METAL_FUNC void fp16_gemm_impl(
         const uint compute_sg = sg;
         uint my_slot = 0u;
         const uint swizzle_h = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N>(persistent_blocks);
+        const ushort2 offset = morton_order(ushort(lane));
 
         // 当前 compute SIMD-group 按固定编号领取 tile。
         for (uint tile_q = block_idx * COMPUTE_SG_NUM + compute_sg; tile_q < total_tiles; tile_q += tile_stride) {
@@ -13360,7 +13354,9 @@ METAL_FUNC void fp16_gemm_impl(
                     const uint global_n_base = n_start + sub_n * FRAG;
                     const bool sub_interior = (global_m_base + REG_TILE_M*FRAG <= M) && (global_n_base + REG_TILE_N*FRAG <= N);
                     if (!sub_interior) {
+                        #pragma clang loop unroll(disable)
                         for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                            #pragma clang loop unroll(disable)
                             for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
                                 const uint frag_m = (sub_m + ii) * FRAG;
                                 const uint frag_n = (sub_n + jj) * FRAG;
@@ -13369,83 +13365,67 @@ METAL_FUNC void fp16_gemm_impl(
                                 const uint frag_local = (sub_m + ii) * NUM_N_FRAGS + (sub_n + jj);
                                 const bool mn_boundary = (global_m + FRAG > M) || (global_n + FRAG > N);
 
-                                simdgroup_float8x8 acc_frag = simdgroup_float8x8(0.0f);
                                 float2 scalar_accum = float2(0.0f);
                                 bool has_scalar_accum = false;
 
+                                #pragma clang loop unroll(disable)
                                 for (uint k_tile = 0u; k_tile < num_k_tiles; ++k_tile) {
+                                    // comment A
                                     const uint k_block = k_tile * BLOCK_K;
                                     const uint group_size = min(BLOCK_K, K - k_block);
                                     const uint scale_group_id = k_block / SCALE_GROUP;
                                     const bool is_last = (k_tile + 1u == num_k_tiles);
                                     const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
 
-                                    if (!mn_boundary) {
-                                        for (uint local_k = 0u; local_k < group_size; local_k += FRAG) {
-                                            const uint remaining = group_size - local_k;
-                                            if (remaining >= FRAG) {
-                                                const uint global_k = k_block + local_k;
-                                                simdgroup_half8x8 a_frag, b_frag;
-                                                simdgroup_load(a_frag, a + ulong(global_m)*ulong(K)+ulong(global_k), K);
-                                                simdgroup_load(b_frag, b + ulong(global_n)*ulong(K)+ulong(global_k), K, ulong2(0u,0u), true);
-                                                simdgroup_multiply_accumulate(acc_frag, a_frag, b_frag, acc_frag);
-                                            } else {
-                                                scalar_accum += scalar_mma_pair<false>(a, b, K, global_m, global_n, k_block+local_k, remaining, lane, M, N);
-                                                has_scalar_accum = true;
-                                            }
-                                        }
-                                    } else {
-                                        for (uint local_k = 0u; local_k < group_size; local_k += FRAG) {
-                                            const uint remaining = group_size - local_k;
-                                            const uint scalar_k_len = min(FRAG, remaining);
-                                            scalar_accum += scalar_mma_pair<true>(a, b, K, global_m, global_n, 
-                                                                                  k_block+local_k, scalar_k_len, lane, M, N);
-                                            has_scalar_accum = true;
+                                    simdgroup_float8x8 acc_frag = simdgroup_float8x8(0.0f);
+                                    #pragma clang loop unroll(disable)
+                                    for (uint local_k = 0u; local_k < group_size; local_k += FRAG) {
+                                        const uint remaining = group_size - local_k;
+                                        if (!mn_boundary && remaining >= FRAG) {
+                                            const uint global_k = k_block + local_k;
+                                            simdgroup_half8x8 a_frag, b_frag;
+                                            simdgroup_load(a_frag, a + ulong(global_m)*ulong(K)+ulong(global_k), K);
+                                            simdgroup_load(b_frag, b + ulong(global_n)*ulong(K)+ulong(global_k), K, ulong2(0u,0u), true);
+                                            simdgroup_multiply_accumulate(acc_frag, a_frag, b_frag, acc_frag);
+                                        } else {
+                                            scalar_accum += scalar_mma_pair<true>(a, b, K, global_m, global_n,
+                                                                                  k_block + local_k, min(FRAG, remaining), lane, M, N);
                                         }
                                     }
+                                    // 立刻把矩阵元素取成普通寄存器
+                                    scalar_accum += float2(acc_frag.thread_elements()[0], acc_frag.thread_elements()[1]);
 
                                     if (!scale_group_end) continue;
-
+                      
                                     const uint state_index = compute_sg * RING_BUF_SIZE + my_slot;
+                                    // comment B
                                     threadgroup uchar* slot = promo_buffer + state_index * SLOT_BYTES;
                                     threadgroup float* raw_accum = reinterpret_cast<threadgroup float*>(slot);
                                     threadgroup uint* metadata = reinterpret_cast<threadgroup uint*>(slot + META_OFFSET);
-                                    const ushort2 offset = morton_order(ushort(lane));
                                     const uint raw_index = uint(offset.y)*FRAG + uint(offset.x);
                                     const uint flags = (is_last ? 1u : 0u) | 2u;
+                             
                                     const uint next_slot = (my_slot + 1u == RING_BUF_SIZE) ? 0u : my_slot + 1u;
 
                                     while (atomic_load_explicit(slot_state + state_index, memory_order_relaxed) != 0u) {}
-
-                                    if (!mn_boundary) {
-                                        simdgroup_store(acc_frag, raw_accum, FRAG, ulong2(0u,0u), false);
-                                    }
-                                    if (has_scalar_accum) {
-                                        if (mn_boundary) {
-                                            raw_accum[raw_index] = scalar_accum.x;
-                                            raw_accum[raw_index+1u] = scalar_accum.y;
-                                        } else {
-                                            raw_accum[raw_index] += scalar_accum.x;
-                                            raw_accum[raw_index+1u] += scalar_accum.y;
-                                        }
-                                    }
+                                    // comment C
+                                    raw_accum[raw_index]      = scalar_accum.x;
+                                    raw_accum[raw_index + 1u] = scalar_accum.y;
                                     if (lane == 0u) {
                                         metadata[0] = global_m; metadata[1] = global_n;
                                         metadata[2] = scale_group_id; metadata[3] = flags;
                                     }
+                                
                                     simdgroup_barrier(mem_flags::mem_threadgroup);
                                     if (lane == 0u) atomic_store_explicit(slot_state + state_index, 1u, memory_order_relaxed);
 
                                     my_slot = next_slot;
-                                    acc_frag = simdgroup_float8x8(0.0f);
                                     scalar_accum = float2(0.0f);
-                                    has_scalar_accum = false;
                                 }
                             }
                         }
                         continue;
                     }
-
                     simdgroup_float8x8 acc[REG_TILE_M][REG_TILE_N];
                     #pragma clang loop unroll(full)
                     for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
@@ -13463,40 +13443,30 @@ METAL_FUNC void fp16_gemm_impl(
                         const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
                         const uint full_steps = group_size / FRAG;
 
-                        constexpr uint KU = 4u;
+                        constexpr uint U = ((REG_TILE_M + REG_TILE_N) <= 6u) ? 4u : 2u;
                         uint step = 0u;
-                        for (; step + KU <= full_steps; step += KU) {
-                            simdgroup_half8x8 a_frag[KU][REG_TILE_M];
-                            simdgroup_half8x8 b_frag[KU][REG_TILE_N];
-                            const uint gk0 = k_block + step * FRAG;
-
-                            // 先把 KU 个 step 的所有 load 全发出去，彼此独立
+                        for (; step + U <= full_steps; step += U) {
+                            simdgroup_half8x8 a_frag[U][REG_TILE_M], b_frag[U][REG_TILE_N];
                             #pragma clang loop unroll(full)
-                            for (uint u = 0u; u < KU; ++u) {
+                            for (uint u = 0u; u < U; ++u) {
+                                const uint gk = k_block + (step + u) * FRAG;
                                 #pragma clang loop unroll(full)
-                                for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
-                                    simdgroup_load(a_frag[u][ii],
-                                        a + ulong(global_m_base + ii * FRAG) * ulong(K) + ulong(gk0 + u * FRAG), K);
-                                }
+                                for (uint ii = 0u; ii < REG_TILE_M; ++ii)
+                                    simdgroup_load(a_frag[u][ii], a + ulong(global_m_base + ii*FRAG)*ulong(K) + ulong(gk), K);
                                 #pragma clang loop unroll(full)
-                                for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
-                                    simdgroup_load(b_frag[u][jj],
-                                        b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(gk0 + u * FRAG),
-                                        K, ulong2(0u, 0u), true);
-                                }
+                                for (uint jj = 0u; jj < REG_TILE_N; ++jj)
+                                    simdgroup_load(b_frag[u][jj], b + ulong(global_n_base + jj*FRAG)*ulong(K) + ulong(gk), K,
+                                                   ulong2(0u,0u), true);
                             }
-                            // 再统一做 KU×RM×RN 个 MMA
                             #pragma clang loop unroll(full)
-                            for (uint u = 0u; u < KU; ++u) {
+                            for (uint u = 0u; u < U; ++u)
                                 #pragma clang loop unroll(full)
-                                for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
+                                for (uint ii = 0u; ii < REG_TILE_M; ++ii)
                                     #pragma clang loop unroll(full)
-                                    for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
+                                    for (uint jj = 0u; jj < REG_TILE_N; ++jj)
                                         simdgroup_multiply_accumulate(acc[ii][jj], a_frag[u][ii], b_frag[u][jj], acc[ii][jj]);
-                                    }
-                                }
-                            }
                         }
+
                         for (; step < full_steps; ++step) {
                             const uint global_k = k_block + step * FRAG;
                             simdgroup_half8x8 a_frag[REG_TILE_M];
@@ -13507,7 +13477,8 @@ METAL_FUNC void fp16_gemm_impl(
                             }
                             #pragma clang loop unroll(full)
                             for (uint jj = 0u; jj < REG_TILE_N; ++jj) {
-                                simdgroup_load(b_frag[jj], b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(global_k), K, ulong2(0u, 0u), true);
+                                simdgroup_load(b_frag[jj], b + ulong(global_n_base + jj * FRAG) * ulong(K) + ulong(global_k), K,
+                                               ulong2(0u, 0u), true);
                             }
                             #pragma clang loop unroll(full)
                             for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
@@ -13530,7 +13501,6 @@ METAL_FUNC void fp16_gemm_impl(
                         const uint next_slot = (my_slot + 1u == RING_BUF_SIZE) ? 0u : my_slot + 1u;
 
                         while (atomic_load_explicit(slot_state + state_index, memory_order_relaxed) != 0u) {}   // 每个子块只等一次
-
                         #pragma clang loop unroll(full)
                         for (uint ii = 0u; ii < REG_TILE_M; ++ii) {
                             #pragma clang loop unroll(full)
@@ -13591,7 +13561,6 @@ METAL_FUNC void fp16_gemm_impl(
     const uint lane_x = uint(lane_offset.x), lane_y = uint(lane_offset.y);
     const uint raw_index = lane_y * FRAG + lane_x;
 
-    // uint cached_tile = 0xFFFFFFFFu, m_start = 0u, n_start = 0u;
     uint processed = 0u;
 
     while (processed < grand_total) {
@@ -13606,17 +13575,11 @@ METAL_FUNC void fp16_gemm_impl(
             threadgroup const uint*  meta = reinterpret_cast<threadgroup const uint*>(slot + META_OFFSET);
 
             const uint row_base = meta[0], col_base = meta[1], g = meta[2], flags = meta[3];
-            float2 raw_v[SUB_FRAGS];
-            #pragma clang loop unroll(full)
-            for (uint f = 0u; f < SUB_FRAGS; ++f) {
-                raw_v[f] = float2(raw[f * 64u + raw_index], raw[f * 64u + raw_index + 1u]);
-            }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            if (lane == 0u) atomic_store_explicit(slot_state + state_index, 0u, memory_order_relaxed);
 
             cur_slot[r] = (cur_slot[r] + 1u == RING_BUF_SIZE) ? 0u : cur_slot[r] + 1u;
-            processed += 1u;
 
+            processed += 1u;
+            
             const bool is_last = (flags & 1u) != 0u;
             const bool single  = (flags & 2u) != 0u;
             const uint row0 = row_base + lane_y;
@@ -13648,9 +13611,13 @@ METAL_FUNC void fp16_gemm_impl(
                 for (uint j = 0u; j < REG_TILE_N; ++j) {
                     if (single && (i != 0u || j != 0u)) continue;
                     const uint f = i * REG_TILE_N + j;
-                    acc[r][f] += raw_v[f] * float2(sa_v[i] * sb0[j], sa_v[i] * sb1[j]);
+                    const float2 rv = *reinterpret_cast<threadgroup const float2*>(raw + f*64u + raw_index);
+                    acc[r][f] += rv * float2(sa_v[i]*sb0[j], sa_v[i]*sb1[j]);
                 }
             }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);              // 所有 lane 读完 raw
+            if (lane == 0u) atomic_store_explicit(slot_state + state_index, 0u, memory_order_relaxed);
 
             if (is_last) {
                 #pragma clang loop unroll(full)
@@ -13683,7 +13650,7 @@ METAL_FUNC constexpr uint align16(uint x) {
 
 template<uint BM, uint BN, uint BK, uint RM, uint RN, uint COMPUTE_SG_NUM, uint WRITE_SG_NUM, uint RING_BUF_SIZE, bool ACC>
 constexpr uint fp16_gemm_smem_bytes() {
-    constexpr uint SLOT_BYTES      = RM * RN * 256u + 16u;
+    constexpr uint SLOT_BYTES = RM * RN * 256u + 16u;
     constexpr uint promo_bytes = COMPUTE_SG_NUM * RING_BUF_SIZE * SLOT_BYTES;
     constexpr uint state_bytes = COMPUTE_SG_NUM * RING_BUF_SIZE * sizeof(atomic_uint);
     return align16(promo_bytes + state_bytes);
@@ -13714,9 +13681,20 @@ kernel void NAME( \
         reinterpret_cast<threadgroup uchar*>(smem_storage)); \
 }
 
-DEFINE_FP16_GEMM(32, 32, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
-DEFINE_FP16_GEMM(32, 32, 128, 4, 4, 1, 1, 1, true, fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a1);
+DEFINE_FP16_GEMM(16, 160, 128, 2, 4, 2, 1, 1, false, fp16_gemm_bm16_bn160_bk128_rm2_rn4_csg2_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(16, 224, 128, 2, 4, 2, 1, 1, false, fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(16, 224, 128, 2, 4, 2, 1, 1, true, fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a1);
 
+DEFINE_FP16_GEMM(16, 32, 128, 2, 4, 2, 1, 1, false, fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 2, 4, 2, 1, 1, false, fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 2, 4, 2, 1, 1, true, fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a1);
+
+DEFINE_FP16_GEMM(16, 32, 128, 2, 4, 1, 1, 1, false, fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg1_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 2, 4, 1, 1, 1, false, fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 2, 4, 1, 1, 1, true, fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a1);
+DEFINE_FP16_GEMM(32, 32, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(128, 128, 128, 4, 4, 1, 1, 1, true, fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a1);
 
 
 

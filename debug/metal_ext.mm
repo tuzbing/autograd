@@ -133,8 +133,18 @@ public:
             @"adamw_step", @"adamw8bit_step",
             @"mini_update_v", @"adamw_mini8bit_step",
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
+            @"fp16_gemm_bm16_bn160_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
+            @"fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
+            @"fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a1",
+            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
+            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
+            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a1",
+            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg1_wsg1_rb1_a0",
+            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a0",
+            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a1",
             @"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
+            @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
+            @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
@@ -145,11 +155,16 @@ public:
             NSError *error = nil;
             // id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
             id<MTLComputePipelineState> pso = nil;
-            const bool needs544 = [name hasPrefix:@"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1"];
-            if (needs544) {
+            const bool needs1 = [name hasPrefix:@"fp16_gemm_bm8_bn64_bk128_rm1_rn8_csg12_wsg12"];
+            const bool needs2 = [name hasPrefix:@"fp16_gemm_bm8_bn64_bk128_rm1_rn8_csg15_wsg15"];
+            if (needs1 || needs2) {
                 MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
                 desc.computeFunction = func;
-                desc.maxTotalThreadsPerThreadgroup = 64;
+                if (needs1) {
+                    desc.maxTotalThreadsPerThreadgroup = (12+12)*32;
+                } else if (needs2) {
+                    desc.maxTotalThreadsPerThreadgroup = (15+15)*32;
+                }
                 pso = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
             } else {
                 pso = [device newComputePipelineStateWithFunction:func error:&error];
