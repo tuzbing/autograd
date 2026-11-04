@@ -145,6 +145,8 @@ public:
             @"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
             @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
             @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
+            @"fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
+            @"fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];

@@ -13366,7 +13366,6 @@ METAL_FUNC void fp16_gemm_impl(
                                 const bool mn_boundary = (global_m + FRAG > M) || (global_n + FRAG > N);
 
                                 float2 scalar_accum = float2(0.0f);
-                                bool has_scalar_accum = false;
 
                                 #pragma clang loop unroll(disable)
                                 for (uint k_tile = 0u; k_tile < num_k_tiles; ++k_tile) {
@@ -13398,7 +13397,6 @@ METAL_FUNC void fp16_gemm_impl(
                                     if (!scale_group_end) continue;
                       
                                     const uint state_index = compute_sg * RING_BUF_SIZE + my_slot;
-                                    // comment B
                                     threadgroup uchar* slot = promo_buffer + state_index * SLOT_BYTES;
                                     threadgroup float* raw_accum = reinterpret_cast<threadgroup float*>(slot);
                                     threadgroup uint* metadata = reinterpret_cast<threadgroup uint*>(slot + META_OFFSET);
@@ -13408,14 +13406,12 @@ METAL_FUNC void fp16_gemm_impl(
                                     const uint next_slot = (my_slot + 1u == RING_BUF_SIZE) ? 0u : my_slot + 1u;
 
                                     while (atomic_load_explicit(slot_state + state_index, memory_order_relaxed) != 0u) {}
-                                    // comment C
                                     raw_accum[raw_index]      = scalar_accum.x;
                                     raw_accum[raw_index + 1u] = scalar_accum.y;
                                     if (lane == 0u) {
                                         metadata[0] = global_m; metadata[1] = global_n;
                                         metadata[2] = scale_group_id; metadata[3] = flags;
                                     }
-                                
                                     simdgroup_barrier(mem_flags::mem_threadgroup);
                                     if (lane == 0u) atomic_store_explicit(slot_state + state_index, 1u, memory_order_relaxed);
 
@@ -13442,8 +13438,7 @@ METAL_FUNC void fp16_gemm_impl(
                         const bool is_last = (k_tile + 1u == num_k_tiles);
                         const bool scale_group_end = is_last || ((k_block + BLOCK_K) / SCALE_GROUP != scale_group_id);
                         const uint full_steps = group_size / FRAG;
-
-                        constexpr uint U = ((REG_TILE_M + REG_TILE_N) <= 6u) ? 4u : 2u;
+                        constexpr uint U = 4u;
                         uint step = 0u;
                         for (; step + U <= full_steps; step += U) {
                             simdgroup_half8x8 a_frag[U][REG_TILE_M], b_frag[U][REG_TILE_N];
@@ -13540,6 +13535,7 @@ METAL_FUNC void fp16_gemm_impl(
     }
 
     const uint write_sg = sg - COMPUTE_SG_NUM;
+
     const uint row_begin = write_sg * PAIR_RATIO;
     const uint swizzle_h = get_num_1d_blocks_per_group<BLOCK_M, BLOCK_N>(persistent_blocks);
     uint grand_total = 0u;
@@ -13695,6 +13691,9 @@ DEFINE_FP16_GEMM(128, 128, 128, 2, 4, 1, 1, 1, true, fp16_gemm_bm128_bn128_bk128
 DEFINE_FP16_GEMM(32, 32, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
 DEFINE_FP16_GEMM(128, 128, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
 DEFINE_FP16_GEMM(128, 128, 128, 4, 4, 1, 1, 1, true, fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a1);
+
+DEFINE_FP16_GEMM(32, 64, 128, 4, 4, 1, 1, 1, false, fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a0);
+DEFINE_FP16_GEMM(32, 64, 128, 4, 4, 1, 1, 1, true, fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a1);
 
 
 

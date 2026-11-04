@@ -432,12 +432,15 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
 					# dbg_kernel_name = "fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0"
 					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
-					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
+					P = cfg['persist_tgs']
+					# P = 40
+					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}, persist_tgs {P}")
 					# self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
 						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
-						[rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
+						# [rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
+						[rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], P, 1, 1, num_threads)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
