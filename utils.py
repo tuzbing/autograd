@@ -1,7 +1,15 @@
 
 import numpy as np
-from math import prod
+from math import prod, ceil, log2
 import struct
+
+def is_power_of_2(n):
+	return ((n & (n - 1)) == 0) and n != 0
+
+def next_power_of_2(n):
+	if is_power_of_2(n):
+		return n
+	return pow(2, ceil(log2(n)))
 
 def f32_bits(x):
 	return struct.unpack('<I', struct.pack('<f', float(x)))[0] 

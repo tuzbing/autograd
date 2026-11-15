@@ -133,20 +133,9 @@ public:
             @"adamw_step", @"adamw8bit_step",
             @"mini_update_v", @"adamw_mini8bit_step",
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
-            @"fp16_gemm_bm16_bn160_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
-            @"fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
-            @"fp16_gemm_bm16_bn224_bk128_rm2_rn4_csg2_wsg1_rb1_a1",
-            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a1",
-            @"fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg1_wsg1_rb1_a1",
-            @"fp16_gemm_bm32_bn32_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm128_bn128_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
-            @"fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a0",
-            @"fp16_gemm_bm32_bn64_bk128_rm4_rn4_csg1_wsg1_rb1_a1",
+            @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
+            @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
@@ -155,23 +144,7 @@ public:
                 throw std::runtime_error("Failed to find function in metal library");
             }
             NSError *error = nil;
-            // id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
-            id<MTLComputePipelineState> pso = nil;
-            const bool needs1 = [name hasPrefix:@"fp16_gemm_bm8_bn64_bk128_rm1_rn8_csg12_wsg12"];
-            const bool needs2 = [name hasPrefix:@"fp16_gemm_bm8_bn64_bk128_rm1_rn8_csg15_wsg15"];
-            if (needs1 || needs2) {
-                MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
-                desc.computeFunction = func;
-                if (needs1) {
-                    desc.maxTotalThreadsPerThreadgroup = (12+12)*32;
-                } else if (needs2) {
-                    desc.maxTotalThreadsPerThreadgroup = (15+15)*32;
-                }
-                pso = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
-            } else {
-                pso = [device newComputePipelineStateWithFunction:func error:&error];
-            }
-
+            id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:func error:&error];
             if (error != nil) {
                 NSLog(@"Error creating pipeline state for %@: %@", name, error);
                 throw std::runtime_error("Failed to create pipeline state");
@@ -580,7 +553,7 @@ public:
             [enc setBytes:&args[i] length:sizeof(uint32_t) atIndex:base_idx + i];
         }
 
-        const bool is_fp16_gemm = kernel_name.rfind("fp16_gemm_", 0) == 0;
+        const bool is_fp16_gemm = kernel_name.rfind("fp16_gemm", 0) == 0;
         if (is_fp16_gemm) {
             MTLSize threadgroups = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
             MTLSize threads_per_threadgroup = MTLSizeMake(tg_size, 1, 1);

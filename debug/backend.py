@@ -7,6 +7,7 @@ from math import prod
 import struct
 from scratch import align_up
 from gemm import fp16_gemm_kernel_name
+from utils import next_power_of_2
 
 _ROOT_BACKEND_PATH = Path(__file__).resolve().parent.parent / "backend.py"
 _SPEC = importlib.util.spec_from_file_location("_autograd_root_backend", _ROOT_BACKEND_PATH)
@@ -427,20 +428,22 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
 						[C, V, 1, C], 256, group_k, group_n, 256)
-					
+
 					cfg = scratch.gemm_configs[("dx", rows, False)]
-					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
-					# dbg_kernel_name = "fp16_gemm_bm16_bn32_bk128_rm2_rn4_csg2_wsg1_rb1_a0"
 					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
-					P = cfg['persist_tgs']
-					# P = 40
-					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}, persist_tgs {P}")
-					# self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, False),
+					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
+					if cfg["is_splitk"]:
+						self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
+					dx_args = (
+						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+						if cfg["is_splitk"] else
+						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
 						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
-						# [rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
-						[rows, C, V, cfg["num_m_blocks"], cfg["num_n_blocks"]], P, 1, 1, num_threads)
+						dx_args,
+						cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
@@ -466,17 +469,21 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
 						[C, rows, 1, C], 256, group_k, group_n, 256)
-					
+
 					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
-					num_threads = (cfg["compute_sg"] + cfg["write_sg"]) * 32
 					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
-					# dbg_kernel_name = "fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a1" if with_accum else "fp16_gemm_bm128_bn128_bk128_rm2_rn4_csg2_wsg1_rb1_a0"
 					print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {dbg_kernel_name}")
-					# self.ctx.dispatch_with_args_3d(fp16_gemm_kernel_name(cfg, with_accum),
+					if cfg["is_splitk"] and not with_accum: # [修正] 若 dW 命中 Split-K 且无需累加，先清零 w.grad
+						self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
+					dw_args = (
+						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+						if cfg["is_splitk"] else
+						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
 						[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
-						[V, C, rows, cfg["num_m_blocks"], cfg["num_n_blocks"]], cfg["persist_tgs"], 1, 1, num_threads)
+						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],

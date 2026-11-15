@@ -2,179 +2,96 @@
 import numpy as np
 import math
 
-# ---------------- 硬件常量 ----------------
-TG_CAPACITY = 32768 # 32KB
-SIMD_WIDTH = 32
-MAX_SG_PER_TG = 32 # 1024线程/32
-NUM_GPU_CORES = 8
-GPU_CLOCK = 1.296e9
-SCALE_GROUP = 128
-BLOCK_K = 128
-FRAG = 8
-FRAG_BYTES = FRAG * FRAG * 2
-TG_ALIGN = 16
-ATOMIC_UINT_BYTES = 4
+def is_power_of_2(n):
+	return ((n & (n - 1)) == 0) and n != 0
 
-# ---------------- 候选 ----------------
-RM_RN_CANDIDATES    = ((2, 4), (4, 4))
-PAIR_RATIO_CANDIDATES = (1,)
-MAX_WRITE_REG_SLOTS = 16        # pair_ratio * rm * rn 上限
-RING_BUF            = 1         # ring 大部分时间为空,rb>1 没有收益
-BLOCK_M_CANDIDATES  = (8, 16, 32, 64, 128)
-WSG_CANDIDATES = (1,)
+def next_power_of_2(n: int) -> int:
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    return 1 << (n - 1).bit_length()
 
-# ---------------- 需要用 Xcode 回填的常数 ----------------
-R0_WORDS   = 42      # 由 4x4 的 PSO=576 反推 (32, 44]
+def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpose=False):
+	tm, tn, tk = (M+15)//16, (N+15)//16, K//16
+	if tm*tn<2048 and tk >= 8 and K > max(M, N):
+		tm, tn = (M+31)//32, (N+31)//32
+		tk = K/16
+		bm = 16 if M < 40 else 32
+		bn = 16 if N < 40 else 32
+		bk = 16
+		wm, wn = 2, 2
+		max_k_pow2 = 1 << ((K // bk).bit_length() - 1)
+		split_k_partitions = min(next_power_of_2(max(2, int(tk / (tm * tn)))), 32, max_k_pow2)
+		split_k_partition_stride = M*N
+		gemm_k_iters = (K//bk)//split_k_partitions
+		split_k_partition_size = gemm_k_iters * bk
+		mn_aligned = (M % bm == 0) and (N % bn == 0)
+		k_aligned = K % bk == 0
+		lda = M if a_transpose else K
+		ldb = K if b_transpose else N
+		ldd = N
+		tn2, tm2 = (N + bn - 1) // bn, (M + bm - 1) // bm
+		grid_x = tn2
+		grid_y = tm2
+		grid_z = split_k_partitions
 
+		return dict(is_splitk=True, a_transpose=a_transpose, b_transpose=b_transpose,
+					mn_aligned=mn_aligned, k_aligned=k_aligned,
+					bm=bm, bn=bn, bk=bk, wm=wm, wn=2,
+					tm=tm2, tn=tn2, lda=lda, ldb=ldb, ldd=ldd,
+					split_k_partitions=split_k_partitions,
+					split_k_partition_size=split_k_partition_size,
+					split_k_partition_stride=split_k_partition_stride,
+					k_iter_aligned=gemm_k_iters,
+					grid_x=grid_x, grid_y=grid_y, grid_z=grid_z)
+	else:
+		bm, bn, bk = 64, 64, 16
+		wm, wn = 2, 2
+		tn, tm = (N+bn-1)//bn, (M+bm-1)//bm 
+		m_aligned = int(M % bm == 0)
+		n_aligned = int(N % bn == 0)
+		k_aligned = int(K % bk == 0)
+		gemm_k_iters = K // bk
+		swizzle_log = 0
+		sw = 1 << swizzle_log
+		lda = M if a_transpose else K
+		ldb = K if b_transpose else N
+		ldd = N
+		grid_x = tn * sw
+		grid_y = (tm + sw - 1) // sw
+		grid_z = 1
 
-ETA = {
-    1: 1.000,
-    2: 1.023,
-    3: 1.026,
-    4: 1.048,
-    5: 1.206,
-    6: 1.614,
-    7: 1.400,
-}
-ETA_MAX_R = max(ETA)
-
-def _ceil_div(a, b):
-	return (a + b - 1) // b
-
-def _align(n, alignment=TG_ALIGN):
-	return _ceil_div(n, alignment) * alignment
-
-# def slot_bytes(rm, rn):
-#     return rm * rn * 256 + 16
-
-def smem_bytes(csg, rm, rn):
-    return _align(csg * RING_BUF * (rm * rn * 256 + 20))
-
-# ---------------- 寄存器模型(32-bit word / lane) ----------------
-def regs_words_compute(rm, rn):
-    # 内核里 U 固定为 4，不再用 (rm + rn) <= 6 切换。
-    return 2 * (2 * rm * rn + 4 * (rm + rn) + R0_WORDS)
-
-def max_resident_threads_by_regs(regs16):
-    table = [(104, 1024), (112, 896), (128, 832), (144, 704),
-             (160, 640), (184, 576), (208, 512), (232, 448), (256, 384)]
-    for limit, threads in table:
-        if regs16 <= limit:
-            return threads
-    return 0            # 超表:视为不可行,不兜底
-
-# ---------------- 单次tile耗时 ----------------
-def t1_loads(bm, bn, rm, rn, K):
-    """r=1 时一个满 tile 的 device simdgroup_load 次数。"""
-    subs_m = bm // (FRAG * rm)
-    subs_n = bn // (FRAG * rn)
-    return subs_m * subs_n * _ceil_div(K, FRAG) * (rm + rn)
-
-def wave_r(ntiles, csg):
-    """最慢的 compute SG 所在核上，这个 wave 有几个 compute SG。"""
-    counts = [0] * NUM_GPU_CORES
-    for s in range(ntiles):
-        counts[(s // csg) % NUM_GPU_CORES] += 1
-    return max(counts)
-
-def score_launch(total_tiles, P, csg, t1):
-    """score = T1 * Σ η(r_t)，只加最慢 SG 实际参加的 wave。"""
-    owners = P * csg
-    crit = _ceil_div(total_tiles, owners)
-    acc = 0.0
-    for t in range(crit):
-        ntiles = min(owners, total_tiles - t * owners)
-        r = wave_r(ntiles, csg)
-        acc += ETA[r]
-    return t1 * acc, crit
-
-# ---------------- 可行形状:线程/寄存器/smem 联合约束 ----------------
-def get_pipeline_shapes(rm, rn):
-    words = regs_words_compute(rm, rn)
-    thr_cap = max_resident_threads_by_regs(words)
-    if thr_cap == 0:
-        return []
-    shapes = []
-    for pr in PAIR_RATIO_CANDIDATES:
-        if pr * rm * rn > MAX_WRITE_REG_SLOTS:
-            continue
-        for wsg in range(1, MAX_SG_PER_TG // (pr + 1) + 1):
-            csg = pr * wsg
-            threads = (csg + wsg) * SIMD_WIDTH
-            smem = smem_bytes(csg, rm, rn)
-            if smem > TG_CAPACITY:
-                continue
-            tgs_per_core = min(thr_cap // threads, TG_CAPACITY // smem)
-            if tgs_per_core < 1:
-                continue
-            r_cap = tgs_per_core * csg
-            # 满 wave 的 r = k * csg。超过 r_cap 或 η 表的候选不评分。
-            k_max = min(r_cap, ETA_MAX_R) // csg
-            if k_max < 1:
-                continue
-            shapes.append(dict(
-                pair_ratio=pr, compute_sg=csg, write_sg=wsg,
-                threads=threads, smem=smem, r_cap=r_cap, k_max=k_max))
-    return shapes
-
-def _search2(M, N, K):
-    cands = []
-    for rm, rn in RM_RN_CANDIDATES:
-        shapes = get_pipeline_shapes(rm, rn)
-        for bm in BLOCK_M_CANDIDATES:
-            if bm % (rm * FRAG) or M % bm:
-                continue
-            for bn in range(rn * FRAG, 257, rn * FRAG):
-                if N % bn:
-                    continue
-                num_m_blocks = _ceil_div(M, bm)
-                num_n_blocks = _ceil_div(N, bn)
-                total_tiles = num_m_blocks * num_n_blocks
-                t1 = t1_loads(bm, bn, rm, rn, K)
-                for s in shapes:
-                    csg = s["compute_sg"]
-                    for k in range(1, s["k_max"] + 1):
-                        P = NUM_GPU_CORES * k
-                        if k > 1 and P * csg > total_tiles:
-                            break
-                        score, crit = score_launch(total_tiles, P, csg, t1)
-                        cands.append(dict(
-                            block_m=bm, block_n=bn, block_k=BLOCK_K,
-                            reg_tile_m=rm, reg_tile_n=rn,
-                            compute_sg=csg, write_sg=s["write_sg"], ring_buf=RING_BUF,
-                            group_k=_ceil_div(K, SCALE_GROUP),
-                            num_m_blocks=num_m_blocks, num_n_blocks=num_n_blocks,
-                            persist_tgs=P, threads_per_tg=s["threads"],
-                            r_cap=s["r_cap"], crit=crit, t1=t1, score=score))
-    cands.sort(key=lambda c: (
-        c["score"], c["block_m"], c["block_n"],
-        c["reg_tile_m"], c["reg_tile_n"], c["compute_sg"], c["persist_tgs"]))
-    return cands
-
-def get_fp16_gemm_config(M, N, K, cd_dtype=np.float32, with_accum=False, verbose=True):
-	# elem_cd = np.dtype(cd_dtype).itemsize
-	cands = _search2(M, N, K)
-	if not cands:
-		raise ValueError(f"GEMM {M}, {N}, {K} 在当前候选下没有可行配置")
-	best = cands[0]
-	if verbose:
-		for c in cands[:8]:
-			print("cand", c["block_m"], c["block_n"],
-				"rm", c["reg_tile_m"], "rn", c["reg_tile_n"],
-				"csg", c["compute_sg"], "P", c["persist_tgs"],
-				"crit", c["crit"], "score", round(c["score"], 1))
-		print({k: (round(v, 1) if isinstance(v, float) else v) for k, v in best.items()})
-	return best
+		return dict(is_splitk=False, a_transpose=a_transpose, b_transpose=b_transpose,
+					mn_aligned=False, m_aligned=m_aligned, n_aligned=n_aligned, k_aligned=k_aligned,
+					bm=bm, bn=bn, bk=bk, wm=wm, wn=2,
+					tm=tm, tn=tn, swizzle_log=swizzle_log,
+					lda=lda, ldb=ldb, ldd=ldd,
+					k_iter_aligned=gemm_k_iters,
+					grid_x=grid_x, grid_y=grid_y, grid_z=grid_z)
 
 def fp16_gemm_kernel_name(cfg, with_accum):
+	if cfg["is_splitk"]:
+		# 仅支持累加, 不支持覆盖
+		return (f"fp16_gemm_splitk_"
+				+ ("t" if cfg['a_transpose'] else "n")
+				+ ("t" if cfg['b_transpose'] else "n")
+				+ ("t" if cfg['mn_aligned'] else "n" if cfg["is_splitk"] else "")
+				+ ("t" if cfg['k_aligned'] else "n" if cfg["is_splitk"] else "")
+				+ "_" +
+				f"bm{int(cfg['bm'])}_"
+				f"bn{int(cfg['bn'])}_"
+				f"bk{int(cfg['bk'])}_"
+				f"wm{int(cfg['wm'])}_"
+				f"wn{int(cfg['wn'])}"
+			)
 	return (f"fp16_gemm_"
-		f"bm{int(cfg['block_m'])}_"
-		f"bn{int(cfg['block_n'])}_"
-		f"bk{int(cfg['block_k'])}_"
-		f"rm{int(cfg['reg_tile_m'])}_"
-		f"rn{int(cfg['reg_tile_n'])}_"
-		f"csg{int(cfg['compute_sg'])}_"
-		f"wsg{int(cfg['write_sg'])}_"
-		f"rb{int(cfg['ring_buf'])}_"
-		f"a{int(bool(with_accum))}"
-	)
+			+ ("t" if cfg['a_transpose'] else "n")
+			+ ("t" if cfg['b_transpose'] else "n")
+			+ "_" +
+			f"bm{int(cfg['bm'])}_"
+			f"bn{int(cfg['bn'])}_"
+			f"bk{int(cfg['bk'])}_"
+			f"wm{int(cfg['wm'])}_"
+			f"wn{int(cfg['wn'])}_"
+			f"a{int(bool(with_accum))}"
+		)
+
