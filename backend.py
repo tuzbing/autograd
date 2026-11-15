@@ -3062,8 +3062,7 @@ class MetalBackend(Backend):
 		dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
 
 		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
-		# scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
-		# scale_bits = struct.unpack("<I", struct.pack("<f", scale))[0]
+		use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
 		need_grad = x.requires_grad or w.requires_grad
 		if row_scale is None:
 			kernel_name = "fused_linear_ce_logits_to_dlogits"
@@ -3076,11 +3075,27 @@ class MetalBackend(Backend):
 			rows = min(chunk_rows, N - row_base)
 			x_offset = x.storage.ptr.offset + row_base*C*itemsize
 
-			# 1) logits = X_chunk @ W.T
-			self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
-				[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
-				[x_offset, w.storage.ptr.offset, logits.ptr.offset],
-				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+			# 1) logits = X_chunk([rows, C]) @ W.T ([C, V])
+			if use_fp16_gemm:
+				cfg = scratch.gemm_configs[("logits", rows, False)]
+				logits_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+				if cfg["is_splitk"]:
+					self.ctx.fill_scalar("fill_scalar_kernel", [logits.ptr.buffer_id], [logits.ptr.offset], 0.0, rows * V)
+				logits_args = (
+					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+					if cfg["is_splitk"] else
+					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+				)
+				self.ctx.dispatch_with_args_3d(logits_kernel,
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w.storage.ptr.offset, 0, 0, logits.ptr.offset, logits.ptr.offset],
+					logits_args,
+					cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+			else:
+				self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w.storage.ptr.offset, logits.ptr.offset],
+					[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
 
 			# 2) row_loss/lse/dlogits
 			if row_scale is None:

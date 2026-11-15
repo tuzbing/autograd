@@ -204,11 +204,13 @@ def plan_node_scratch(node, use_f16_gemm=False):
 			]
 
 			configs = {}
+			row_sizes = [logits_rows]
+			if N % logits_rows:
+				row_sizes.append(N % logits_rows)
+			for rows in row_sizes:
+				configs[("logits", rows, False)] = get_fp16_gemm_config(M=rows, N=V, K=C, with_accum=False, b_transpose=True, dtype="fp32")
 			if use_f16_gemm:
 				max_quant_bytes = 0
-				row_sizes = [logits_rows]
-				if N % logits_rows:
-					row_sizes.append(N % logits_rows)
 				if x.requires_grad:
 					# dx[rows, C] = dlogits[rows, V] @ W[V, C]
 					max_quant_bytes = fp16_gemm_quant_size(logits_rows, C, V)

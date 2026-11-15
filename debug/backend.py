@@ -388,11 +388,27 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			rows = min(chunk_rows, N - row_base)
 			x_offset = x.storage.ptr.offset + row_base*C*itemsize
 
-			# 1) logits = X_chunk @ W.T
-			self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
-				[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
-				[x_offset, w.storage.ptr.offset, logits.ptr.offset],
-				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+			# 1) logits = X_chunk([rows, C]) @ W.T ([C, V])
+			if True:
+				cfg = scratch.gemm_configs[("logits", rows, False)]
+				logits_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+				if cfg["is_splitk"]:
+					self.ctx.fill_scalar("fill_scalar_kernel", [logits.ptr.buffer_id], [logits.ptr.offset], 0.0, rows * V)
+				logits_args = (
+					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+					if cfg["is_splitk"] else
+					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+				)
+				self.ctx.dispatch_with_args_3d(logits_kernel,
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w.storage.ptr.offset, 0, 0, logits.ptr.offset, logits.ptr.offset],
+					logits_args,
+					cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+			else:
+				self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w.storage.ptr.offset, logits.ptr.offset],
+					[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
 
 			# 2) row_loss/lse/dlogits
 			if row_scale is None:
@@ -423,7 +439,9 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
 						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[logits.ptr.offset, quant_base, quant_base + qa_size + qb_size],
-						[rows, V, V, 1], 128, group_k, (rows+3)//4, 128)
+						# [rows, V, V, 1], 128, group_k, (rows+3)//4, 128)
+						[rows, V, V, 1], 256, group_k, (rows+31)//32, 256)
+
 					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
 						[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
@@ -431,7 +449,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 					cfg = scratch.gemm_configs[("dx", rows, False)]
 					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
-					print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
+					# print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
 					if cfg["is_splitk"]:
 						self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
 					dx_args = (
@@ -464,7 +482,8 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
 						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[logits.ptr.offset, quant_base, quant_base+qa_size+qb_size],
-						[V, rows, 1, V], 128, group_k, (V+3)//4, 128)
+						# [V, rows, 1, V], 128, group_k, (V+3)//4, 128)
+						[V, rows, 1, V], 256, group_k, (V+31)//32, 256)
 					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
 						[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
 						[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
@@ -472,7 +491,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
 					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
-					print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {dbg_kernel_name}")
+					#print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {dbg_kernel_name}")
 					if cfg["is_splitk"] and not with_accum: # [修正] 若 dW 命中 Split-K 且无需累加，先清零 w.grad
 						self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
 					dw_args = (

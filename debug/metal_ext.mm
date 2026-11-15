@@ -134,8 +134,11 @@ public:
             @"mini_update_v", @"adamw_mini8bit_step",
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
             @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
+            @"fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
             @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
             @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1",
+            @"fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
@@ -553,8 +556,8 @@ public:
             [enc setBytes:&args[i] length:sizeof(uint32_t) atIndex:base_idx + i];
         }
 
-        const bool is_fp16_gemm = kernel_name.rfind("fp16_gemm", 0) == 0;
-        if (is_fp16_gemm) {
+        const bool is_gemm = kernel_name.rfind("fp16_gemm", 0) == 0 || kernel_name.rfind("fp32_gemm", 0) == 0;
+        if (is_gemm) {
             MTLSize threadgroups = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
             MTLSize threads_per_threadgroup = MTLSizeMake(tg_size, 1, 1);
             [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];

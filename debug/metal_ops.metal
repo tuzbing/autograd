@@ -13023,44 +13023,170 @@ kernel void per_token_cast_to_fp16(
     uint lane                     [[thread_index_in_simdgroup]],
     uint sg                       [[simdgroup_index_in_threadgroup]]
 ) {
-    const uint row = tg.z * 4u + sg;
+    // 仅占 4.125 KB 共享内存 (32x33x4B)，单核可驻留满 4 组 (1024 线程 = 100% 占用率)
+    // 奇数步长 33 保证列写与行读双向零 Bank Conflict
+    threadgroup uint htile2[32][33];
     const uint tile_k = tg.y;
-    if (row >= M) {
+    const uint m0 = tg.z * 32u;
+    const uint k0 = tile_k * 128u;
+    const uint groups_k = (K + 127u) >> 7;
+
+    // 路径 1：行连续输入 (dX: src_col_stride == 1)，32 lanes 步长 1 天然合并为 128B 缓存行事务
+    if (src_col_stride == 1u) {
+        #pragma unroll
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint row = m0 + sg * 4u + r;
+            if (row >= M) break;
+
+            device const float* row_src = src + ulong(row) * ulong(src_row_stride);
+            float values[4];
+            uint max_bits = 0u;
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint k = k0 + lane + j * 32u;
+                const float x = (k < K) ? row_src[k] : 0.0f;
+                values[j] = x;
+                max_bits = max(max_bits, fp16_quant_abs_bits(x));
+            }
+            max_bits = simd_max(max_bits);
+
+            const bool invalid = max_bits >= 0x7f800000u;
+            const float scale = fp16_quant_scale(max_bits);
+            const float inv_scale = 1.0f / scale;
+            if (lane == 0u) {
+                scales[ulong(row) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+            }
+
+            device half* row_dst = dst + ulong(row) * ulong(K);
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint k = k0 + lane + j * 32u;
+                if (k < K) row_dst[k] = fp16_quant_value(values[j], inv_scale, invalid);
+            }
+        }
         return;
     }
 
-    const uint groups_k = K / 128u + uint(K % 128u != 0u);
-    const uint k0 = tile_k * 128u;
-    float values[4];
-    uint max_bits = 0u;
+    // 路径 2：转置输入 (dW: src_row_stride == 1)，32 lanes 满 128B 缓存行合并读 + 寄存器量化 + 零冲突转置写
+    if (src_row_stride == 1u) {
+        const uint gm = m0 + lane;
+        const bool m_valid = (gm < M);
+        const uint k_sg_base = sg * 16u;
 
-    #pragma unroll
-    for (uint j = 0u; j < 4u; ++j) {
-        const uint k = k0 + lane + j * 32u;
-
-        float x = 0.0f;
-        if (k < K) {
-            const ulong index = ulong(row) * ulong(src_row_stride) + ulong(k) * ulong(src_col_stride);
-            x = src[index];
+        // 1) 沿连续 M 方向每次读满整条 128B 缓存行 (32 floats)，同时求局部 max
+        float vals[16];
+        uint local_max = 0u;
+        #pragma unroll
+        for (uint s = 0u; s < 16u; ++s) {
+            const uint gk = k0 + k_sg_base + s;
+            float x = 0.0f;
+            if (m_valid && gk < K) {
+                x = src[ulong(gk) * ulong(src_col_stride) + ulong(gm)];
+            }
+            vals[s] = x;
+            local_max = max(local_max, fp16_quant_abs_bits(x));
         }
-        values[j] = x;
-        max_bits = max(max_bits, fp16_quant_abs_bits(x));
+
+        // 2) 复用 htile2 前 8 行跨 8 个 simdgroup 归约 32 行的 max_bits (零 Bank Conflict)
+        htile2[sg][lane] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint row_max_bits = htile2[0][lane];
+        #pragma unroll
+        for (uint g = 1u; g < 8u; ++g) {
+            row_max_bits = max(row_max_bits, htile2[g][lane]);
+        }
+        const bool invalid = row_max_bits >= 0x7f800000u;
+        const float scale = fp16_quant_scale(row_max_bits);
+        const float inv_scale = 1.0f / scale;
+        if (sg == 0u && m_valid) {
+            scales[ulong(gm) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3) 第一拍：转置写出前 64 列 K (sg 0..3 写入，全组每次合并写出 128B)
+        if (sg < 4u) {
+            #pragma unroll
+            for (uint p = 0u; p < 8u; ++p) {
+                const half h0 = fp16_quant_value(vals[p * 2u + 0u], inv_scale, invalid);
+                const half h1 = fp16_quant_value(vals[p * 2u + 1u], inv_scale, invalid);
+                htile2[lane][sg * 8u + p] = as_type<uint>(half2(h0, h1));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint local_m = sg * 4u + r;
+            const uint row = m0 + local_m;
+            if (row >= M) break;
+            const uint packed_pair = htile2[local_m][lane];
+            const uint out_k = k0 + lane * 2u;
+            device half* row_dst = dst + ulong(row) * ulong(K);
+            if (out_k + 1u < K) {
+                *reinterpret_cast<device packed_ushort2*>(row_dst + out_k) = as_type<packed_ushort2>(packed_pair);
+            } else if (out_k < K) {
+                row_dst[out_k] = as_type<half2>(packed_pair).x;
+            }
+        }
+
+        // 4) 第二拍：转置写出后 64 列 K (sg 4..7 写入)
+        if (k0 + 64u < K) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg >= 4u) {
+                const uint sg_hi = sg - 4u;
+                #pragma unroll
+                for (uint p = 0u; p < 8u; ++p) {
+                    const half h0 = fp16_quant_value(vals[p * 2u + 0u], inv_scale, invalid);
+                    const half h1 = fp16_quant_value(vals[p * 2u + 1u], inv_scale, invalid);
+                    htile2[lane][sg_hi * 8u + p] = as_type<uint>(half2(h0, h1));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                const uint local_m = sg * 4u + r;
+                const uint row = m0 + local_m;
+                if (row >= M) break;
+                const uint packed_pair = htile2[local_m][lane];
+                const uint out_k = k0 + 64u + lane * 2u;
+                device half* row_dst = dst + ulong(row) * ulong(K);
+                if (out_k + 1u < K) {
+                    *reinterpret_cast<device packed_ushort2*>(row_dst + out_k) = as_type<packed_ushort2>(packed_pair);
+                } else if (out_k < K) {
+                    row_dst[out_k] = as_type<half2>(packed_pair).x;
+                }
+            }
+        }
+        return;
     }
 
-    max_bits = simd_max(max_bits);
-    const bool invalid = max_bits >= 0x7f800000u;
-    const float scale = fp16_quant_scale(max_bits);
-    const float inv_scale = 1.0f / scale;
-
-    if (lane == 0u) {
-        scales[ulong(row) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
-    }
-
+    // 通用兜底路径
     #pragma unroll
-    for (uint j = 0u; j < 4u; ++j) {
-        const uint k = k0 + lane + j * 32u;
-        if (k < K) {
-            dst[ulong(row) * ulong(K) + ulong(k)] = fp16_quant_value(values[j], inv_scale, invalid);
+    for (uint r = 0u; r < 4u; ++r) {
+        const uint row = m0 + sg * 4u + r;
+        if (row >= M) break;
+        float values[4];
+        uint max_bits = 0u;
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint k = k0 + lane + j * 32u;
+            const float x = (k < K) ? src[ulong(row) * ulong(src_row_stride) + ulong(k) * ulong(src_col_stride)] : 0.0f;
+            values[j] = x;
+            max_bits = max(max_bits, fp16_quant_abs_bits(x));
+        }
+        max_bits = simd_max(max_bits);
+        const bool invalid = max_bits >= 0x7f800000u;
+        const float scale = fp16_quant_scale(max_bits);
+        const float inv_scale = 1.0f / scale;
+        if (lane == 0u) {
+            scales[ulong(row) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+        }
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint k = k0 + lane + j * 32u;
+            if (k < K) dst[ulong(row) * ulong(K) + ulong(k)] = fp16_quant_value(values[j], inv_scale, invalid);
         }
     }
 }
@@ -13481,7 +13607,7 @@ struct BlockMMA {
             simdgroup_barrier(mem_flags::mem_none);
             Btile.template load<T, 1, WN, B_str_k, B_str_n>(Bs);
             simdgroup_barrier(mem_flags::mem_none);
-            if (has_scale) {
+            if constexpr (has_scale) {
                 tile_matmad(group_state.Gtile, Atile, Btile, group_state.Gtile);
             } else {
                 tile_matmad(Ctile, Atile, Btile, Ctile);
@@ -13500,28 +13626,28 @@ struct BlockMMA {
                                       const int c_col,
                                       const uint groups_k,
                                       const uint g) thread {
-        if (!has_scale) return;
-
-        float sb_vals[TN];
-        #pragma clang loop unroll(full)
-        for (short j = 0; j < TN; ++j) {
-            const uint col0 = uint(c_col + sn + j * kFragSize * WN);
-            sb_vals[j] = (col0 < N) ? sb[size_t(col0 >> 7) * size_t(groups_k) + size_t(g)] : 0.0f;
-        }
-        #pragma clang loop unroll(full)
-        for (short i = 0; i < TM; ++i) {
-            const uint row = uint(c_row + sm + i * kFragSize * WM);
-            const float sa_val = (row < M) ? sa[size_t(row) * size_t(groups_k) + size_t(g)] : 0.0f;
+        if constexpr (has_scale) {
+            float sb_vals[TN];
             #pragma clang loop unroll(full)
             for (short j = 0; j < TN; ++j) {
-                const float scale = sa_val * sb_vals[j];
-                thread typename MMATile<AccumType, TM, TN>::frag_type& c_frag = Ctile.frag_at(i, j);
-                const thread typename MMATile<AccumType, TM, TN>::frag_type& g_frag = group_state.Gtile.frag_at(i, j);
-                c_frag[0] = fma(g_frag[0], scale, c_frag[0]);
-                c_frag[1] = fma(g_frag[1], scale, c_frag[1]);
+                const uint col0 = uint(c_col + sn + j * kFragSize * WN);
+                sb_vals[j] = (col0 < N) ? sb[size_t(col0 >> 7) * size_t(groups_k) + size_t(g)] : 0.0f;
             }
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < TM; ++i) {
+                const uint row = uint(c_row + sm + i * kFragSize * WM);
+                const float sa_val = (row < M) ? sa[size_t(row) * size_t(groups_k) + size_t(g)] : 0.0f;
+                #pragma clang loop unroll(full)
+                for (short j = 0; j < TN; ++j) {
+                    const float scale = sa_val * sb_vals[j];
+                    thread typename MMATile<AccumType, TM, TN>::frag_type& c_frag = Ctile.frag_at(i, j);
+                    const thread typename MMATile<AccumType, TM, TN>::frag_type& g_frag = group_state.Gtile.frag_at(i, j);
+                    c_frag[0] = fma(g_frag[0], scale, c_frag[0]);
+                    c_frag[1] = fma(g_frag[1], scale, c_frag[1]);
+                }
+            }
+            group_state.Gtile.clear();
         }
-        group_state.Gtile.clear();
     }
 
     template<bool ACC=false>
@@ -13733,6 +13859,8 @@ fp16_gemm_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
 
 DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
 DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, true, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
+DEFINE_FP16_GEMM(float, false, false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
 
 template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
          bool align_mn, bool align_k, uint BM, uint BN, uint BK, uint WM, uint WN>
@@ -13846,6 +13974,7 @@ decltype(fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN,
 fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
 
 DEFINE_FP16_GEMM_SPLITK(half, true, false, true, true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_GEMM_SPLITK(float, false, false, true, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
 
 
 
