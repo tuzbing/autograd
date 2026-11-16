@@ -13711,35 +13711,23 @@ static METAL_FUNC void gemm_loop(
     }
 }
 
-template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
+template<typename T, bool has_scale, bool a_transpose, bool b_transpose,
          uint BM, uint BN, uint BK, uint WM, uint WN, bool accum=false>
-[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
-void fp16_gemm_impl(
-    device const T* A          [[buffer(0)]],
-    device const T* B          [[buffer(1)]],
-    device const float* sa        [[buffer(2)]],
-    device const float* sb        [[buffer(3)]],
-    device float* D               [[buffer(4)]],
-    device const float* C         [[buffer(5)]],
-    constant uint& M              [[buffer(6)]],
-    constant uint& N              [[buffer(7)]],
-    constant uint& K              [[buffer(8)]],
-    constant uint& lda            [[buffer(9)]],
-    constant uint& ldb            [[buffer(10)]],
-    constant uint& ldd            [[buffer(11)]],
-    constant uint& tiles_m        [[buffer(12)]],
-    constant uint& tiles_n        [[buffer(13)]],
-    constant uint& swizzle_log    [[buffer(14)]],
-    constant uint& k_iter_aligned [[buffer(15)]],
-    constant uint& align_m        [[buffer(16)]],
-    constant uint& align_n        [[buffer(17)]],
-    constant uint& align_k        [[buffer(18)]],
-    uint simd_lane_id             [[thread_index_in_simdgroup]],
-    uint simd_group_id            [[simdgroup_index_in_threadgroup]],
-    uint3 tid                     [[threadgroup_position_in_grid]],
-    uint3 lid                     [[thread_position_in_threadgroup]]
-) {
-    (void)lid;
+static METAL_FUNC void gemm_core(
+        threadgroup T* As,
+        threadgroup T* Bs,
+        device const T* A,
+        device const T* B,
+        device const float* sa,
+        device const float* sb,
+        device float* D,
+        uint M, uint N, uint K,
+        uint lda, uint ldb, uint ldd,
+        uint tiles_m, uint tiles_n,
+        uint swizzle_log, uint k_iter_aligned,
+        uint align_m, uint align_n, uint align_k,
+        uint simd_lane_id, uint simd_group_id, uint3 tid) 
+{
     const uint tid_y = ((tid.y) << swizzle_log) + ((tid.x) & (1 << swizzle_log) - 1);
     const uint tid_x = (tid.x) >> swizzle_log;
     if (tiles_n <= tid_x || tiles_m <= tid_y) return;
@@ -13752,11 +13740,7 @@ void fp16_gemm_impl(
     constexpr short tgp_padding_b = 16 / sizeof(T);
     constexpr short lda_tgp = (a_transpose ? BM : BK) + tgp_padding_a;
     constexpr short ldb_tgp = (b_transpose ? BK : BN) + tgp_padding_b;
-    constexpr uint tgp_mem_size_a = (a_transpose ? BK : BM) * lda_tgp;
-    constexpr uint tgp_mem_size_b = (b_transpose ? BN : BK) * ldb_tgp;
     constexpr uint tgp_size = WM * WN * 32;
-    threadgroup T As[tgp_mem_size_a];
-    threadgroup T Bs[tgp_mem_size_b];
     threadgroup_barrier(mem_flags::mem_none);
 
     // Find block in A, B, C
@@ -13832,47 +13816,124 @@ void fp16_gemm_impl(
     }
 }
 
-#define DEFINE_FP16_GEMM(T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC, NAME) \
-template [[host_name(NAME)]] [[kernel]] \
-decltype(fp16_gemm_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>) \
-fp16_gemm_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
+template<typename T, bool a_transpose, uint BM, uint BK>
+constexpr uint gemm_tgp_mem_size_a() {
+    return (a_transpose ? BK : BM) * ((a_transpose ? BM : BK) + 16 / sizeof(T));
+}
 
-DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
-DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, true, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
-DEFINE_FP16_GEMM(float, false, false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
-DEFINE_FP16_GEMM(float, false, false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
-DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, false, "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0");
-DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, true,  "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1");
+template<typename T, bool b_transpose, uint BN, uint BK>
+constexpr uint gemm_tgp_mem_size_b() {
+    return (b_transpose ? BN : BK) * ((b_transpose ? BK : BN) + 16 / sizeof(T));
+}
 
-template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
-         bool align_mn, bool align_k, uint BM, uint BN, uint BK, uint WM, uint WN>
-[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
-void fp16_gemm_splitk_impl(
-    device const T* A          [[buffer(0)]],
-    device const T* B          [[buffer(1)]],
-    device const float* sa        [[buffer(2)]],
-    device const float* sb        [[buffer(3)]],
-    // device float* D               [[buffer(4)]],
-    device atomic_float* D        [[buffer(4)]],
-    device const float* C         [[buffer(5)]],
-    constant uint& M              [[buffer(6)]],
-    constant uint& N              [[buffer(7)]],
-    constant uint& K              [[buffer(8)]],
-    constant uint& lda            [[buffer(9)]],
-    constant uint& ldb            [[buffer(10)]],
-    constant uint& ldd            [[buffer(11)]],
-    constant uint& tiles_m        [[buffer(12)]],
-    constant uint& tiles_n        [[buffer(13)]],
-    constant uint& split_k_partitions       [[buffer(14)]],
-    constant uint& split_k_partition_stride [[buffer(15)]],
-    constant uint& split_k_partition_size   [[buffer(16)]],
-    constant uint& k_iter_aligned [[buffer(17)]],
+template<bool a_transpose, bool b_transpose, uint BM, uint BN, uint BK, uint WM, uint WN, bool accum = false>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
+void fp32_gemm(
+    device const float* A         [[buffer(0)]],
+    device const float* B         [[buffer(1)]],
+    device float* D               [[buffer(2)]],
+    constant uint& M              [[buffer(3)]],
+    constant uint& N              [[buffer(4)]],
+    constant uint& K              [[buffer(5)]],
+    constant uint& lda            [[buffer(6)]],
+    constant uint& ldb            [[buffer(7)]],
+    constant uint& ldd            [[buffer(8)]],
+    constant uint& tiles_m        [[buffer(9)]],
+    constant uint& tiles_n        [[buffer(10)]],
+    constant uint& swizzle_log    [[buffer(11)]],
+    constant uint& k_iter_aligned [[buffer(12)]],
+    constant uint& align_m        [[buffer(13)]],
+    constant uint& align_n        [[buffer(14)]],
+    constant uint& align_k        [[buffer(15)]],
     uint simd_lane_id             [[thread_index_in_simdgroup]],
     uint simd_group_id            [[simdgroup_index_in_threadgroup]],
-    uint3 tid                     [[threadgroup_position_in_grid]],
-    uint3 lid                     [[thread_position_in_threadgroup]]
+    uint3 tid                     [[threadgroup_position_in_grid]]
 ) {
-    (void)lid;
+    threadgroup float As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
+    threadgroup float Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
+    gemm_core<float, false, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum>(
+        As, Bs, A, B, nullptr, nullptr, D,
+        M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
+        swizzle_log, k_iter_aligned, align_m, align_n, align_k,
+        simd_lane_id, simd_group_id, tid);
+}
+
+template<bool a_transpose, bool b_transpose, uint BM, uint BN, uint BK, uint WM, uint WN, bool accum = false>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
+void fp16_scaled_gemm(
+    device const half* A          [[buffer(0)]],
+    device const half* B          [[buffer(1)]],
+    device const float* sa        [[buffer(2)]],
+    device const float* sb        [[buffer(3)]],
+    device float* D               [[buffer(4)]],
+    constant uint& M              [[buffer(5)]],
+    constant uint& N              [[buffer(6)]],
+    constant uint& K              [[buffer(7)]],
+    constant uint& lda            [[buffer(8)]],
+    constant uint& ldb            [[buffer(9)]],
+    constant uint& ldd            [[buffer(10)]],
+    constant uint& tiles_m        [[buffer(11)]],
+    constant uint& tiles_n        [[buffer(12)]],
+    constant uint& swizzle_log    [[buffer(13)]],
+    constant uint& k_iter_aligned [[buffer(14)]],
+    constant uint& align_m        [[buffer(15)]],
+    constant uint& align_n        [[buffer(16)]],
+    constant uint& align_k        [[buffer(17)]],
+    uint simd_lane_id             [[thread_index_in_simdgroup]],
+    uint simd_group_id            [[simdgroup_index_in_threadgroup]],
+    uint3 tid                     [[threadgroup_position_in_grid]]
+) {
+    threadgroup half As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
+    threadgroup half Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
+    gemm_core<half, true, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum>(
+        As, Bs, A, B, sa, sb, D,
+        M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
+        swizzle_log, k_iter_aligned, align_m, align_n, align_k,
+        simd_lane_id, simd_group_id, tid);
+}
+
+#define DEFINE_FP32_GEMM(TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp32_gemm<TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>) \
+fp32_gemm<TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
+
+#define DEFINE_FP16_SCALED_GEMM(TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp16_scaled_gemm<TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>) \
+fp16_scaled_gemm<TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
+
+DEFINE_FP16_SCALED_GEMM(false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_SCALED_GEMM(false, true, 64, 64, 16, 2, 2, true,  "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
+DEFINE_FP32_GEMM(false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(true, false, 32, 64, 16, 2, 2, false, "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(true, false, 32, 64, 16, 2, 2, true,  "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1");
+DEFINE_FP32_GEMM(false, false, 32, 64, 16, 2, 2, false, "fp32_gemm_nn_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(false, false, 64, 64, 16, 2, 2, false, "fp32_gemm_nn_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(true, false, 64, 64, 16, 2, 2, false, "fp32_gemm_tn_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP32_GEMM(true, false, 64, 64, 16, 2, 2, true, "fp32_gemm_tn_bm64_bn64_bk16_wm2_wn2_a1");
+
+template<typename T, bool has_scale, bool a_transpose, bool b_transpose,
+         bool align_mn, bool align_k, uint BM, uint BN, uint BK, uint WM, uint WN>
+static METAL_FUNC void gemm_splitk_core(
+    threadgroup T* As,
+    threadgroup T* Bs,
+    device const T* A,
+    device const T* B,
+    device const float* sa,
+    device const float* sb,
+    device atomic_float* D,
+    uint M, uint N, uint K,
+    uint lda, uint ldb, uint ldd,
+    uint tiles_m, uint tiles_n,
+    uint split_k_partitions,
+    uint split_k_partition_stride,
+    uint split_k_partition_size,
+    uint k_iter_aligned,
+    uint simd_lane_id,
+    uint simd_group_id,
+    uint3 tid
+) {
     const uint tid_x = tid.x;
     const uint tid_y = tid.y;
     const uint tid_z = tid.z;
@@ -13882,11 +13943,7 @@ void fp16_gemm_splitk_impl(
     constexpr short tgp_padding_b = 16 / sizeof(T);
     constexpr short lda_tgp = (a_transpose ? BM : BK) + tgp_padding_a;
     constexpr short ldb_tgp = (b_transpose ? BK : BN) + tgp_padding_b;
-    constexpr uint tgp_mem_size_a = (a_transpose ? BK : BM) * lda_tgp;
-    constexpr uint tgp_mem_size_b = (b_transpose ? BN : BK) * ldb_tgp;
     constexpr uint tgp_size = WM * WN * 32;
-    threadgroup T As[tgp_mem_size_a];
-    threadgroup T Bs[tgp_mem_size_b];
     threadgroup_barrier(mem_flags::mem_none);
 
     // Find block in A, B, C
@@ -13950,11 +14007,81 @@ void fp16_gemm_splitk_impl(
     }
 }
 
-#define DEFINE_FP16_GEMM_SPLITK(T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN, NAME) \
-template [[host_name(NAME)]] [[kernel]] \
-decltype(fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>) \
-fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
+template<bool a_transpose, bool b_transpose, bool align_mn, bool align_k,
+         uint BM, uint BN, uint BK, uint WM, uint WN>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
+void fp32_gemm_splitk(
+    device const float* A                   [[buffer(0)]],
+    device const float* B                   [[buffer(1)]],
+    device atomic_float* D                  [[buffer(2)]],
+    constant uint& M                        [[buffer(3)]],
+    constant uint& N                        [[buffer(4)]],
+    constant uint& K                        [[buffer(5)]],
+    constant uint& lda                      [[buffer(6)]],
+    constant uint& ldb                      [[buffer(7)]],
+    constant uint& ldd                      [[buffer(8)]],
+    constant uint& tiles_m                  [[buffer(9)]],
+    constant uint& tiles_n                  [[buffer(10)]],
+    constant uint& split_k_partitions       [[buffer(11)]],
+    constant uint& split_k_partition_stride [[buffer(12)]],
+    constant uint& split_k_partition_size   [[buffer(13)]],
+    constant uint& k_iter_aligned           [[buffer(14)]],
+    uint simd_lane_id                       [[thread_index_in_simdgroup]],
+    uint simd_group_id                      [[simdgroup_index_in_threadgroup]],
+    uint3 tid                               [[threadgroup_position_in_grid]]
+) {
+    threadgroup float As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
+    threadgroup float Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
+    gemm_splitk_core<float, false, a_transpose, b_transpose, align_mn, align_k, BM, BN, BK, WM, WN>(
+        As, Bs, A, B, nullptr, nullptr, D, M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
+        split_k_partitions, split_k_partition_stride, split_k_partition_size, k_iter_aligned,
+        simd_lane_id, simd_group_id, tid);
+}
 
-DEFINE_FP16_GEMM_SPLITK(half, true, false, true, true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
-DEFINE_FP16_GEMM_SPLITK(float, false, false, true, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
-DEFINE_FP16_GEMM_SPLITK(float, false, false, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");
+template<bool a_transpose, bool b_transpose, bool align_mn, bool align_k,
+         uint BM, uint BN, uint BK, uint WM, uint WN>
+[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]
+void fp16_scaled_gemm_splitk(
+    device const half* A                    [[buffer(0)]],
+    device const half* B                    [[buffer(1)]],
+    device const float* sa                  [[buffer(2)]],
+    device const float* sb                  [[buffer(3)]],
+    device atomic_float* D                  [[buffer(4)]],
+    constant uint& M                        [[buffer(5)]],
+    constant uint& N                        [[buffer(6)]],
+    constant uint& K                        [[buffer(7)]],
+    constant uint& lda                      [[buffer(8)]],
+    constant uint& ldb                      [[buffer(9)]],
+    constant uint& ldd                      [[buffer(10)]],
+    constant uint& tiles_m                  [[buffer(11)]],
+    constant uint& tiles_n                  [[buffer(12)]],
+    constant uint& split_k_partitions       [[buffer(13)]],
+    constant uint& split_k_partition_stride [[buffer(14)]],
+    constant uint& split_k_partition_size   [[buffer(15)]],
+    constant uint& k_iter_aligned           [[buffer(16)]],
+    uint simd_lane_id                       [[thread_index_in_simdgroup]],
+    uint simd_group_id                      [[simdgroup_index_in_threadgroup]],
+    uint3 tid                               [[threadgroup_position_in_grid]]
+) {
+    threadgroup half As[gemm_tgp_mem_size_a<half, a_transpose, BM, BK>()];
+    threadgroup half Bs[gemm_tgp_mem_size_b<half, b_transpose, BN, BK>()];
+    gemm_splitk_core<half, true, a_transpose, b_transpose, align_mn, align_k, BM, BN, BK, WM, WN>(
+        As, Bs, A, B, sa, sb, D, M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
+        split_k_partitions, split_k_partition_stride, split_k_partition_size, k_iter_aligned,
+        simd_lane_id, simd_group_id, tid);
+}
+
+#define DEFINE_FP32_GEMM_SPLITK(TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp32_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>) \
+fp32_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
+
+#define DEFINE_FP16_SCALED_GEMM_SPLITK(TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp16_scaled_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>) \
+fp16_scaled_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
+
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, true,  true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP32_GEMM_SPLITK(false, true,  true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP32_GEMM_SPLITK(false, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP32_GEMM_SPLITK(false, false, true, false, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntn_bm32_bn32_bk16_wm2_wn2");

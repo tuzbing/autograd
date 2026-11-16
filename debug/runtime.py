@@ -91,6 +91,7 @@ class Runtime:
 		self.grad_scale = 1.0
 		self.accumulate_parameter_grads = False
 		self.use_fp16_gemm = False
+		self.backend.use_fp16_gemm = False
 
 		self.memory_plan = None
 		self.arena_bytes = 0

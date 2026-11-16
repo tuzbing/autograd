@@ -3089,8 +3089,8 @@ class MetalBackend(Backend):
 					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 				)
 				self.ctx.dispatch_with_args_3d(logits_kernel,
-					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, logits.ptr.buffer_id],
-					[x_offset, w.storage.ptr.offset, 0, 0, logits.ptr.offset, logits.ptr.offset],
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w.storage.ptr.offset, logits.ptr.offset],
 					logits_args,
 					cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 			else:
@@ -3128,10 +3128,9 @@ class MetalBackend(Backend):
 						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-						[logits.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-						[logits.ptr.offset, w.storage.ptr.offset, 0, 0, x_grad_offset, x_grad_offset],
-						dx_args,
-						cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+						[logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
+						dx_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
@@ -3151,8 +3150,8 @@ class MetalBackend(Backend):
 						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-						[logits.ptr.offset, x_offset, logits.ptr.offset, x_offset, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
 						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
@@ -3484,6 +3483,8 @@ class MetalBackend(Backend):
 
 	    eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
 
+	    use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
+
 	    gu = scratch["gu"]
 	    hidden = scratch["hidden"]
 
@@ -3500,10 +3501,25 @@ class MetalBackend(Backend):
 		    	[C, eps_bits], N*256, 1, 1, 256)
 
 	    # GU = X_norm @ Wgu
-	    self.ctx.dispatch_gemm_mps(
-	    	[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-	        [hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
-	        [1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
+	    if use_fp16_gemm:
+	    	cfg = scratch.gemm_configs["gu"]
+	    	gu_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+	    	if cfg["is_splitk"]:
+	    		self.ctx.fill_scalar("fill_scalar_kernel", [gu.ptr.buffer_id], [gu.ptr.offset], 0.0, N * H2)
+	    	gu_args = (
+	    		[N, H2, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+	    		if cfg["is_splitk"] else
+	    		[N, H2, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+	    	)
+	    	self.ctx.dispatch_with_args_3d(gu_kernel,
+	    			[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+	    			[hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+	    			gu_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+	    else:
+		    self.ctx.dispatch_gemm_mps(
+		    	[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+		        [hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+		        [1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 	    # HIDDEN = SiLU(gate) * up
 	    self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
@@ -3512,10 +3528,25 @@ class MetalBackend(Backend):
 	        [N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4 , 256))
 
 	    # OUT = HIDDEN @ Wdown
-	    self.ctx.dispatch_gemm_mps(
-	        [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
-	        [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
-	        [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
+	    if use_fp16_gemm:
+	    	cfg = scratch.gemm_configs["out"]
+	    	out_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+	    	if cfg["is_splitk"]:
+	    		self.ctx.fill_scalar("fill_scalar_kernel", [out.storage.ptr.buffer_id], [out.storage.ptr.offset], 0.0, N * C)
+	    	out_args = (
+	    		[N, C, H, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+	    		if cfg["is_splitk"] else
+	    		[N, C, H, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+	    	)
+	    	self.ctx.dispatch_with_args_3d(out_kernel,
+	    		[hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+	    		[hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+	    		out_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+	    else:
+		    self.ctx.dispatch_gemm_mps(
+		        [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+		        [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+		        [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
 
 	def metal_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
 		if len(inputs) == 3:

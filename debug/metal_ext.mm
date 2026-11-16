@@ -142,7 +142,11 @@ public:
             @"fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0",
             @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0",
             @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1",
-
+            @"fp32_gemm_nn_bm32_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_nn_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm64_bn64_bk16_wm2_wn2_a1",
+            @"fp32_gemm_splitk_nntn_bm32_bn32_bk16_wm2_wn2",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];

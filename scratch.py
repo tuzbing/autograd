@@ -225,7 +225,19 @@ def plan_node_scratch(node, use_f16_gemm=False):
 							# configs["dw", rows, accum] = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=accum, b_transpose=True)
 							configs["dw", rows, accum] = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
 
-				if max_quant_bytes > 0:
+				capacity = logits_rows * V
+				tile_rows = min(logits_rows, capacity - C)
+				tile_v = min(V, capacity // (tile_rows + C))
+				tile_row_sizes = [tile_rows] + ([N % tile_rows] if N % tile_rows else [])
+				tile_col_sizes = [tile_v] + ([V % tile_v] if V % tile_v else [])
+				for rows in tile_row_sizes:
+					for cols in tile_col_sizes:
+						configs[("logits_tile", rows, cols)] = get_fp16_gemm_config(M=rows, N=cols, K=C, with_accum=False, b_transpose=True, dtype="fp32")
+						for accum in (False, True):
+							configs[("dw_tile", cols, rows, accum)] = get_fp16_gemm_config(M=cols, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+
+				# if max_quant_bytes > 0:
+				if max_quant_bytes > 0 and any(c.get("dtype") == "fp16" for c in configs.values()):
 					slots.append(("gemm_quant", (max_quant_bytes,), np.uint8))
 
 			fwd = pack_slots(slots)
@@ -327,6 +339,14 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
 			])
+			if use_f16_gemm:
+				N = prod(x.shape[:-1])
+				C = x.shape[-1]
+				H2 = wgu.shape[-1]
+				fwd.gemm_configs = {
+					"gu": get_fp16_gemm_config(M=N, N=H2, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32"),
+					"out": get_fp16_gemm_config(M=N, N=C, K=H, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32")
+				}
 			bwd = pack_slots([
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),

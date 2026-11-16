@@ -44,10 +44,14 @@ def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpo
 					k_iter_aligned=gemm_k_iters,
 					grid_x=grid_x, grid_y=grid_y, grid_z=grid_z)
 	else:
-		if dtype == "fp32":
-			bm, bn, bk = 32, 64, 16
-		else:
+		# if dtype == "fp32":
+		# 	bm, bn, bk = 32, 64, 16
+		# else:
+		# 	bm, bn, bk = 64, 64, 16
+		if dtype != "fp32" or M >= 64:
 			bm, bn, bk = 64, 64, 16
+		else:
+			bm, bn, bk = 32, 64, 16
 		wm, wn = 2, 2
 		tn, tm = (N+bn-1)//bn, (M+bm-1)//bm 
 		m_aligned = int(M % bm == 0)
