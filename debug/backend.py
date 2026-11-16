@@ -429,27 +429,41 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			if x.requires_grad:
 				x_grad_offset = x.grad.storage.ptr.offset+row_base*C*itemsize
 				if use_fp16_gemm:
-					gemm_quant = scratch["gemm_quant"]
-					quant_base = gemm_quant.ptr.offset
-					group_k = (V+127)//128
-					group_n = (C+127)//128
-					qa_size = align_up(rows*V*2, 16)
-					qb_size = align_up(V*C*2, 16)
-					sa_size = align_up(rows*group_k*4, 16)
-					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
-						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-						[logits.ptr.offset, quant_base, quant_base + qa_size + qb_size],
-						# [rows, V, V, 1], 128, group_k, (rows+3)//4, 128)
-						[rows, V, V, 1], 256, group_k, (rows+31)//32, 256)
+					# gemm_quant = scratch["gemm_quant"]
+					# quant_base = gemm_quant.ptr.offset
+					# group_k = (V+127)//128
+					# group_n = (C+127)//128
+					# qa_size = align_up(rows*V*2, 16)
+					# qb_size = align_up(V*C*2, 16)
+					# sa_size = align_up(rows*group_k*4, 16)
+					# self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
+					# 	[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+					# 	[logits.ptr.offset, quant_base, quant_base + qa_size + qb_size],
+					# 	[rows, V, V, 1], 256, group_k, (rows+31)//32, 256)
 
-					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
-						[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-						[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
-						[C, V, 1, C], 256, group_k, group_n, 256)
+					# self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
+					# 	[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+					# 	[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
+					# 	[C, V, 1, C], 256, group_k, group_n, 256)
+
+					# cfg = scratch.gemm_configs[("dx", rows, False)]
+					# dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
+					# if cfg["is_splitk"]:
+					# 	self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
+					# dx_args = (
+					# 	[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+					# 	if cfg["is_splitk"] else
+					# 	[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					# )
+					# self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+					# 	[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+					# 	[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
+					# 	dx_args,
+					# 	cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 
 					cfg = scratch.gemm_configs[("dx", rows, False)]
-					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
-					# print(f"dX NEED KERNEL M={rows}, N={C}, K={V} {dbg_kernel_name}")
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+					print(f"dx need kernel {dbg_kernel_name}")
 					if cfg["is_splitk"]:
 						self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
 					dx_args = (
@@ -458,8 +472,8 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-						[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
+						[logits.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, w.storage.ptr.offset, 0, 0, x_grad_offset, x_grad_offset],
 						dx_args,
 						cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
@@ -471,28 +485,40 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			if w.requires_grad and not dw_bf16:
 				with_accum = bool(accumulate or row_base != 0)
 				if use_fp16_gemm:
-					gemm_quant = scratch["gemm_quant"]
-					quant_base = gemm_quant.ptr.offset
-					group_k = (rows + 127) // 128
-					group_n = (C + 127) // 128
+					# gemm_quant = scratch["gemm_quant"]
+					# quant_base = gemm_quant.ptr.offset
+					# group_k = (rows + 127) // 128
+					# group_n = (C + 127) // 128
+					# qa_size = align_up(V*rows*2, 16)
+					# qb_size = align_up(rows*C*2, 16)
+					# sa_size = align_up(V*group_k*4, 16)
+					# self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
+					# 	[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+					# 	[logits.ptr.offset, quant_base, quant_base+qa_size+qb_size],
+					# 	[V, rows, 1, V], 256, group_k, (V+31)//32, 256)
+					# self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
+					# 	[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
+					# 	[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
+					# 	[C, rows, 1, C], 256, group_k, group_n, 256)
 
-					qa_size = align_up(V*rows*2, 16)
-					qb_size = align_up(rows*C*2, 16)
-					sa_size = align_up(V*group_k*4, 16)
-					self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
-						[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-						[logits.ptr.offset, quant_base, quant_base+qa_size+qb_size],
-						# [V, rows, 1, V], 128, group_k, (V+3)//4, 128)
-						[V, rows, 1, V], 256, group_k, (V+31)//32, 256)
-					self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
-						[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-						[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
-						[C, rows, 1, C], 256, group_k, group_n, 256)
+					# cfg = scratch.gemm_configs[("dw", rows, with_accum)]
+					# dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
+					# if cfg["is_splitk"] and not with_accum:
+					# 	self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
+					# dw_args = (
+					# 	[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+					# 	if cfg["is_splitk"] else
+					# 	[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					# )
+					# self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+					# 	[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+					# 	[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+					# 	dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 
 					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
-					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
-					#print(f"dW NEED KERNEL M={V}, N={C}, K={rows}, {dbg_kernel_name}")
-					if cfg["is_splitk"] and not with_accum: # [修正] 若 dW 命中 Split-K 且无需累加，先清零 w.grad
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp32")
+					print(f"dw need kernel {dbg_kernel_name}")
+					if cfg["is_splitk"] and not with_accum:
 						self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
 					dw_args = (
 						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
@@ -500,8 +526,8 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 					)
 					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-						[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-						[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_offset, logits.ptr.offset, x_offset, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
 						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 				else:
 					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],

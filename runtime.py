@@ -67,7 +67,7 @@ class Runtime:
 			cls._default_runtime = Runtime()
 		return cls._default_runtime
 
-	def __init__(self, device="cpu", forward_only=False, owns_params=True):
+	def __init__(self, device="cpu", forward_only=False, owns_params=True, use_fp16_gemm=True):
 		self.loss = None
 		self.topo = []
 		self.forward_only = forward_only
@@ -80,6 +80,7 @@ class Runtime:
 		self.need_scratch = (device == "cpu")
 		self.grad_scale = 1.0
 		self.accumulate_parameter_grads = False
+		self.use_fp16_gemm = use_fp16_gemm
 
 		self.memory_plan = None
 		self.arena_bytes = 0
@@ -90,6 +91,7 @@ class Runtime:
 		self.accumulate_parameter_grads = bool(accumulate_parameter_grads)
 		self.backend.accumulate_parameter_grads = self.accumulate_parameter_grads
 		self.backend.grad_scale = self.grad_scale
+		self.backend.use_fp16_gemm = self.use_fp16_gemm
 		if not self.is_compiled:
 			self.build_topo(loss)
 			self.bind_memory()
@@ -215,7 +217,8 @@ class Runtime:
 			if t.storage is None:
 				t.storage = self.allocator.alloc(t.shape, t.dtype)
 				self.backend.init(t)
-				weight_bytes += t.storage.nbytes
+				if t.requires_grad:
+					weight_bytes += t.storage.nbytes
 
 			if not self.forward_only and t.grad is not None and t.grad.storage is None:
 				t.grad.storage = self.allocator.alloc(t.grad.shape, t.grad.dtype)
@@ -237,7 +240,7 @@ class Runtime:
 		for node in self.topo:
 			node.forward = self.backend.get_forward_kernel(node.op)
 			node.backward = self.backend.get_backward_kernel(node.op)
-			fwd, bwd = plan_node_scratch(node)
+			fwd, bwd = plan_node_scratch(node, self.use_fp16_gemm)
 			if fwd is not None: node.scratch_fwd_layout = fwd
 			if bwd is not None: node.scratch_bwd_layout = bwd
 
@@ -793,7 +796,7 @@ class Runtime:
 		views = {}
 		for name, (off, shape, dtype) in layout.slots.items():
 			views[name] = self.allocator.view(storage, off, shape, dtype)
-		return ScratchViews(views)
+		return ScratchViews(views, layout.gemm_configs)
 
 	def execute(self):
 		if self.forward_only:

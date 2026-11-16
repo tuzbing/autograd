@@ -12964,3 +12964,997 @@ kernel void gqa_rms_dgamma_bf16(
         dg[c] = fla_float_to_bf16_rne(sum);
     }
 }
+
+////////////////////////////////////////////////////////////////////////////
+///                               量化
+////////////////////////////////////////////////////////////////////////////
+METAL_FUNC uint fp16_quant_abs_bits(float x) {
+    return as_type<uint>(x) & 0x7fffffffu;
+}
+
+METAL_FUNC float fp16_quant_scale(uint max_bits) {
+    if (max_bits == 0u || max_bits >= 0x7f800000u) {
+        return 1.0f;
+    }
+
+    const float amax = as_type<float>(max_bits);
+    // FP16 最大有限值为65504。scale下限取FP32最小正规数，避免倒数溢出。
+    return max(amax / 65504.0f, 0x1.0p-126f);
+}
+
+METAL_FUNC half fp16_quant_value(float x, float inv_scale, bool invalid) 
+{
+    if (invalid) {
+        return as_type<half>(ushort(0x7e00u));
+    }
+    const float scaled = clamp(x * inv_scale, -65504.0f, 65504.0f);
+    return half(scaled);
+}
+
+kernel void per_token_cast_to_fp16(
+    device const float* src       [[buffer(0)]],
+    device half* dst              [[buffer(1)]],
+    device float* scales          [[buffer(2)]],
+    constant uint& M              [[buffer(3)]],
+    constant uint& K              [[buffer(4)]],
+    constant uint& src_row_stride [[buffer(5)]],
+    constant uint& src_col_stride [[buffer(6)]],
+    uint3 tg                      [[threadgroup_position_in_grid]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    // 仅占 4.125 KB 共享内存 (32x33x4B)，单核可驻留满 4 组 (1024 线程 = 100% 占用率)
+    // 奇数步长 33 保证列写与行读双向零 Bank Conflict
+    threadgroup uint htile2[32][33];
+    const uint tile_k = tg.y;
+    const uint m0 = tg.z * 32u;
+    const uint k0 = tile_k * 128u;
+    const uint groups_k = (K + 127u) >> 7;
+
+    // 路径 1：行连续输入 (dX: src_col_stride == 1)，32 lanes 步长 1 天然合并为 128B 缓存行事务
+    if (src_col_stride == 1u) {
+        #pragma unroll
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint row = m0 + sg * 4u + r;
+            if (row >= M) break;
+
+            device const float* row_src = src + ulong(row) * ulong(src_row_stride);
+            float values[4];
+            uint max_bits = 0u;
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint k = k0 + lane + j * 32u;
+                const float x = (k < K) ? row_src[k] : 0.0f;
+                values[j] = x;
+                max_bits = max(max_bits, fp16_quant_abs_bits(x));
+            }
+            max_bits = simd_max(max_bits);
+
+            const bool invalid = max_bits >= 0x7f800000u;
+            const float scale = fp16_quant_scale(max_bits);
+            const float inv_scale = 1.0f / scale;
+            if (lane == 0u) {
+                scales[ulong(row) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+            }
+
+            device half* row_dst = dst + ulong(row) * ulong(K);
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint k = k0 + lane + j * 32u;
+                if (k < K) row_dst[k] = fp16_quant_value(values[j], inv_scale, invalid);
+            }
+        }
+        return;
+    }
+
+    // 路径 2：转置输入 (dW: src_row_stride == 1)，32 lanes 满 128B 缓存行合并读 + 寄存器量化 + 零冲突转置写
+    if (src_row_stride == 1u) {
+        const uint gm = m0 + lane;
+        const bool m_valid = (gm < M);
+        const uint k_sg_base = sg * 16u;
+
+        // 1) 沿连续 M 方向每次读满整条 128B 缓存行 (32 floats)，同时求局部 max
+        float vals[16];
+        uint local_max = 0u;
+        #pragma unroll
+        for (uint s = 0u; s < 16u; ++s) {
+            const uint gk = k0 + k_sg_base + s;
+            float x = 0.0f;
+            if (m_valid && gk < K) {
+                x = src[ulong(gk) * ulong(src_col_stride) + ulong(gm)];
+            }
+            vals[s] = x;
+            local_max = max(local_max, fp16_quant_abs_bits(x));
+        }
+
+        // 2) 复用 htile2 前 8 行跨 8 个 simdgroup 归约 32 行的 max_bits (零 Bank Conflict)
+        htile2[sg][lane] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint row_max_bits = htile2[0][lane];
+        #pragma unroll
+        for (uint g = 1u; g < 8u; ++g) {
+            row_max_bits = max(row_max_bits, htile2[g][lane]);
+        }
+        const bool invalid = row_max_bits >= 0x7f800000u;
+        const float scale = fp16_quant_scale(row_max_bits);
+        const float inv_scale = 1.0f / scale;
+        if (sg == 0u && m_valid) {
+            scales[ulong(gm) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3) 第一拍：转置写出前 64 列 K (sg 0..3 写入，全组每次合并写出 128B)
+        if (sg < 4u) {
+            #pragma unroll
+            for (uint p = 0u; p < 8u; ++p) {
+                const half h0 = fp16_quant_value(vals[p * 2u + 0u], inv_scale, invalid);
+                const half h1 = fp16_quant_value(vals[p * 2u + 1u], inv_scale, invalid);
+                htile2[lane][sg * 8u + p] = as_type<uint>(half2(h0, h1));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint local_m = sg * 4u + r;
+            const uint row = m0 + local_m;
+            if (row >= M) break;
+            const uint packed_pair = htile2[local_m][lane];
+            const uint out_k = k0 + lane * 2u;
+            device half* row_dst = dst + ulong(row) * ulong(K);
+            if (out_k + 1u < K) {
+                *reinterpret_cast<device packed_ushort2*>(row_dst + out_k) = as_type<packed_ushort2>(packed_pair);
+            } else if (out_k < K) {
+                row_dst[out_k] = as_type<half2>(packed_pair).x;
+            }
+        }
+
+        // 4) 第二拍：转置写出后 64 列 K (sg 4..7 写入)
+        if (k0 + 64u < K) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg >= 4u) {
+                const uint sg_hi = sg - 4u;
+                #pragma unroll
+                for (uint p = 0u; p < 8u; ++p) {
+                    const half h0 = fp16_quant_value(vals[p * 2u + 0u], inv_scale, invalid);
+                    const half h1 = fp16_quant_value(vals[p * 2u + 1u], inv_scale, invalid);
+                    htile2[lane][sg_hi * 8u + p] = as_type<uint>(half2(h0, h1));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            #pragma unroll
+            for (uint r = 0u; r < 4u; ++r) {
+                const uint local_m = sg * 4u + r;
+                const uint row = m0 + local_m;
+                if (row >= M) break;
+                const uint packed_pair = htile2[local_m][lane];
+                const uint out_k = k0 + 64u + lane * 2u;
+                device half* row_dst = dst + ulong(row) * ulong(K);
+                if (out_k + 1u < K) {
+                    *reinterpret_cast<device packed_ushort2*>(row_dst + out_k) = as_type<packed_ushort2>(packed_pair);
+                } else if (out_k < K) {
+                    row_dst[out_k] = as_type<half2>(packed_pair).x;
+                }
+            }
+        }
+        return;
+    }
+
+    // 通用兜底路径
+    #pragma unroll
+    for (uint r = 0u; r < 4u; ++r) {
+        const uint row = m0 + sg * 4u + r;
+        if (row >= M) break;
+        float values[4];
+        uint max_bits = 0u;
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint k = k0 + lane + j * 32u;
+            const float x = (k < K) ? src[ulong(row) * ulong(src_row_stride) + ulong(k) * ulong(src_col_stride)] : 0.0f;
+            values[j] = x;
+            max_bits = max(max_bits, fp16_quant_abs_bits(x));
+        }
+        max_bits = simd_max(max_bits);
+        const bool invalid = max_bits >= 0x7f800000u;
+        const float scale = fp16_quant_scale(max_bits);
+        const float inv_scale = 1.0f / scale;
+        if (lane == 0u) {
+            scales[ulong(row) * ulong(groups_k) + ulong(tile_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+        }
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            const uint k = k0 + lane + j * 32u;
+            if (k < K) dst[ulong(row) * ulong(K) + ulong(k)] = fp16_quant_value(values[j], inv_scale, invalid);
+        }
+    }
+}
+
+kernel void per_block_cast_to_fp16(
+    device const float* src       [[buffer(0)]],
+    device half* dst              [[buffer(1)]],
+    device float* scales          [[buffer(2)]],
+    constant uint& N              [[buffer(3)]],
+    constant uint& K              [[buffer(4)]],
+    constant uint& src_row_stride [[buffer(5)]],
+    constant uint& src_col_stride [[buffer(6)]],
+    uint3 tg                      [[threadgroup_position_in_grid]],
+    uint3 tid3                    [[thread_position_in_threadgroup]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]]
+) {
+    const uint tid = tid3.x;
+    const uint block_k = tg.y;
+    const uint block_n = tg.z;
+    const uint n0 = block_n * 128u;
+    const uint k0 = block_k * 128u;
+    const uint groups_k = K / 128u + uint(K % 128u != 0u);
+
+    threadgroup uint group_max_bits[8];
+
+    uint max_bits = 0u;
+    // 第一遍：每线程最多读取64个元素，只保留局部最大值。
+    for (uint p = tid; p < 128u * 128u; p += 256u) {
+        const uint n = n0 + p / 128u;
+        const uint k = k0 + p % 128u;
+        if (n < N && k < K) {
+            const ulong index = ulong(n) * ulong(src_row_stride) + ulong(k) * ulong(src_col_stride);
+            max_bits = max(max_bits, fp16_quant_abs_bits(src[index]));
+        }
+    }
+    max_bits = simd_max(max_bits);
+    if (lane == 0u) {
+        group_max_bits[sg] = max_bits;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 每个SIMD-group都归约同样的8个组结果，
+    // 因而所有线程得到相同block最大值，无需第二次barrier。
+    uint block_max_bits = 0u;
+    if (lane < 8u) {
+        block_max_bits = group_max_bits[lane];
+    }
+    block_max_bits = simd_max(block_max_bits);
+
+    const bool invalid = block_max_bits >= 0x7f800000u;
+    const float scale = fp16_quant_scale(block_max_bits);
+    const float inv_scale = 1.0f / scale;
+    if (tid == 0u) {
+        scales[ulong(block_n) * ulong(groups_k) + ulong(block_k)] = invalid ? as_type<float>(0x7fc00000u) : scale;
+    }
+
+    // 第二遍：重新读取原输入，写出连续FP16结果。
+    for (uint p = tid; p < 128u * 128u; p += 256u) {
+        const uint n = n0 + p / 128u;
+        const uint k = k0 + p % 128u;
+        if (n < N && k < K) {
+            const ulong src_index = ulong(n) * ulong(src_row_stride) + ulong(k) * ulong(src_col_stride);
+            const ulong dst_index = ulong(n) * ulong(K) + ulong(k);
+            dst[dst_index] = fp16_quant_value(src[src_index], inv_scale, invalid);
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+//////      GEMM NEW
+//////////////////////////////////////////////////////////////////////////////////
+template<typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size, short reduction_dim>
+struct BlockLoader {
+    static constant constexpr short n_heads = (BCOLS*BROWS) / tgp_size;
+    static constant constexpr short TCOLS = BCOLS / n_heads;
+    static constant constexpr short TROWS = tgp_size / TCOLS;
+    static constant constexpr short n_rows = (BROWS + TROWS - 1) / TROWS;
+    static constant constexpr short vec_size = n_heads;
+
+    const int src_ld;
+    const int tile_stride;
+    const short thread_idx;
+    const short bi;
+    const short bj;
+    threadgroup T* dst;
+    const device T* src;
+
+    struct alignas(sizeof(T)) ReadVector {
+        uint8_t v[sizeof(T) * vec_size];
+    };
+
+    METAL_FUNC BlockLoader(
+        const device T* src_,
+        threadgroup T* dst_,
+        const int src_ld_,
+        ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+        ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+        : src_ld(src_ld_),
+          tile_stride(reduction_dim ? BCOLS : BROWS*src_ld),
+          thread_idx(simd_group_id*32+simd_lane_id),
+          bi(thread_idx/TCOLS),
+          bj(vec_size*(thread_idx % TCOLS)),
+          dst(dst_+bi*dst_ld+bj),
+          src(src_+bi*src_ld+bj) {
+    }
+
+    METAL_FUNC void load_unsafe() const thread {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < BROWS; i += TROWS) {
+            *((threadgroup ReadVector*)(&dst[i * dst_ld])) = *((const device ReadVector*)(&src[i * src_ld]));
+        }
+    }
+
+    METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
+        src_tile_dim = src_tile_dim - short2(bj, bi);
+
+        // Skip loading if thread has no valid reads
+        if (src_tile_dim.x <= 0 || src_tile_dim.y <= 0) {
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < BROWS; i += TROWS) {
+                #pragma clang loop unroll(full)
+                for (short j = 0; j < vec_size; j++) {
+                    dst[i * dst_ld + j] = T(0);
+                }
+            }
+            return;
+        }
+
+        // Use fast thread memory for bound checks
+        bool tmp_idx[vec_size];
+        T tmp_val[vec_size];
+
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < BROWS; i += TROWS) {
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < vec_size; j++) {
+                tmp_idx[j] = (i < src_tile_dim.y) && (j < src_tile_dim.x);
+            }
+
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < vec_size; j++) {
+                tmp_val[j] = src[(tmp_idx[j] ? i * src_ld + j : 0)];
+            }
+
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < vec_size; j++) {
+                tmp_val[j] = tmp_idx[j] ? tmp_val[j] : T(0);
+            }
+
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < vec_size; j++) {
+                dst[i * dst_ld + j] = tmp_val[j];
+            }
+        }
+    }
+
+    METAL_FUNC void next() thread {
+        src += tile_stride;
+    }
+};
+
+METAL_FUNC static constexpr short2 get_coord(ushort simd_lane_id [[thread_index_in_simdgroup]]) {
+    const short qid = simd_lane_id / 4;
+    const short fm = (qid & 4) + ((simd_lane_id / 2) % 4);
+    const short fn = (qid & 2) * 2 + (simd_lane_id % 2) * 2;
+    return short2{fn, fm};
+}
+
+template<typename T, int kTileRows_, int kTileCols_>
+struct MMATile {
+    static constant constexpr int kFragRows = 8;
+    static constant constexpr int kFragCols = 8;
+    static constant constexpr int kElemsPerFrag = (kFragRows * kFragCols) / 32;
+    static constant constexpr int kElemRows = 1;
+    static constant constexpr int kElemCols = 2;
+    static constant constexpr int kNumFrags = kTileRows_ * kTileCols_;
+    static constant constexpr int kElemsPerTile = kNumFrags * kElemsPerFrag;
+
+    typedef metal::simdgroup_matrix<T, kFragRows, kFragCols> mat_type;
+    typedef metal::vec<T, kElemsPerFrag> frag_type;
+
+    frag_type val_frags[kNumFrags] = {frag_type(0)};
+
+    METAL_FUNC MMATile() thread {}
+
+    METAL_FUNC void clear() thread {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < kNumFrags; ++i) {
+            val_frags[i] = frag_type(0);
+        }
+    }
+
+    METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j) thread {
+        return val_frags[i * kTileCols_ + j];
+    }
+
+    METAL_FUNC constexpr const thread frag_type& frag_at(const short i, const short j) const thread {
+        return val_frags[i * kTileCols_ + j];
+    }
+
+    template <typename U, int w_x, int w_y, int str_x, int str_y>
+    METAL_FUNC void load(const threadgroup U* src) thread {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < kTileRows_; ++i) {
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < kTileCols_; ++j) {
+                thread frag_type& dst = frag_at(i, j);
+                const threadgroup U* src2 = &(src[(i * kFragRows) * w_x * str_x + (j * kFragCols) * w_y * str_y]);
+                #pragma clang loop unroll(full)
+                for (short ii = 0; ii < kElemRows; ii++) {
+                    #pragma clang loop unroll(full)
+                    for (short jj = 0; jj < kElemCols; jj++) {
+                        dst[ii*kElemCols+jj] = static_cast<T>(src2[ii*str_x + jj*str_y]);
+                    }
+                }
+            }
+        }
+    }
+
+    template<typename U, int w_x, int w_y, bool ACC=false>
+    METAL_FUNC void store(device U* dst, const int ld) const thread {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < kTileRows_; i++) {
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < kTileCols_; j++) {
+                const thread frag_type& src = frag_at(i, j);
+                device U* dst2 = &(dst[(i * kFragRows) * w_x * ld + (j * kFragCols) * w_y]);
+                #pragma clang loop unroll(full)
+                for (short ii = 0; ii < kElemRows; ii++) {
+                    #pragma clang loop unroll(full)
+                    for (short jj = 0; jj < kElemCols; jj++) {
+                        if constexpr (ACC) {
+                            dst2[ii*ld+jj*1] += static_cast<U>(src[ii*kElemCols+jj]);
+                        } else {
+                            dst2[ii*ld+jj*1] = static_cast<U>(src[ii*kElemCols+jj]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    template<typename U, int w_x, int w_y, bool ACC=false>
+    METAL_FUNC void store_safe(device U* dst, const int ld, const short2 dst_tile_dims) const thread {
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < kTileRows_; i++) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < kTileCols_; j++) {
+                const thread frag_type& src = frag_at(i, j);
+                int off_x = (i * kFragRows) * w_x;
+                int off_y = (j * kFragCols) * w_y;
+                #pragma clang loop unroll(full)
+                for (short ii = 0; ii < kElemRows; ii++) {
+                    #pragma clang loop unroll(full)
+                    for (short jj = 0; jj < kElemCols; jj++) {
+                        if (off_x + ii < dst_tile_dims.y && (off_y + jj) < dst_tile_dims.x) {
+                            if constexpr (ACC) {
+                                dst[(off_x + ii) * ld + (off_y + jj)*1] += static_cast<U>(src[ii*kElemCols+jj]);
+                            } else {
+                                dst[(off_x + ii) * ld + (off_y + jj)*1] = static_cast<U>(src[ii*kElemCols+jj]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    template<int w_x, int w_y>
+    METAL_FUNC void store_atomic(device atomic_float* dst, const int ld) const thread {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < kTileRows_; i++) {
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < kTileCols_; j++) {
+                const thread frag_type& src = frag_at(i, j);
+                device atomic_float* dst2 = &(dst[(i * kFragRows) * w_x * ld + (j * kFragCols) * w_y]);
+                #pragma clang loop unroll(full)
+                for (short ii = 0; ii < kElemRows; ii++) {
+                    #pragma clang loop unroll(full)
+                    for (short jj = 0; jj < kElemCols; jj++) {
+                        atomic_fetch_add_explicit(&dst2[ii * ld + jj],
+                                                  static_cast<float>(src[ii * kElemCols + jj]),
+                                                  memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
+
+    template<int w_x, int w_y>
+    METAL_FUNC void store_safe_atomic(device atomic_float* dst, const int ld, const short2 dst_tile_dims) const thread {
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < kTileRows_; i++) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < kTileCols_; j++) {
+                const thread frag_type& src = frag_at(i, j);
+                int off_x = (i * kFragRows) * w_x;
+                int off_y = (j * kFragCols) * w_y;
+                #pragma clang loop unroll(full)
+                for (short ii = 0; ii < kElemRows; ii++) {
+                    #pragma clang loop unroll(full)
+                    for (short jj = 0; jj < kElemCols; jj++) {
+                        if (off_x + ii < dst_tile_dims.y && (off_y + jj) < dst_tile_dims.x) {
+                            atomic_fetch_add_explicit(&dst[(off_x + ii) * ld + (off_y + jj)],
+                                                      static_cast<float>(src[ii * kElemCols + jj]),
+                                                      memory_order_relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    template<typename U>
+    METAL_FUNC static void mma(thread frag_type& D,
+                               thread typename MMATile<U, 1, 1>::frag_type& A,
+                               thread typename MMATile<U, 1, 1>::frag_type& B,
+                               thread frag_type& C) {
+        typedef typename MMATile<U, 1, 1>::mat_type in_mat_type;
+        typedef typename MMATile<U, 1, 1>::frag_type in_frag_type;
+
+        mat_type D_mat;
+        in_mat_type A_mat;
+        in_mat_type B_mat;
+        mat_type C_mat;
+        reinterpret_cast<thread in_frag_type&>(A_mat.thread_elements()) = A;
+        reinterpret_cast<thread in_frag_type&>(B_mat.thread_elements()) = B;
+        reinterpret_cast<thread frag_type&>(C_mat.thread_elements()) = C;
+
+        simdgroup_multiply_accumulate(D_mat, A_mat, B_mat, C_mat);
+
+        D = reinterpret_cast<thread frag_type&>(D_mat.thread_elements());
+    }
+};
+
+template <typename T, typename U, int M, int N, int K>
+METAL_FUNC void tile_matmad(thread MMATile<T, M, N>& D,
+                            thread MMATile<U, M, K>& A,
+                            thread MMATile<U, K, N>& B,
+                            thread MMATile<T, M, N>& C) {
+    #pragma clang loop unroll(full)
+    for (short m = 0; m < M; ++m) {
+        #pragma clang loop unroll(full)
+        for (short n = 0; n < N; ++n) {
+            short n_serp = (m % 2) ? (N - 1 - n) : n;
+            #pragma clang loop unroll(full)
+            for (short k = 0; k < K; ++k) {
+                MMATile<T, M, N>::template mma<U>(D.frag_at(m, n_serp), A.frag_at(m, k), B.frag_at(k, n_serp), C.frag_at(m, n_serp));
+            }
+        }
+    }
+}
+
+template<typename AccumType, short TM, short TN, bool has_scale>
+struct ScaleGroupState {};
+
+template<typename AccumType, short TM, short TN>
+struct ScaleGroupState<AccumType, TM, TN, true>{
+    MMATile<AccumType, TM, TN> Gtile;  
+};
+
+template<typename T, uint BM, uint BN, uint BK, uint WM, uint WN, 
+         bool transpose_a, bool transpose_b, short lda_tgp, short ldb_tgp,
+         typename AccumType=float, bool has_scale=false>
+struct BlockMMA {
+    static constant constexpr short kFragSize = 8;
+    static constant constexpr short TM_stride = kFragSize * WM;
+    static constant constexpr short TN_stride = kFragSize * WN;
+    static constant constexpr short TM = BM / (kFragSize * WM);
+    static constant constexpr short TN = BN / (kFragSize * WN);
+    static constant constexpr short A_str_m = transpose_a ? 1 : lda_tgp; // M
+    static constant constexpr short A_str_k = transpose_a ? lda_tgp : 1; // K
+    static constant constexpr short B_str_k = transpose_b ? 1 : ldb_tgp; // K
+    static constant constexpr short B_str_n = transpose_b ? ldb_tgp : 1; // N
+    static constant constexpr short tile_stride_a = kFragSize * A_str_k;
+    static constant constexpr short tile_stride_b = kFragSize * B_str_k;
+
+    MMATile<T, TM, 1> Atile;
+    MMATile<T, 1, TN> Btile;
+    MMATile<AccumType, TM, TN> Ctile;
+
+    ScaleGroupState<AccumType, TM, TN, has_scale> group_state;
+
+    short sm;
+    short sn;
+    short As_offset;
+    short Bs_offset;
+
+    METAL_FUNC BlockMMA(ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+                        ushort simd_lane_id [[thread_index_in_simdgroup]]) thread {
+        // Determine thread position in simdgroup matrix
+        short tm = kFragSize * (simd_group_id / WN);
+        short tn = kFragSize * (simd_group_id % WN);
+
+        short2 simd_coord = get_coord(simd_lane_id);
+        sm = simd_coord.y;
+        sn = simd_coord.x;
+
+        // Determine thread and simdgroup offset
+        As_offset = (tm + sm) * A_str_m + (sn)*A_str_k; // M, K
+        Bs_offset = (sm)*B_str_k + (tn + sn) * B_str_n; // K, N
+        sm += tm;
+        sn += tn;
+    }
+
+    // (BM, BK) X (BK, BN) multiply accumulate function
+    METAL_FUNC void mma(const threadgroup T* As, const threadgroup T* Bs) thread {
+        // Adjust for simdgroup and thread location
+        As += As_offset;
+        Bs += Bs_offset;
+
+        // Iterate over BK in blocks of kFragSize
+        #pragma clang loop unroll(full)
+        for (ushort kk = 0; kk < BK; kk += kFragSize) {
+            simdgroup_barrier(mem_flags::mem_none);
+            Atile.template load<T, WM, 1, A_str_m, A_str_k>(As);
+            simdgroup_barrier(mem_flags::mem_none);
+            Btile.template load<T, 1, WN, B_str_k, B_str_n>(Bs);
+            simdgroup_barrier(mem_flags::mem_none);
+            if constexpr (has_scale) {
+                tile_matmad(group_state.Gtile, Atile, Btile, group_state.Gtile);
+            } else {
+                tile_matmad(Ctile, Atile, Btile, Ctile);
+            }
+            // Progress to next simdgroup tile
+            As += tile_stride_a;
+            Bs += tile_stride_b;
+        }
+    }
+
+    METAL_FUNC void flush_scale_group(device const float* sa,
+                                      device const float* sb,
+                                      const uint M,
+                                      const uint N,
+                                      const int c_row,
+                                      const int c_col,
+                                      const uint groups_k,
+                                      const uint g) thread {
+        if constexpr (has_scale) {
+            float sb_vals[TN];
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < TN; ++j) {
+                const uint col0 = uint(c_col + sn + j * kFragSize * WN);
+                sb_vals[j] = (col0 < N) ? sb[size_t(col0 >> 7) * size_t(groups_k) + size_t(g)] : 0.0f;
+            }
+            #pragma clang loop unroll(full)
+            for (short i = 0; i < TM; ++i) {
+                const uint row = uint(c_row + sm + i * kFragSize * WM);
+                const float sa_val = (row < M) ? sa[size_t(row) * size_t(groups_k) + size_t(g)] : 0.0f;
+                #pragma clang loop unroll(full)
+                for (short j = 0; j < TN; ++j) {
+                    const float scale = sa_val * sb_vals[j];
+                    thread typename MMATile<AccumType, TM, TN>::frag_type& c_frag = Ctile.frag_at(i, j);
+                    const thread typename MMATile<AccumType, TM, TN>::frag_type& g_frag = group_state.Gtile.frag_at(i, j);
+                    c_frag[0] = fma(g_frag[0], scale, c_frag[0]);
+                    c_frag[1] = fma(g_frag[1], scale, c_frag[1]);
+                }
+            }
+            group_state.Gtile.clear();
+        }
+    }
+
+    template<bool ACC=false>
+    METAL_FUNC void store(device AccumType* dst, const int ld) const thread {
+        Ctile.template store<AccumType, WM, WN, ACC>(dst + sm * ld + sn, ld);
+    }
+
+    template<bool ACC=false>
+    METAL_FUNC void store_safe(device AccumType* dst, const int ld, const short2 dst_tile_dims) const thread {
+        Ctile.template store_safe<AccumType, WM, WN, ACC>(dst + sm * ld + sn, ld, dst_tile_dims - short2(sn, sm));
+    }
+
+    METAL_FUNC void store_atomic(device atomic_float* dst, const int ld) const thread {
+        Ctile.template store_atomic<WM, WN>(dst + sm * ld + sn, ld);
+    }
+
+    METAL_FUNC void store_safe_atomic(device atomic_float* dst, const int ld, const short2 dst_tile_dims) const thread {
+        Ctile.template store_safe_atomic<WM, WN>(dst + sm * ld + sn, ld, dst_tile_dims - short2(sn, sm));
+    }
+};
+
+template<typename T, uint BK, bool transpose_a, bool transpose_b, bool align_m, bool align_n, bool align_k,
+         bool has_scale, typename loader_a_t, typename loader_b_t, typename mma_t>
+static METAL_FUNC void gemm_loop(
+        threadgroup T* As,
+        threadgroup T* Bs,
+        const int gemm_k_iters,
+        uint k_offset,
+        device const float* sa, 
+        device const float* sb,
+        const uint M, const uint N, const int c_row, const int c_col, const uint groups_k,
+        thread loader_a_t& loader_a,
+        thread loader_b_t& loader_b,
+        thread mma_t& mma_op,
+        thread const short& tgp_bm,
+        thread const short& tgp_bn,
+        thread const short& lbk) {
+    short2 tile_dims_A = transpose_a ? short2(tgp_bm, BK) : short2(BK, tgp_bm);
+    short2 tile_dims_B = transpose_b ? short2(BK, tgp_bn) : short2(tgp_bn, BK);
+    bool group_dirty = false;
+
+    for (int k = 0; k < gemm_k_iters; k++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (align_m) loader_a.load_unsafe();
+        else loader_a.load_safe(tile_dims_A);
+        if (align_n) loader_b.load_unsafe();
+        else loader_b.load_safe(tile_dims_B);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(As, Bs);
+        loader_a.next();
+        loader_b.next();
+
+        if (has_scale) {
+            group_dirty = true;
+            if (((k_offset + BK) & 127u) == 0u) { // 凑满一个 128 分组，立即反量化汇入 Ctile
+                mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, k_offset >> 7);
+                group_dirty = false;
+            }
+            k_offset += BK;
+        }
+    }
+
+    if (!align_k) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        short2 tile_dims_A_last = transpose_a ? short2(tgp_bm, lbk) : short2(lbk, tgp_bm);
+        short2 tile_dims_B_last = transpose_b ? short2(lbk, tgp_bn) : short2(tgp_bn, lbk);
+        loader_a.load_safe(tile_dims_A_last);
+        loader_b.load_safe(tile_dims_B_last);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(As, Bs);
+        if (has_scale) {
+            mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, k_offset >> 7);
+            group_dirty = false;
+        }
+    }
+
+    // 若 gemm_k_iters * BK 不是 128 的整数倍（例如尾部不足 128 或 Split-K 分片未按 128 对齐），收尾冲刷一次
+    if (has_scale && group_dirty) {
+        mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, (k_offset - BK) >> 7);
+    }
+}
+
+template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
+         uint BM, uint BN, uint BK, uint WM, uint WN, bool accum=false>
+[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
+void fp16_gemm_impl(
+    device const T* A          [[buffer(0)]],
+    device const T* B          [[buffer(1)]],
+    device const float* sa        [[buffer(2)]],
+    device const float* sb        [[buffer(3)]],
+    device float* D               [[buffer(4)]],
+    device const float* C         [[buffer(5)]],
+    constant uint& M              [[buffer(6)]],
+    constant uint& N              [[buffer(7)]],
+    constant uint& K              [[buffer(8)]],
+    constant uint& lda            [[buffer(9)]],
+    constant uint& ldb            [[buffer(10)]],
+    constant uint& ldd            [[buffer(11)]],
+    constant uint& tiles_m        [[buffer(12)]],
+    constant uint& tiles_n        [[buffer(13)]],
+    constant uint& swizzle_log    [[buffer(14)]],
+    constant uint& k_iter_aligned [[buffer(15)]],
+    constant uint& align_m        [[buffer(16)]],
+    constant uint& align_n        [[buffer(17)]],
+    constant uint& align_k        [[buffer(18)]],
+    uint simd_lane_id             [[thread_index_in_simdgroup]],
+    uint simd_group_id            [[simdgroup_index_in_threadgroup]],
+    uint3 tid                     [[threadgroup_position_in_grid]],
+    uint3 lid                     [[thread_position_in_threadgroup]]
+) {
+    (void)lid;
+    const uint tid_y = ((tid.y) << swizzle_log) + ((tid.x) & (1 << swizzle_log) - 1);
+    const uint tid_x = (tid.x) >> swizzle_log;
+    if (tiles_n <= tid_x || tiles_m <= tid_y) return;
+
+    A += tid.z;
+    B += tid.z;
+    D += tid.z;
+
+    constexpr short tgp_padding_a = 16 / sizeof(T);
+    constexpr short tgp_padding_b = 16 / sizeof(T);
+    constexpr short lda_tgp = (a_transpose ? BM : BK) + tgp_padding_a;
+    constexpr short ldb_tgp = (b_transpose ? BK : BN) + tgp_padding_b;
+    constexpr uint tgp_mem_size_a = (a_transpose ? BK : BM) * lda_tgp;
+    constexpr uint tgp_mem_size_b = (b_transpose ? BN : BK) * ldb_tgp;
+    constexpr uint tgp_size = WM * WN * 32;
+    threadgroup T As[tgp_mem_size_a];
+    threadgroup T Bs[tgp_mem_size_b];
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Find block in A, B, C
+    const int c_row = tid_y * BM;
+    const int c_col = tid_x * BN;
+    const size_t c_row_long = size_t(c_row);
+    const size_t c_col_long = size_t(c_col);
+
+    A += a_transpose ? c_row_long : c_row_long * lda;
+    B += b_transpose ? c_col_long * ldb : c_col_long;
+    D += c_row_long * ldd + c_col_long;
+
+    using mma_t = BlockMMA<T, BM, BN, BK, WM, WN, a_transpose, b_transpose, lda_tgp, ldb_tgp, float, has_scale>;
+    using loader_a_t = BlockLoader<T, a_transpose ? BK : BM, a_transpose ? BM : BK, lda_tgp, tgp_size, !a_transpose>;
+    using loader_b_t = BlockLoader<T, b_transpose ? BN : BK, b_transpose ? BK : BN, ldb_tgp, tgp_size, b_transpose>;
+
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+    thread loader_a_t loader_a(A, As, lda, simd_group_id, simd_lane_id);
+    thread loader_b_t loader_b(B, Bs, ldb, simd_group_id, simd_lane_id);
+
+    const short tgp_bm = align_m ? BM : short(min(BM, M - c_row));
+    const short tgp_bn = align_n ? BN : short(min(BN, N - c_col));
+    const uint groups_k = (K + 127u) >> 7;
+
+    if (!align_k) {
+        const int k_last = k_iter_aligned * BK;
+        const int k_remain = K - k_last;
+        const size_t k_jump_a = a_transpose ? lda * size_t(k_last) : size_t(k_last);
+        const size_t k_jump_b = b_transpose ? size_t(k_last) : ldb * size_t(k_last);
+
+        // Move loader source ahead to end
+        loader_a.src += k_jump_a;
+        loader_b.src += k_jump_b;
+
+        // load tile
+        const short2 tile_dims_A = a_transpose ? short2(tgp_bm, k_remain) : short2(k_remain, tgp_bm);
+        const short2 tile_dims_B = b_transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+
+        loader_a.load_safe(tile_dims_A);
+        loader_b.load_safe(tile_dims_B);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        mma_op.mma(As, Bs);
+        if (has_scale) mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, uint(k_last) >> 7);
+
+        // reset source back to start
+        loader_a.src -= k_jump_a;
+        loader_b.src -= k_jump_b;
+    }
+
+    const short leftover_bk = 0;
+    if ((align_m || tgp_bm == BM) && (align_n || tgp_bn == BN)) {
+        gemm_loop<T, BK, a_transpose, b_transpose, true, true, true, has_scale>(As, Bs, k_iter_aligned,
+                  0u, sa, sb, M, N, c_row, c_col, groups_k,
+                  loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        mma_op.template store<accum>(D, ldd);
+    } else if (align_n || tgp_bn == BN) {
+        gemm_loop<T, BK, a_transpose, b_transpose, false, true, true, has_scale>(As, Bs, k_iter_aligned,
+                  0u, sa, sb, M, N, c_row, c_col, groups_k,
+                  loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+    } else if (align_m || tgp_bm == BM) {
+        gemm_loop<T, BK, a_transpose, b_transpose, true, false, true, has_scale>(As, Bs, k_iter_aligned,
+                  0u, sa, sb, M, N, c_row, c_col, groups_k,
+                  loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+    } else {
+        gemm_loop<T, BK, a_transpose, b_transpose, false, false, true, has_scale>(As, Bs, k_iter_aligned,
+                  0u, sa, sb, M, N, c_row, c_col, groups_k,
+                  loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+    }
+}
+
+#define DEFINE_FP16_GEMM(T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp16_gemm_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>) \
+fp16_gemm_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
+
+DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, true, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
+DEFINE_FP16_GEMM(float, false, false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, false, "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, true,  "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1");
+
+template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
+         bool align_mn, bool align_k, uint BM, uint BN, uint BK, uint WM, uint WN>
+[[kernel, max_total_threads_per_threadgroup(WM*WN*32)]]
+void fp16_gemm_splitk_impl(
+    device const T* A          [[buffer(0)]],
+    device const T* B          [[buffer(1)]],
+    device const float* sa        [[buffer(2)]],
+    device const float* sb        [[buffer(3)]],
+    // device float* D               [[buffer(4)]],
+    device atomic_float* D        [[buffer(4)]],
+    device const float* C         [[buffer(5)]],
+    constant uint& M              [[buffer(6)]],
+    constant uint& N              [[buffer(7)]],
+    constant uint& K              [[buffer(8)]],
+    constant uint& lda            [[buffer(9)]],
+    constant uint& ldb            [[buffer(10)]],
+    constant uint& ldd            [[buffer(11)]],
+    constant uint& tiles_m        [[buffer(12)]],
+    constant uint& tiles_n        [[buffer(13)]],
+    constant uint& split_k_partitions       [[buffer(14)]],
+    constant uint& split_k_partition_stride [[buffer(15)]],
+    constant uint& split_k_partition_size   [[buffer(16)]],
+    constant uint& k_iter_aligned [[buffer(17)]],
+    uint simd_lane_id             [[thread_index_in_simdgroup]],
+    uint simd_group_id            [[simdgroup_index_in_threadgroup]],
+    uint3 tid                     [[threadgroup_position_in_grid]],
+    uint3 lid                     [[thread_position_in_threadgroup]]
+) {
+    (void)lid;
+    const uint tid_x = tid.x;
+    const uint tid_y = tid.y;
+    const uint tid_z = tid.z;
+    if (tiles_n <= tid_x || tiles_m <= tid_y) return;
+
+    constexpr short tgp_padding_a = 16 / sizeof(T);
+    constexpr short tgp_padding_b = 16 / sizeof(T);
+    constexpr short lda_tgp = (a_transpose ? BM : BK) + tgp_padding_a;
+    constexpr short ldb_tgp = (b_transpose ? BK : BN) + tgp_padding_b;
+    constexpr uint tgp_mem_size_a = (a_transpose ? BK : BM) * lda_tgp;
+    constexpr uint tgp_mem_size_b = (b_transpose ? BN : BK) * ldb_tgp;
+    constexpr uint tgp_size = WM * WN * 32;
+    threadgroup T As[tgp_mem_size_a];
+    threadgroup T Bs[tgp_mem_size_b];
+    threadgroup_barrier(mem_flags::mem_none);
+
+    // Find block in A, B, C
+    const int c_row = tid_y * BM;
+    const int c_col = tid_x * BN;
+    const int k_start = split_k_partition_size * tid_z;
+    const size_t c_row_long = size_t(c_row);
+    const size_t c_col_long = size_t(c_col);
+    const size_t k_start_long = size_t(k_start);
+
+    A += a_transpose ? (c_row_long + k_start_long * lda) : (k_start_long + c_row_long * lda);
+    B += b_transpose ? (k_start_long + c_col_long * ldb) : (c_col_long + k_start_long * ldb);
+    // D += (size_t(split_k_partition_stride)*tid_z) + c_row_long * ldd + c_col_long;
+    (void)split_k_partition_stride;
+    D += c_row_long * ldd + c_col_long;
+
+    using mma_t = BlockMMA<T, BM, BN, BK, WM, WN, a_transpose, b_transpose, lda_tgp, ldb_tgp, float, has_scale>;
+    using loader_a_t = BlockLoader<T, a_transpose ? BK : BM, a_transpose ? BM : BK, lda_tgp, tgp_size, !a_transpose>;
+    using loader_b_t = BlockLoader<T, b_transpose ? BN : BK, b_transpose ? BK : BN, ldb_tgp, tgp_size, b_transpose>;
+
+    thread mma_t mma_op(simd_group_id, simd_lane_id);
+    thread loader_a_t loader_a(A, As, lda, simd_group_id, simd_lane_id);
+    thread loader_b_t loader_b(B, Bs, ldb, simd_group_id, simd_lane_id);
+
+    const short tgp_bm = min(BM, M - c_row);
+    const short tgp_bn = min(BN, N - c_col);
+    short leftover_bk = K % BK;
+    const uint groups_k = (K + 127u) >> 7;
+
+    if (align_mn || (tgp_bm == BM && tgp_bn == BN)) {
+        gemm_loop<T, BK, a_transpose, b_transpose, true, true, true, has_scale>(As, Bs, k_iter_aligned, uint(k_start),
+                  sa, sb, M, N, c_row, c_col, groups_k, loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+    } else if (tgp_bn == BN) {
+        gemm_loop<T, BK, a_transpose, b_transpose, false, true, true, has_scale>(As, Bs, k_iter_aligned, uint(k_start),
+                    sa, sb, M, N, c_row, c_col, groups_k, loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+    } else if (tgp_bm == BM) {
+        gemm_loop<T, BK, a_transpose, b_transpose, true, false, true, has_scale>(As, Bs, k_iter_aligned, uint(k_start),
+                    sa, sb, M, N, c_row, c_col, groups_k, loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+    } else {
+        gemm_loop<T, BK, a_transpose, b_transpose, false, false, true, has_scale>(As, Bs, k_iter_aligned, uint(k_start),
+                    sa, sb, M, N, c_row, c_col, groups_k, loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((tid_z + 1) == split_k_partitions) {
+        int gemm_k_remain = (int(K) - int(k_start + split_k_partition_size)) / int(BK);
+        if (!align_k || gemm_k_remain > 0) {
+            gemm_loop<T, BK, a_transpose, b_transpose, false, false, align_k, has_scale>(As, Bs, gemm_k_remain, 
+                    uint(k_start + split_k_partition_size), sa, sb, M, N, c_row, c_col, groups_k,
+                    loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        }
+    }
+
+    if (align_mn || (tgp_bm == BM && tgp_bn == BN)) {
+        // mma_op.store(D, ldd);
+        mma_op.store_atomic(D, ldd);
+    } else {
+        // mma_op.store_safe(D, ldd, short2(tgp_bn, tgp_bm));
+        mma_op.store_safe_atomic(D, ldd, short2(tgp_bn, tgp_bm));
+    }
+}
+
+#define DEFINE_FP16_GEMM_SPLITK(T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN, NAME) \
+template [[host_name(NAME)]] [[kernel]] \
+decltype(fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>) \
+fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
+
+DEFINE_FP16_GEMM_SPLITK(half, true, false, true, true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_GEMM_SPLITK(float, false, false, true, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_GEMM_SPLITK(float, false, false, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");

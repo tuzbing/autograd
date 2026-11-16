@@ -74,7 +74,7 @@ public:
         NSString *source = [NSString stringWithUTF8String:buffer.str().c_str()];
         MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
         options.fastMathEnabled = YES;
-        options.languageVersion = MTLLanguageVersion3_0;
+        options.languageVersion = MTLLanguageVersion3_2;
         NSError *compile_error = nil;
         id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&compile_error];
         if (library == nil) {
@@ -132,6 +132,16 @@ public:
             @"grad_norm_sq",
             @"adamw_step", @"adamw8bit_step",
             @"mini_update_v", @"adamw_mini8bit_step",
+            @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
+            @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
+            @"fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
+            @"fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2",
+            @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1",
+            @"fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1",
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
@@ -549,9 +559,16 @@ public:
             [enc setBytes:&args[i] length:sizeof(uint32_t) atIndex:base_idx + i];
         }
 
-        MTLSize grid = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
-        MTLSize tgSize = MTLSizeMake(tg_size, 1, 1);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        const bool is_gemm = kernel_name.rfind("fp16_gemm", 0) == 0 || kernel_name.rfind("fp32_gemm", 0) == 0;
+        if (is_gemm) {
+            MTLSize threadgroups = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
+            MTLSize threads_per_threadgroup = MTLSizeMake(tg_size, 1, 1);
+            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_threadgroup];
+        } else {
+            MTLSize grid = MTLSizeMake(grid_size_x, grid_size_y, grid_size_z);
+            MTLSize tgSize = MTLSizeMake(tg_size, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tgSize];
+        }
     }
 
     static uint32_t float_bits(float value) {

@@ -1,4 +1,3 @@
-
 export NANOCHAT_BASE_DIR="$HOME/Documents/code/autograd/sft_data"
 export HF_HOME="$NANOCHAT_BASE_DIR/huggingface"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"

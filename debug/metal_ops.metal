@@ -13861,6 +13861,8 @@ DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt
 DEFINE_FP16_GEMM(half, true, false, true, 64, 64, 16, 2, 2, true, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
 DEFINE_FP16_GEMM(float, false, false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
 DEFINE_FP16_GEMM(float, false, false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, false, "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0");
+DEFINE_FP16_GEMM(float, false, true, false, 32, 64, 16, 2, 2, true,  "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1");
 
 template<typename T, bool has_scale, bool a_transpose, bool b_transpose, 
          bool align_mn, bool align_k, uint BM, uint BN, uint BK, uint WM, uint WN>
@@ -13975,6 +13977,7 @@ fp16_gemm_splitk_impl<T, HAS_SCALE, TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K,
 
 DEFINE_FP16_GEMM_SPLITK(half, true, false, true, true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP16_GEMM_SPLITK(float, false, false, true, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_GEMM_SPLITK(float, false, false, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");
 
 
 

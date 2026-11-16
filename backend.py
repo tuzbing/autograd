@@ -10,6 +10,8 @@ from op import FusedRMSNormFlashAttentionOp, FusedLinearAddOp, KVCacheAttentionO
 from op import LastPositionLMHeadOp, DecodeStateOp, DecodeFinishedOp
 from op import FusedRMSNormGQAOp, FusedRMSNormLinearCrossEntropyOp
 from utils import xavier_uniform, reduce_broadcast_grad, tensor_to_numpy, is_materialized, grad_shape_matches, mul_bcast_kind, f32_bits, bf16_bits
+from gemm import fp16_gemm_kernel_name
+from scratch import align_up
 
 import metal_ext
 
@@ -3048,7 +3050,7 @@ class MetalBackend(Backend):
 
 	def metal_fused_linear_ce_forward(self, inputs, outputs, scratch=None):
 		x, w, targets = inputs[0], inputs[1], inputs[2]
-		row_scale = inputs[3] if len(inputs) == 4 else None
+		row_scale = inputs[3] if len(inputs) > 3 else None
 		out_loss = outputs[0]
 		
 		N = x.shape[0] * x.shape[1] if len(x.shape) == 3 else x.shape[0]
@@ -3114,15 +3116,48 @@ class MetalBackend(Backend):
 
 			# 3) dX = dlogits([rows, V]) @ W([V, C])
 			if x.requires_grad:
-				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-					[logits.ptr.offset, w.storage.ptr.offset, x.grad.storage.ptr.offset+row_base*C*itemsize],
-					[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
+				x_grad_offset = x.grad.storage.ptr.offset+row_base*C*itemsize
+				if use_fp16_gemm:
+					cfg = scratch.gemm_configs[("dx", rows, False)]
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
+					if cfg["is_splitk"]:
+						self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
+					dx_args = (
+						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+						if cfg["is_splitk"] else
+						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					)
+					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+						[logits.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, w.storage.ptr.offset, 0, 0, x_grad_offset, x_grad_offset],
+						dx_args,
+						cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+				else:
+					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
+						[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
 
 			# 4) dW += dlogits.T([V, rows])@X([rows, C])
 			if w.requires_grad and not dw_bf16:
-				self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-					[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
-					[1, V, C, rows, 1, 0, 0, 0], 1.0, 1.0 if accumulate or row_base != 0 else 0.0)
+				with_accum = bool(accumulate or row_base != 0)
+				if use_fp16_gemm:
+					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
+					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp32")
+					if cfg["is_splitk"] and not with_accum:
+						self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
+					dw_args = (
+						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+						if cfg["is_splitk"] else
+						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+					)
+					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_offset, logits.ptr.offset, x_offset, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+				else:
+					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
+						[1, V, C, rows, 1, 0, 0, 0], 1.0, float(with_accum))
 
 		self.ctx.dispatch_with_args_3d('fused_linear_ce_forward_reduce',
 			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],

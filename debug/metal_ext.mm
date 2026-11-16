@@ -135,10 +135,14 @@ public:
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
             @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
             @"fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
+            @"fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2",
             @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
             @"fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1",
             @"fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0",
             @"fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0",
+            @"fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a1",
+
         ];
         for (NSString* name in kernel_names) {
             id<MTLFunction> func = [library newFunctionWithName:name];
