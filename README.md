@@ -17,7 +17,9 @@ a) compile metal
 b) train gpt2
 	python test_train_gpt2.py
 
+## Training Logs
 
+```text
 
 pretrain logs
 NANOCHAT_BASE_DIR="$HOME/.cache/nanochat" \
@@ -162,3 +164,5 @@ step 00082/05000 (1.64%) | loss: 6.804447 | lrm: 1.00 | dt: 2191.51ms | tok/sec:
 step 00083/05000 (1.66%) | loss: 6.786666 | lrm: 1.00 | dt: 2219.49ms | tok/sec: 7,381 | bf16_mfu: 10.89 | epoch: 1 pq: 0 rg: 5 | total time: 2.68m | eta: 180.6m
 step 00084/05000 (1.68%) | loss: 6.762711 | lrm: 1.00 | dt: 2206.17ms | tok/sec: 7,426 | bf16_mfu: 10.95 | epoch: 1 pq: 0 rg: 5 | total time: 2.72m | eta: 180.6m
 step 00085/05000 (1.70%) | loss: 6.747888 | lrm: 1.00 | dt: 2195.62ms | tok/sec: 7,462 | bf16_mfu: 11.00 | epoch: 1 pq: 0 rg: 5 | total time: 2.76m | eta: 180.6m
+
+```
