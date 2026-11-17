@@ -5,7 +5,7 @@ from math import prod
 from op import AddOp, MulOp, RsqrtOp, SoftmaxOp, GELUOp, LayerNormOp, MatMulOp, PermuteOp, TransposeOp, CrossEntropyLossOp
 from op import ScaledDotProductAttenOp, FusedLinearCrossEntropyOp, FusedMLPOp, FusedQKVProjOp, FlashAttentionOp
 from op import FusedRMSNormLinearCrossEntropyOp
-from gemm import get_fp16_gemm_config
+from gemm import get_fp16_gemm_config, fp16_gemm_k_tile, build_fp16_k_tile_configs
 
 def align_up(n, align=64):
 	return (n + align - 1) // align * align
@@ -85,12 +85,11 @@ def pack_slots_reuse(groups, align=64):
 	return ScratchLayout(slots, align_up(offset, align))
 
 def fp16_gemm_quant_size(M, N, K):
-	groups_k = (K + 127) // 128
-	groups_n = (N + 127) // 128
-	qa_size = align_up(M*K*2, 16)
-	qb_size = align_up(N*K*2, 16)
-	sa_size = align_up(M*groups_k*4, 16)
-	sb_size = align_up(groups_n*groups_k*4, 16) 
+	kt = fp16_gemm_k_tile(M, N, K)
+	qa_size = align_up(M*kt*2, 16)
+	qb_size = align_up(N*kt*2, 16)
+	sa_size = align_up(M*4, 16)
+	sb_size = align_up(N*4, 16) 
 	return qa_size + qb_size + sa_size + sb_size
 
 def plan_node_scratch(node, use_f16_gemm=False):
@@ -207,38 +206,36 @@ def plan_node_scratch(node, use_f16_gemm=False):
 			row_sizes = [logits_rows]
 			if N % logits_rows:
 				row_sizes.append(N % logits_rows)
+			ce_fp16 = use_f16_gemm and len(inputs) == 3
+			gemm_dtype = "fp16" if ce_fp16 else "fp32"
+			dl_lda = (2 * V) if ce_fp16 else None
 			for rows in row_sizes:
-				configs[("logits", rows, False)] = get_fp16_gemm_config(M=rows, N=V, K=C, with_accum=False, b_transpose=True, dtype="fp32")
-			if use_f16_gemm:
-				max_quant_bytes = 0
-				if x.requires_grad:
-					# dx[rows, C] = dlogits[rows, V] @ W[V, C]
-					max_quant_bytes = fp16_gemm_quant_size(logits_rows, C, V)
-					for rows in row_sizes:
-						# configs[("dx", rows, False)] = get_fp16_gemm_config(M=rows, N=C, K=V, with_accum=False, b_transpose=True)
-						configs[("dx", rows, False)] = get_fp16_gemm_config(M=rows, N=C, K=V, with_accum=False, b_transpose=False, dtype="fp32")
-				if w.requires_grad:
-					# dW[V,C] += dlogits.T[V,rows] @ X[rows,C]
-					max_quant_bytes = max(fp16_gemm_quant_size(V, C, logits_rows), max_quant_bytes)
-					for rows in row_sizes:
-						for accum in (False, True):
-							# configs["dw", rows, accum] = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=accum, b_transpose=True)
-							configs["dw", rows, accum] = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+				configs[("logits", rows, False)] = get_fp16_gemm_config(M=rows, N=V, K=C, with_accum=False, b_transpose=True, dtype=gemm_dtype)
+			if x.requires_grad:
+				# dx[rows, C] = dlogits[rows, V] @ W[V, C]
+				for rows in row_sizes:
+					configs[("dx", rows, False)] = get_fp16_gemm_config(M=rows, N=C, K=V, with_accum=False, b_transpose=False, dtype=gemm_dtype, lda=dl_lda)
+			if w.requires_grad:
+				# dW[V,C] += dlogits.T[V,rows] @ X[rows,C]
+				for rows in row_sizes:
+					for accum in (False, True):
+						configs["dw", rows, accum] = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype=gemm_dtype, lda=dl_lda)
 
-				capacity = logits_rows * V
-				tile_rows = min(logits_rows, capacity - C)
-				tile_v = min(V, capacity // (tile_rows + C))
-				tile_row_sizes = [tile_rows] + ([N % tile_rows] if N % tile_rows else [])
-				tile_col_sizes = [tile_v] + ([V % tile_v] if V % tile_v else [])
-				for rows in tile_row_sizes:
-					for cols in tile_col_sizes:
-						configs[("logits_tile", rows, cols)] = get_fp16_gemm_config(M=rows, N=cols, K=C, with_accum=False, b_transpose=True, dtype="fp32")
-						for accum in (False, True):
-							configs[("dw_tile", cols, rows, accum)] = get_fp16_gemm_config(M=cols, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+			capacity = logits_rows * V
+			tile_rows = min(logits_rows, capacity - C)
+			tile_v = min(V, capacity // (tile_rows + C))
+			tile_row_sizes = [tile_rows] + ([N % tile_rows] if N % tile_rows else [])
+			tile_col_sizes = [tile_v] + ([V % tile_v] if V % tile_v else [])
+			for rows in tile_row_sizes:
+				for cols in tile_col_sizes:
+					configs[("logits_tile", rows, cols)] = get_fp16_gemm_config(M=rows, N=cols, K=C, with_accum=False, b_transpose=True, dtype="fp32")
+					for accum in (False, True):
+						configs[("dw_tile", cols, rows, accum)] = get_fp16_gemm_config(M=cols, N=C, K=rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
 
-				# if max_quant_bytes > 0:
-				if max_quant_bytes > 0 and any(c.get("dtype") == "fp16" for c in configs.values()):
-					slots.append(("gemm_quant", (max_quant_bytes,), np.uint8))
+			if ce_fp16:
+				sdl_len = max(2, logits_rows, V) if (x.requires_grad or w.requires_grad) else 2
+				quant_bytes = align_up(N*C*2, 16) + align_up(V*C*2, 16) + align_up(max(logits_rows, C)*4, 16) + align_up(max(V, C)*4, 16) + align_up(sdl_len*4, 16)
+				slots.append(("gemm_quant", (quant_bytes,), np.uint8))
 
 			fwd = pack_slots(slots)
 			fwd.gemm_configs = configs
@@ -351,6 +348,22 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
 			])
+			if use_f16_gemm:
+				N = prod(x.shape[:-1])
+				C = x.shape[-1]
+				H2 = wgu.shape[-1]
+				bwd_configs = {
+					"gu": fwd.gemm_configs["gu"],
+					"dhidden": get_fp16_gemm_config(M=N, N=H, K=C, with_accum=False, a_transpose=False, b_transpose=True, dtype="fp32"),
+					"dx_norm": get_fp16_gemm_config(M=N, N=C, K=H2, with_accum=False, a_transpose=False, b_transpose=True, dtype="fp32"),
+				}
+				for accum in (False, True):
+					if wdown.requires_grad:
+						bwd_configs[("dwdown", accum)] = get_fp16_gemm_config(M=H, N=C, K=N, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+					main_rows = (N // 16) * 16
+					if wgu.requires_grad and main_rows > 0:
+						bwd_configs[("dwgu", accum)] = get_fp16_gemm_config(M=C, N=H2, K=main_rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+				bwd.gemm_configs = bwd_configs
 		else:
 			fwd = pack_slots([
 				# RMSNorm

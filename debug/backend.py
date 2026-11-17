@@ -152,6 +152,79 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			if real_in.requires_grad and real_in.grad is not None:
 				self.copy_from_host(real_in.grad, host_in.grad.storage.data)
 
+	def _dispatch_fp32_gemm(self, cfg, with_accum, buf_ids, offsets, m, n, k):
+		kernel = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp32")
+		# print(f"need kernel {kernel}")
+		if cfg["is_splitk"] and not with_accum:
+			self.ctx.fill_scalar("fill_scalar_kernel", [buf_ids[2]], [offsets[2]], 0.0, m * n)
+		args = (
+			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+			if cfg["is_splitk"] else
+			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+		)
+		self.ctx.dispatch_with_args_3d(kernel, buf_ids, offsets, args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+
+	def _quantize_fp16_colwise(self, src_id, src_off, q_id, q_off, s_off, rows, cols, src_ld):
+		groups_c = (cols + 63) // 64
+		groups_r = max(1, min(32, (rows + 15) // 16))
+		self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [s_off], 0.0, cols)
+		self.ctx.dispatch_with_args_3d("fp16_quant_col_max",
+			[src_id, q_id],
+			[src_off, s_off],
+			[rows, cols, src_ld], groups_c * 256, groups_r, 1, 256)
+		self.ctx.dispatch_with_args_3d("fp16_bits_to_scale",
+			[q_id], [s_off], [cols], cols, 1, 1, min(cols, 256))
+		self.ctx.dispatch_with_args_3d("fp16_quant_colwise",
+			[src_id, q_id, q_id],
+			[src_off, q_off, s_off],
+			[rows, cols, src_ld], groups_c * 256, groups_r, 1, 256)
+
+	def _dispatch_fp16_gemm_raw(self, cfg, with_accum, buf_ids, offsets, m, n, k):
+		kernel = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp16")
+		# print(f"Need kernel {kernel}")
+		if cfg["is_splitk"] and not with_accum:
+			self.ctx.fill_scalar("fill_scalar_kernel", [buf_ids[4]], [offsets[4]], 0.0, m * n)
+		args = (
+			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
+			if cfg["is_splitk"] else
+			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+		)
+		self.ctx.dispatch_with_args_3d(kernel, buf_ids, offsets, args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+
+	def _dispatch_fp16_gemm(self, tiled_cfg, with_accum, buf_ids, offsets, quant_buf, m, n, k, a_src_ld=None, b_src_ld=None):
+		kt = tiled_cfg["k_tile"]
+		a_T = tiled_cfg["a_transpose"]
+		b_T = tiled_cfg["b_transpose"]
+		sub_cfgs = tiled_cfg["sub_configs"]
+		a_ld = (m if a_T else k) if a_src_ld is None else a_src_ld
+		b_ld = (k if b_T else n) if b_src_ld is None else b_src_ld
+		q_id = quant_buf.ptr.buffer_id
+		qa_off = quant_buf.ptr.offset
+		qb_off = qa_off + align_up(m * kt * 2, 16)
+		sa_off = qb_off + align_up(n * kt * 2, 16)
+		sb_off = sa_off + align_up(m * 4, 16)
+		for k0 in range(0, k, kt):
+			k_sub = min(kt, k - k0)
+			a_off = offsets[0] + (k0 * a_ld * 4 if a_T else k0 * 4)
+			b_off = offsets[1] + (k0 * 4 if b_T else k0 * b_ld * 4)
+			if a_T:
+				self._quantize_fp16_colwise(buf_ids[0], a_off, q_id, qa_off, sa_off, k_sub, m, a_ld)
+			else:
+				self.ctx.dispatch_with_args_3d("fp16_quant_rowwise", [buf_ids[0], q_id, q_id],
+					[a_off, qa_off, sa_off],
+					[m, k_sub, a_ld], 256, m, 1, 256)
+			if b_T:
+				self.ctx.dispatch_with_args_3d("fp16_quant_rowwise", [buf_ids[1], q_id, q_id],
+					[b_off, qb_off, sb_off],
+					[n, k_sub, b_ld], 256, n, 1, 256)
+			else:
+				self._quantize_fp16_colwise(buf_ids[1], b_off, q_id, qb_off, sb_off, k_sub, n, b_ld)
+			step_accum = bool(with_accum or k0 > 0)
+			self._dispatch_fp16_gemm_raw(sub_cfgs[k_sub], step_accum,
+				[q_id, q_id, q_id, q_id, buf_ids[2]],
+				[qa_off, qb_off, sa_off, sb_off, offsets[2]],
+				m, n, k_sub)
+
 	def fa_recompute_dispatch(self, head_dim, seq_len):
 		if head_dim <= 0 or head_dim > 128:
 			raise ValueError(f"fused LN/FA recompute only supports 0 < head_dim <= 128, got {head_dim}")
@@ -376,6 +449,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
 		use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
+		ce_fp16 = use_fp16_gemm and row_scale is None
 		need_grad = x.requires_grad or w.requires_grad
 		if row_scale is None:
 			kernel_name = "fused_linear_ce_logits_to_dlogits"
@@ -384,38 +458,59 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		else:
 			kernel_name = "fused_linear_ce_logits_to_dlogits_row_scaled"
 
+		if ce_fp16:
+			q_buf = scratch["gemm_quant"]
+			q_id = q_buf.ptr.buffer_id
+			xq_off = q_buf.ptr.offset
+			wq_off = xq_off + align_up(N * C * 2, 16)
+			sx_off = wq_off + align_up(V * C * 2, 16)
+			sw_off = sx_off + align_up(max(chunk_rows, C) * 4, 16)
+			sdl_off = sw_off + align_up(max(V, C) * 4, 16)
+
+			x_numel, w_numel = N * C, V * C
+			gx = max(1, min(64, (x_numel + 1023) // 1024)) * 256
+			gw = max(1, min(64, (w_numel + 1023) // 1024)) * 256
+			# 借用 sdl_off 前 2 个 uint32 暂存 X 和 W 的 max_bits
+			self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [sdl_off], 0.0, 2)
+			self.ctx.dispatch_with_args_3d("fp16_quant_tensor_max",
+				[x.storage.ptr.buffer_id, q_id], [x.storage.ptr.offset, sdl_off],
+				[x_numel], gx, 1, 1, 256)
+			self.ctx.dispatch_with_args_3d("fp16_quant_tensor_cast",
+				[x.storage.ptr.buffer_id, q_id, q_id, q_id],
+				[x.storage.ptr.offset, xq_off, sdl_off, sx_off],
+				[x_numel, max(chunk_rows, C)], gx, 1, 1, 256)
+			self.ctx.dispatch_with_args_3d("fp16_quant_tensor_max",
+				[w.storage.ptr.buffer_id, q_id], [w.storage.ptr.offset, sdl_off + 4],
+				[w_numel], gw, 1, 1, 256)
+			self.ctx.dispatch_with_args_3d("fp16_quant_tensor_cast",
+				[w.storage.ptr.buffer_id, q_id, q_id, q_id],
+				[w.storage.ptr.offset, wq_off, sdl_off + 4, sw_off],
+				[w_numel, max(V, C)], gw, 1, 1, 256)
+			if need_grad:
+				self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [sdl_off], scale / 32768.0, max(chunk_rows, V))
+
 		for row_base in range(0, N, chunk_rows):
 			rows = min(chunk_rows, N - row_base)
 			x_offset = x.storage.ptr.offset + row_base*C*itemsize
 
 			# 1) logits = X_chunk([rows, C]) @ W.T ([C, V])
-			if use_fp16_gemm:
-				cfg = scratch.gemm_configs[("logits", rows, False)]
-				logits_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
-				if cfg["is_splitk"]:
-					self.ctx.fill_scalar("fill_scalar_kernel", [logits.ptr.buffer_id], [logits.ptr.offset], 0.0, rows * V)
-				logits_args = (
-					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-					if cfg["is_splitk"] else
-					[rows, V, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-				)
-				self.ctx.dispatch_with_args_3d(logits_kernel,
-					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
-					[x_offset, w.storage.ptr.offset, logits.ptr.offset],
-					logits_args,
-					cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
+			if ce_fp16:
+				self._dispatch_fp16_gemm_raw(scratch.gemm_configs[("logits", rows, False)], False,
+					[q_id, q_id, q_id, q_id, logits.ptr.buffer_id],
+					[xq_off + row_base * C * 2, wq_off, sx_off, sw_off, logits.ptr.offset],
+					rows, V, C)
 			else:
-				self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+				self._dispatch_fp32_gemm(scratch.gemm_configs[("logits", rows, False)], False,
 					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
 					[x_offset, w.storage.ptr.offset, logits.ptr.offset],
-					[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+					rows, V, C)
 
 			# 2) row_loss/lse/dlogits
 			if row_scale is None:
 				self.ctx.dispatch_with_args_3d(kernel_name,
 					[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
 					[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
-					[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+					[rows, V, row_base, scale_bits, int(need_grad)|(int(ce_fp16)<<1)], 256, rows, 1, 256)
 			else:
 				inp_vars = [logits, targets.storage, row_loss, lse, row_scale.storage]
 				self.ctx.dispatch_with_args_3d(kernel_name,
@@ -428,110 +523,30 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			# 3) dX = dlogits([rows, V]) @ W([V, C])
 			if x.requires_grad:
 				x_grad_offset = x.grad.storage.ptr.offset+row_base*C*itemsize
-				if use_fp16_gemm:
-					# gemm_quant = scratch["gemm_quant"]
-					# quant_base = gemm_quant.ptr.offset
-					# group_k = (V+127)//128
-					# group_n = (C+127)//128
-					# qa_size = align_up(rows*V*2, 16)
-					# qb_size = align_up(V*C*2, 16)
-					# sa_size = align_up(rows*group_k*4, 16)
-					# self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
-					# 	[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-					# 	[logits.ptr.offset, quant_base, quant_base + qa_size + qb_size],
-					# 	[rows, V, V, 1], 256, group_k, (rows+31)//32, 256)
-
-					# self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
-					# 	[w.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-					# 	[w.storage.ptr.offset, gemm_quant.ptr.offset+qa_size, gemm_quant.ptr.offset+qa_size+qb_size+sa_size],
-					# 	[C, V, 1, C], 256, group_k, group_n, 256)
-
-					# cfg = scratch.gemm_configs[("dx", rows, False)]
-					# dbg_kernel_name = fp16_gemm_kernel_name(cfg, False)
-					# if cfg["is_splitk"]:
-					# 	self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
-					# dx_args = (
-					# 	[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-					# 	if cfg["is_splitk"] else
-					# 	[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					# )
-					# self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-					# 	[gemm_quant.ptr.buffer_id] * 4 + [x.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-					# 	[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, x_grad_offset, x_grad_offset],
-					# 	dx_args,
-					# 	cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-
-					cfg = scratch.gemm_configs[("dx", rows, False)]
-					dbg_kernel_name = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
-					print(f"dx need kernel {dbg_kernel_name}")
-					if cfg["is_splitk"]:
-						self.ctx.fill_scalar("fill_scalar_kernel", [x.grad.storage.ptr.buffer_id], [x_grad_offset], 0.0, rows * C)
-					dx_args = (
-						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-						if cfg["is_splitk"] else
-						[rows, C, V, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					)
-					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+				if ce_fp16:
+					self._dispatch_fp16_gemm_raw(scratch.gemm_configs[("dx", rows, False)], False,
+						[logits.ptr.buffer_id, q_id, q_id, q_id, x.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, wq_off, sdl_off, sw_off, x_grad_offset],
+						rows, C, V)
+				else:
+					self._dispatch_fp32_gemm(scratch.gemm_configs[("dx", rows, False)], False,
 						[logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
-						dx_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-				else:
-					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
-						[logits.ptr.offset, w.storage.ptr.offset, x_grad_offset],
-						[1, rows, C, V, 0, 0, 0, 0], 1.0, 0.0)
+						rows, C, V)
 
 			# 4) dW += dlogits.T([V, rows])@X([rows, C])
 			if w.requires_grad and not dw_bf16:
 				with_accum = bool(accumulate or row_base != 0)
-				if use_fp16_gemm:
-					# gemm_quant = scratch["gemm_quant"]
-					# quant_base = gemm_quant.ptr.offset
-					# group_k = (rows + 127) // 128
-					# group_n = (C + 127) // 128
-					# qa_size = align_up(V*rows*2, 16)
-					# qb_size = align_up(rows*C*2, 16)
-					# sa_size = align_up(V*group_k*4, 16)
-					# self.ctx.dispatch_with_args_3d("per_token_cast_to_fp16",
-					# 	[logits.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-					# 	[logits.ptr.offset, quant_base, quant_base+qa_size+qb_size],
-					# 	[V, rows, 1, V], 256, group_k, (V+31)//32, 256)
-					# self.ctx.dispatch_with_args_3d("per_block_cast_to_fp16",
-					# 	[x.storage.ptr.buffer_id, gemm_quant.ptr.buffer_id, gemm_quant.ptr.buffer_id],
-					# 	[x_offset, quant_base+qa_size, quant_base+qa_size+qb_size+sa_size],
-					# 	[C, rows, 1, C], 256, group_k, group_n, 256)
-
-					# cfg = scratch.gemm_configs[("dw", rows, with_accum)]
-					# dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum)
-					# if cfg["is_splitk"] and not with_accum:
-					# 	self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
-					# dw_args = (
-					# 	[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-					# 	if cfg["is_splitk"] else
-					# 	[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					# )
-					# self.ctx.dispatch_with_args_3d(dbg_kernel_name,
-					# 	[gemm_quant.ptr.buffer_id]*4 + [w.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-					# 	[quant_base, quant_base+qa_size, quant_base+qa_size+qb_size, quant_base+qa_size+qb_size+sa_size, w.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
-					# 	dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-
-					cfg = scratch.gemm_configs[("dw", rows, with_accum)]
-					dbg_kernel_name = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp32")
-					print(f"dw need kernel {dbg_kernel_name}")
-					if cfg["is_splitk"] and not with_accum:
-						self.ctx.fill_scalar("fill_scalar_kernel", [w.grad.storage.ptr.buffer_id], [w.grad.storage.ptr.offset], 0.0, V * C)
-					dw_args = (
-						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-						if cfg["is_splitk"] else
-						[V, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					)
-					self.ctx.dispatch_with_args_3d(dbg_kernel_name,
+				if ce_fp16:
+					self._dispatch_fp16_gemm_raw(scratch.gemm_configs[("dw", rows, with_accum)], with_accum,
+						[logits.ptr.buffer_id, q_id, q_id, q_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, xq_off + row_base * C * 2, sdl_off, sx_off, w.grad.storage.ptr.offset],
+						V, C, rows)
+				else:
+					self._dispatch_fp32_gemm(scratch.gemm_configs[("dw", rows, with_accum)], with_accum,
 						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
-						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-				else:
-					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-						[logits.ptr.offset, x_offset, w.grad.storage.ptr.offset],
-						[1, V, C, rows, 1, 0, 0, 0], 1.0, float(with_accum))
+						V, C, rows)
 
 		self.ctx.dispatch_with_args_3d('fused_linear_ce_forward_reduce',
 			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
@@ -555,26 +570,10 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				x_offset = x.storage.ptr.offset + row_base*C*4
 
 				# 1. 重算当前token块, 词表块的logits
-				if use_fp16_gemm:
-					cfg = scratch.gemm_configs[("logits_tile", rows, cols)]
-					logits_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
-					if cfg["is_splitk"]:
-						self.ctx.fill_scalar("fill_scalar_kernel", [logits.ptr.buffer_id], [logits.ptr.offset], 0.0, rows * cols)
-					logits_args = (
-						[rows, cols, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-						if cfg["is_splitk"] else
-						[rows, cols, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					)
-					self.ctx.dispatch_with_args_3d(logits_kernel,
-						[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
-						[x_offset, w_offset, logits.ptr.offset],
-						logits_args,
-						cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-				else:
-					self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
-						[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
-						[x_offset, w_offset, logits.ptr.offset],
-						[rows, C, cols], 256, (rows+63)//64, (cols+95)//96, 256)
+				self._dispatch_fp32_gemm(scratch.gemm_configs[("logits_tile", rows, cols)], False,
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_offset, w_offset, logits.ptr.offset],
+					rows, cols, C)
 
 				# 2. 使用阶段一保存的全词表LSE原地生成当前块的dlogits
 				count = rows * cols
@@ -585,23 +584,10 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 				# 3. dW_tile += dlogits_tile.T @ X_chunk
 				with_accum = row_base != 0
-				if use_fp16_gemm:
-					cfg = scratch.gemm_configs[("dw_tile", cols, rows, with_accum)]
-					dw_kernel = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp32")
-					if cfg["is_splitk"] and not with_accum:
-						self.ctx.fill_scalar("fill_scalar_kernel", [logits.ptr.buffer_id], [dw_offset], 0.0, cols * C)
-					dw_args = (
-						[cols, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-						if cfg["is_splitk"] else
-						[cols, C, rows, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-					)
-					self.ctx.dispatch_with_args_3d(dw_kernel,
-						[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
-						[logits.ptr.offset, x_offset, dw_offset],
-						dw_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-				else:
-					self.ctx.dispatch_gemm_mps([logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
-						[logits.ptr.offset, x_offset, dw_offset], [1, cols, C, rows, 1, 0, 0, 0], 1.0, 0.0 if row_base == 0 else 1.0)
+				self._dispatch_fp32_gemm(scratch.gemm_configs[("dw_tile", cols, rows, with_accum)], with_accum,
+					[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[logits.ptr.offset, x_offset, dw_offset],
+					cols, C, rows)
 
 			# 4. 转换成BF16
 			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
@@ -764,7 +750,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		    	[C, eps_bits], N*256, 1, 1, 256)
 
 	    # GU = X_norm @ Wgu
-	    if use_fp16_gemm:
+	    if False:
 	    	cfg = scratch.gemm_configs["gu"]
 	    	gu_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
 	    	print(f"gu need {gu_kernel}")
@@ -792,7 +778,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	        [N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4 , 256))
 
 	    # OUT = HIDDEN @ Wdown
-	    if use_fp16_gemm:
+	    if False:
 	    	cfg = scratch.gemm_configs["out"]
 	    	out_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
 	    	print(f"out need {out_kernel}")
@@ -831,6 +817,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		eps = out.op.op.eps 
 		eps_bits = struct.unpack('<i', struct.pack('<f', eps))[0]
 		accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
+		use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
 
 		gu = scratch['gu']
 		hidden = scratch['hidden']
@@ -983,9 +970,14 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				[C, eps_bits], N*256, 1, 1, 256)
 
 		# 6. GU = X_norm @ Wgu
-		self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-			[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
-			[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
+		if use_fp16_gemm:
+			self._dispatch_fp32_gemm(scratch.gemm_configs["gu"], False,
+					[x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+					[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset], N, H2, C)
+		else:
+			self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+				[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+				[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 		# 7. hidden = SiLU(gate)*up
 		if down_bf16:
@@ -1012,14 +1004,24 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 		# 8. dWdown = HIDDEN.T @ dOUT
 		if wdown.requires_grad and not down_bf16:
-			self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
-				[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
-				[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))	
+			if False:
+				self._dispatch_fp32_gemm(scratch.gemm_configs[("dwdown", bool(accumulate))], bool(accumulate),
+						[hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
+						[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset], H, C, N)
+			else:
+				self.ctx.dispatch_gemm_mps([hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
+					[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
+					[1, H, C, N, 1, 0, 0, 0], 1.0, float(accumulate))	
 
 		# 9. hidden -> dHidden
-		self.ctx.dispatch_gemm_mps([out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-			[out.grad.storage.ptr.offset, wdown.storage.ptr.offset, hidden.ptr.offset],
-			[1, N, H, C, 0, 1, 0, 0], 1.0, 0.0)
+		if use_fp16_gemm:
+			self._dispatch_fp32_gemm(scratch.gemm_configs["dhidden"], False,
+				[out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+				[out.grad.storage.ptr.offset, wdown.storage.ptr.offset, hidden.ptr.offset], N, H, C)
+		else:
+			self.ctx.dispatch_gemm_mps([out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+				[out.grad.storage.ptr.offset, wdown.storage.ptr.offset, hidden.ptr.offset],
+				[1, N, H, C, 0, 1, 0, 0], 1.0, 0.0)
 
 		# 10. gu -> dGU
 		self.ctx.dispatch_with_args_3d("swiglu_backward_inplace_kernel",
@@ -1058,9 +1060,14 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				main_rows = (N // 16) * 16
 				tail_rows = N - main_rows
 				if main_rows > 0:
-					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
-						[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
-						[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
+					if use_fp16_gemm:
+						self._dispatch_fp32_gemm(scratch.gemm_configs[("dwgu", bool(accumulate))], bool(accumulate),
+									[x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+									[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset], C, H2, main_rows)
+					else:
+						self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+							[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+							[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
 				if tail_rows:
 					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_tail",
 						[x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
@@ -1073,9 +1080,14 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		else:
 			dx_norm_storage = tmp_dx
 
-		self.ctx.dispatch_gemm_mps([gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, dx_norm_storage.ptr.buffer_id],
-			[gu.ptr.offset, wgu.storage.ptr.offset, dx_norm_storage.ptr.offset],
-			[1, N, C, H2, 0, 1, 0, 0], 1.0, 0.0)
+		if use_fp16_gemm:
+			self._dispatch_fp32_gemm(scratch.gemm_configs["dx_norm"], False,
+						[gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, dx_norm_storage.ptr.buffer_id],
+						[gu.ptr.offset, wgu.storage.ptr.offset, dx_norm_storage.ptr.offset], N, C, H2)
+		else:
+			self.ctx.dispatch_gemm_mps([gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, dx_norm_storage.ptr.buffer_id],
+				[gu.ptr.offset, wgu.storage.ptr.offset, dx_norm_storage.ptr.offset],
+				[1, N, C, H2, 0, 1, 0, 0], 1.0, 0.0)
 
 		# 13. RMSNorm backward
 		if norm_weight is not None and norm_weight.requires_grad:

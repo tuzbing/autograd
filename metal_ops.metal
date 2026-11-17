@@ -9179,10 +9179,44 @@ kernel void fused_linear_ce_logits_to_dlogits(
         lse_out[global_row]  = target_valid ? lse_value : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);   // 保护 tid0 读 target logit 先于覆写
-    if (write_grad == 0u) return;
+    if ((write_grad&1u) == 0u) return;
     // ================= 第二遍：float4 读 + float4 写 =================
     const float scale    = as_type<float>(scale_bits);
     const uint  target_u = target_valid ? uint(target) : V;   // V 作哨兵，永不命中
+    if ((write_grad & 2u) != 0u) {
+        device half* row_h = reinterpret_cast<device half*>(logits + logits_base);
+        for (uint base0 = 0u; base0 < vec_end; base0 += kVecSpan) {
+            const uint base = base0 + tid * 4u;
+            half4 out_h = half4(0.0h);
+            if (target_valid && base + 4u <= V) {
+                const float4 x = float4(*reinterpret_cast<device const packed_float4*>(
+                    logits + logits_base + base));
+                float4 out = exp2((x - shared_max) * kLog2E) * inverse_sum;
+                if (target_u >= base && target_u < base + 4u) {
+                    const uint jj = target_u - base;
+                    out -= float4(float(jj == 0u), float(jj == 1u),
+                                  float(jj == 2u), float(jj == 3u));
+                }
+                out_h = half4(out * 32768.0f);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+            if (base + 4u <= V) {
+                *reinterpret_cast<device packed_half4*>(row_h + base) = packed_half4(out_h);
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        const uint p = vec_end + tid;
+        float tail_val = 0.0f;
+        if (target_valid && p < V) {
+            tail_val = exp2((logits[logits_base + p] - shared_max) * kLog2E) * inverse_sum;
+            if (p == target_u) tail_val -= 1.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (p < V) {
+            row_h[p] = half(tail_val * 32768.0f);
+        }
+        return;
+    }
     for (uint base = tid * 4u; base + 4u <= V; base += kVecSpan) {
         float4 out = float4(0.0f);
         if (target_valid) {
@@ -12991,6 +13025,258 @@ METAL_FUNC half fp16_quant_value(float x, float inv_scale, bool invalid)
     return half(scaled);
 }
 
+kernel void fp16_quant_rowwise(
+    device const float* src [[buffer(0)]],
+    device half* dst        [[buffer(1)]],
+    device float* scales    [[buffer(2)]],
+    constant uint& R        [[buffer(3)]],
+    constant uint& C        [[buffer(4)]],
+    constant uint& src_ld   [[buffer(5)]],
+    uint3 tg                [[threadgroup_position_in_grid]],
+    uint3 tid3              [[thread_position_in_threadgroup]],
+    uint lane               [[thread_index_in_simdgroup]],
+    uint sg                 [[simdgroup_index_in_threadgroup]]
+) {
+    const uint row = tg.y;
+    if (row >= R) return;
+
+    const uint tid = tid3.x;
+    device const float* row_src = src + ulong(row) * ulong(src_ld);
+    device half* row_dst = dst + ulong(row) * ulong(C);
+
+    threadgroup uint sg_max[8];
+    uint max_bits = 0u;
+    const uint c_vec_end = C & ~3u;
+
+    for (uint c = tid * 4u; c < c_vec_end; c += 1024u) {
+        const float4 v = *reinterpret_cast<device const packed_float4*>(row_src + c);
+        max_bits = max(max_bits, fp16_quant_abs_bits(v.x));
+        max_bits = max(max_bits, fp16_quant_abs_bits(v.y));
+        max_bits = max(max_bits, fp16_quant_abs_bits(v.z));
+        max_bits = max(max_bits, fp16_quant_abs_bits(v.w));
+    }
+    for (uint c = c_vec_end + tid; c < C; c += 256u) {
+        max_bits = max(max_bits, fp16_quant_abs_bits(row_src[c]));
+    }
+
+    max_bits = simd_max(max_bits);
+    if (lane == 0u) sg_max[sg] = max_bits;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_max_bits = (lane < 8u) ? sg_max[lane] : 0u;
+    row_max_bits = simd_max(row_max_bits);
+
+    const bool invalid = row_max_bits >= 0x7f800000u;
+    const float scale = fp16_quant_scale(row_max_bits);
+    const float inv_scale = 1.0f / scale;
+    if (tid == 0u) {
+        scales[row] = invalid ? as_type<float>(0x7fc00000u) : scale;
+    }
+
+    for (uint c = tid * 4u; c < c_vec_end; c += 1024u) {
+        const float4 v = *reinterpret_cast<device const packed_float4*>(row_src + c);
+        const half4 h(
+            fp16_quant_value(v.x, inv_scale, invalid),
+            fp16_quant_value(v.y, inv_scale, invalid),
+            fp16_quant_value(v.z, inv_scale, invalid),
+            fp16_quant_value(v.w, inv_scale, invalid)
+        );
+        *reinterpret_cast<device packed_half4*>(row_dst + c) = h;
+    }
+    for (uint c = c_vec_end + tid; c < C; c += 256u) {
+        row_dst[c] = fp16_quant_value(row_src[c], inv_scale, invalid);
+    }
+}
+
+kernel void fp16_quant_col_max(
+    device const float* src       [[buffer(0)]],
+    device atomic_uint* scale_bits[[buffer(1)]],
+    constant uint& R              [[buffer(2)]],
+    constant uint& C              [[buffer(3)]],
+    constant uint& src_ld         [[buffer(4)]],
+    uint3 tg                      [[threadgroup_position_in_grid]],
+    uint3 tid3                    [[thread_position_in_threadgroup]],
+    uint3 tgs                     [[threadgroups_per_grid]]
+) {
+    const uint tid = tid3.x;
+    const uint tx = tid & 15u;
+    const uint ty = tid >> 4;
+    const uint col0 = tg.x * 64u + tx * 4u;
+    const uint r_step = tgs.y * 16u;
+
+    uint4 local_max = uint4(0u);
+    if (col0 + 3u < C) {
+        for (uint r = tg.y * 16u + ty; r < R; r += r_step) {
+            const float4 v = *reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0);
+            local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x));
+            local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y));
+            local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z));
+            local_max.w = max(local_max.w, fp16_quant_abs_bits(v.w));
+        }
+    } else if (col0 < C) {
+        for (uint r = tg.y * 16u + ty; r < R; r += r_step) {
+            device const float* row_src = src + ulong(r) * ulong(src_ld);
+            if (col0 + 0u < C) local_max.x = max(local_max.x, fp16_quant_abs_bits(row_src[col0 + 0u]));
+            if (col0 + 1u < C) local_max.y = max(local_max.y, fp16_quant_abs_bits(row_src[col0 + 1u]));
+            if (col0 + 2u < C) local_max.z = max(local_max.z, fp16_quant_abs_bits(row_src[col0 + 2u]));
+        }
+    }
+
+    threadgroup uint4 smax[16][16];
+    smax[ty][tx] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ty == 0u && col0 < C) {
+        uint4 acc = smax[0][tx];
+        #pragma unroll
+        for (uint u = 1u; u < 16u; ++u) {
+            acc = max(acc, smax[u][tx]);
+        }
+        if (col0 + 0u < C) atomic_fetch_max_explicit(&scale_bits[col0 + 0u], acc.x, memory_order_relaxed);
+        if (col0 + 1u < C) atomic_fetch_max_explicit(&scale_bits[col0 + 1u], acc.y, memory_order_relaxed);
+        if (col0 + 2u < C) atomic_fetch_max_explicit(&scale_bits[col0 + 2u], acc.z, memory_order_relaxed);
+        if (col0 + 3u < C) atomic_fetch_max_explicit(&scale_bits[col0 + 3u], acc.w, memory_order_relaxed);
+    }
+}
+
+kernel void fp16_bits_to_scale(
+    device uint* scale_bits [[buffer(0)]],
+    constant uint& C        [[buffer(1)]],
+    uint gid                [[thread_position_in_grid]]
+) {
+    if (gid >= C) return;
+    const uint mb = scale_bits[gid];
+    const float sc = (mb >= 0x7f800000u) ? as_type<float>(0x7fc00000u) : fp16_quant_scale(mb);
+    reinterpret_cast<device float*>(scale_bits)[gid] = sc;
+}
+
+kernel void fp16_quant_colwise(
+    device const float* src    [[buffer(0)]],
+    device half* dst           [[buffer(1)]],
+    device const float* scales [[buffer(2)]],
+    constant uint& R           [[buffer(3)]],
+    constant uint& C           [[buffer(4)]],
+    constant uint& src_ld      [[buffer(5)]],
+    uint3 tg                   [[threadgroup_position_in_grid]],
+    uint3 tid3                 [[thread_position_in_threadgroup]],
+    uint3 tgs                  [[threadgroups_per_grid]]
+) {
+    const uint tid = tid3.x;
+    const uint tx = tid & 15u;
+    const uint ty = tid >> 4;
+    const uint col0 = tg.x * 64u + tx * 4u;
+    if (col0 >= C) return;
+
+    float4 inv4 = float4(1.0f);
+    bool4 invld4 = bool4(false);
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        if (col0 + j < C) {
+            const float sc = scales[col0 + j];
+            const bool invld = (as_type<uint>(sc) & 0x7fffffffu) >= 0x7f800000u;
+            invld4[j] = invld;
+            inv4[j] = invld ? 0.0f : (1.0f / sc);
+        }
+    }
+
+    const uint r_step = tgs.y * 16u;
+    if (col0 + 3u < C) {
+        for (uint r = tg.y * 16u + ty; r < R; r += r_step) {
+            const float4 v = *reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0);
+            const half4 h(
+                fp16_quant_value(v.x, inv4.x, invld4.x),
+                fp16_quant_value(v.y, inv4.y, invld4.y),
+                fp16_quant_value(v.z, inv4.z, invld4.z),
+                fp16_quant_value(v.w, inv4.w, invld4.w)
+            );
+            *reinterpret_cast<device packed_half4*>(dst + ulong(r) * ulong(C) + col0) = h;
+        }
+    } else {
+        for (uint r = tg.y * 16u + ty; r < R; r += r_step) {
+            device const float* row_src = src + ulong(r) * ulong(src_ld);
+            device half* row_dst = dst + ulong(r) * ulong(C);
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                if (col0 + j < C) {
+                    row_dst[col0 + j] = fp16_quant_value(row_src[col0 + j], inv4[j], invld4[j]);
+                }
+            }
+        }
+    }
+}
+
+kernel void fp16_quant_tensor_max(
+    device const float* src       [[buffer(0)]],
+    device atomic_uint* max_bits  [[buffer(1)]],
+    constant uint& numel          [[buffer(2)]],
+    uint tid                      [[thread_index_in_threadgroup]],
+    uint lane                     [[thread_index_in_simdgroup]],
+    uint sg                       [[simdgroup_index_in_threadgroup]],
+    uint3 tg_pos                  [[threadgroup_position_in_grid]],
+    uint3 tgs                     [[threadgroups_per_grid]]
+) {
+    threadgroup uint sg_max[8];
+    uint local_max = 0u;
+    const uint vec_end = numel & ~3u;
+    const uint vec_stride = tgs.x * 1024u;
+    for (uint i = (tg_pos.x * 256u + tid) * 4u; i < vec_end; i += vec_stride) {
+        const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        local_max = max(local_max, fp16_quant_abs_bits(v.x));
+        local_max = max(local_max, fp16_quant_abs_bits(v.y));
+        local_max = max(local_max, fp16_quant_abs_bits(v.z));
+        local_max = max(local_max, fp16_quant_abs_bits(v.w));
+    }
+    for (uint i = vec_end + tg_pos.x * 256u + tid; i < numel; i += tgs.x * 256u) {
+        local_max = max(local_max, fp16_quant_abs_bits(src[i]));
+    }
+    local_max = simd_max(local_max);
+    if (lane == 0u) sg_max[sg] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        uint tg_max = (lane < 8u) ? sg_max[lane] : 0u;
+        tg_max = simd_max(tg_max);
+        if (lane == 0u && tg_max > 0u) {
+            atomic_fetch_max_explicit(&max_bits[0], tg_max, memory_order_relaxed);
+        }
+    }
+}
+
+kernel void fp16_quant_tensor_cast(
+    device const float* src      [[buffer(0)]],
+    device half* dst             [[buffer(1)]],
+    device const uint* max_bits  [[buffer(2)]],
+    device float* scales         [[buffer(3)]],
+    constant uint& numel         [[buffer(4)]],
+    constant uint& scale_len     [[buffer(5)]],
+    uint gid                     [[thread_position_in_grid]],
+    uint total_threads           [[threads_per_grid]]
+) {
+    const uint mb = max_bits[0];
+    const bool invalid = mb >= 0x7f800000u;
+    const float sc = fp16_quant_scale(mb);
+    const float out_sc = invalid ? as_type<float>(0x7fc00000u) : sc;
+    const float inv_sc = 1.0f / sc;
+
+    for (uint s = gid; s < scale_len; s += total_threads) {
+        scales[s] = out_sc;
+    }
+    const uint vec_end = numel & ~3u;
+    const uint vec_stride = total_threads * 4u;
+    for (uint i = gid * 4u; i < vec_end; i += vec_stride) {
+        const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        const half4 h(
+            fp16_quant_value(v.x, inv_sc, invalid),
+            fp16_quant_value(v.y, inv_sc, invalid),
+            fp16_quant_value(v.z, inv_sc, invalid),
+            fp16_quant_value(v.w, inv_sc, invalid)
+        );
+        *reinterpret_cast<device packed_half4*>(dst + i) = packed_half4(h);
+    }
+    for (uint i = vec_end + gid; i < numel; i += total_threads) {
+        dst[i] = fp16_quant_value(src[i], inv_sc, invalid);
+    }
+}
+
 kernel void per_token_cast_to_fp16(
     device const float* src       [[buffer(0)]],
     device half* dst              [[buffer(1)]],
@@ -13275,6 +13561,19 @@ struct BlockLoader {
     }
 
     METAL_FUNC void load_unsafe() const thread {
+        if constexpr (sizeof(T) == 2) {
+            constexpr short fast_align = (sizeof(T) * vec_size >= 16) ? 16 : (sizeof(T) * vec_size);
+            if (((uint(src_ld) * uint(sizeof(T))) & uint(fast_align - 1)) == 0u) {
+                struct alignas(fast_align) FastReadVector {
+                    uint8_t v[sizeof(T) * vec_size];
+                };
+                #pragma clang loop unroll(full)
+                for (short i = 0; i < BROWS; i += TROWS) {
+                    *((threadgroup FastReadVector*)(&dst[i * dst_ld])) = *((const device FastReadVector*)(&src[i * src_ld]));
+                }
+                return;
+            }
+        }
         #pragma clang loop unroll(full)
         for (short i = 0; i < BROWS; i += TROWS) {
             *((threadgroup ReadVector*)(&dst[i * dst_ld])) = *((const device ReadVector*)(&src[i * src_ld]));
@@ -13524,11 +13823,6 @@ METAL_FUNC void tile_matmad(thread MMATile<T, M, N>& D,
 template<typename AccumType, short TM, short TN, bool has_scale>
 struct ScaleGroupState {};
 
-template<typename AccumType, short TM, short TN>
-struct ScaleGroupState<AccumType, TM, TN, true>{
-    MMATile<AccumType, TM, TN> Gtile;  
-};
-
 template<typename T, uint BM, uint BN, uint BK, uint WM, uint WN, 
          bool transpose_a, bool transpose_b, short lda_tgp, short ldb_tgp,
          typename AccumType=float, bool has_scale=false>
@@ -13587,46 +13881,40 @@ struct BlockMMA {
             simdgroup_barrier(mem_flags::mem_none);
             Btile.template load<T, 1, WN, B_str_k, B_str_n>(Bs);
             simdgroup_barrier(mem_flags::mem_none);
-            if constexpr (has_scale) {
-                tile_matmad(group_state.Gtile, Atile, Btile, group_state.Gtile);
-            } else {
-                tile_matmad(Ctile, Atile, Btile, Ctile);
-            }
+            tile_matmad(Ctile, Atile, Btile, Ctile);
             // Progress to next simdgroup tile
             As += tile_stride_a;
             Bs += tile_stride_b;
         }
     }
 
-    METAL_FUNC void flush_scale_group(device const float* sa,
-                                      device const float* sb,
-                                      const uint M,
-                                      const uint N,
-                                      const int c_row,
-                                      const int c_col,
-                                      const uint groups_k,
-                                      const uint g) thread {
+    METAL_FUNC void apply_epilogue_scale(device const float* sa,
+                                         device const float* sb,
+                                         const uint M,
+                                         const uint N,
+                                         const int c_row,
+                                         const int c_col) thread {
         if constexpr (has_scale) {
-            float sb_vals[TN];
+            float2 sb_vals[TN];
             #pragma clang loop unroll(full)
             for (short j = 0; j < TN; ++j) {
                 const uint col0 = uint(c_col + sn + j * kFragSize * WN);
-                sb_vals[j] = (col0 < N) ? sb[size_t(col0 >> 7) * size_t(groups_k) + size_t(g)] : 0.0f;
+                sb_vals[j] = float2(
+                    (col0 < N) ? sb[col0] : 0.0f,
+                    (col0 + 1u < N) ? sb[col0 + 1u] : 0.0f
+                );
             }
             #pragma clang loop unroll(full)
             for (short i = 0; i < TM; ++i) {
                 const uint row = uint(c_row + sm + i * kFragSize * WM);
-                const float sa_val = (row < M) ? sa[size_t(row) * size_t(groups_k) + size_t(g)] : 0.0f;
+                const float sa_val = (row < M) ? sa[row] : 0.0f;
                 #pragma clang loop unroll(full)
                 for (short j = 0; j < TN; ++j) {
-                    const float scale = sa_val * sb_vals[j];
                     thread typename MMATile<AccumType, TM, TN>::frag_type& c_frag = Ctile.frag_at(i, j);
-                    const thread typename MMATile<AccumType, TM, TN>::frag_type& g_frag = group_state.Gtile.frag_at(i, j);
-                    c_frag[0] = fma(g_frag[0], scale, c_frag[0]);
-                    c_frag[1] = fma(g_frag[1], scale, c_frag[1]);
+                    c_frag[0] *= sa_val * sb_vals[j].x;
+                    c_frag[1] *= sa_val * sb_vals[j].y;
                 }
             }
-            group_state.Gtile.clear();
         }
     }
 
@@ -13680,15 +13968,6 @@ static METAL_FUNC void gemm_loop(
         mma_op.mma(As, Bs);
         loader_a.next();
         loader_b.next();
-
-        if (has_scale) {
-            group_dirty = true;
-            if (((k_offset + BK) & 127u) == 0u) { // 凑满一个 128 分组，立即反量化汇入 Ctile
-                mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, k_offset >> 7);
-                group_dirty = false;
-            }
-            k_offset += BK;
-        }
     }
 
     if (!align_k) {
@@ -13699,15 +13978,6 @@ static METAL_FUNC void gemm_loop(
         loader_b.load_safe(tile_dims_B_last);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(As, Bs);
-        if (has_scale) {
-            mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, k_offset >> 7);
-            group_dirty = false;
-        }
-    }
-
-    // 若 gemm_k_iters * BK 不是 128 的整数倍（例如尾部不足 128 或 Split-K 分片未按 128 对齐），收尾冲刷一次
-    if (has_scale && group_dirty) {
-        mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, (k_offset - BK) >> 7);
     }
 }
 
@@ -13785,7 +14055,6 @@ static METAL_FUNC void gemm_core(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         mma_op.mma(As, Bs);
-        if (has_scale) mma_op.flush_scale_group(sa, sb, M, N, c_row, c_col, groups_k, uint(k_last) >> 7);
 
         // reset source back to start
         loader_a.src -= k_jump_a;
@@ -13797,21 +14066,25 @@ static METAL_FUNC void gemm_core(
         gemm_loop<T, BK, a_transpose, b_transpose, true, true, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
         mma_op.template store<accum>(D, ldd);
     } else if (align_n || tgp_bn == BN) {
         gemm_loop<T, BK, a_transpose, b_transpose, false, true, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
         mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
     } else if (align_m || tgp_bm == BM) {
         gemm_loop<T, BK, a_transpose, b_transpose, true, false, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
         mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
     } else {
         gemm_loop<T, BK, a_transpose, b_transpose, false, false, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
+        if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
         mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
     }
 }
@@ -13883,8 +14156,8 @@ void fp16_scaled_gemm(
     uint simd_group_id            [[simdgroup_index_in_threadgroup]],
     uint3 tid                     [[threadgroup_position_in_grid]]
 ) {
-    threadgroup half As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
-    threadgroup half Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
+    alignas(16) threadgroup half As[gemm_tgp_mem_size_a<half, a_transpose, BM, BK>()];
+    alignas(16) threadgroup half Bs[gemm_tgp_mem_size_b<half, b_transpose, BN, BK>()];
     gemm_core<half, true, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum>(
         As, Bs, A, B, sa, sb, D,
         M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
@@ -13904,6 +14177,13 @@ fp16_scaled_gemm<TRANSPOSE_A, TRANSPOSE_B, BM, BN, BK, WM, WN, ACC>;
 
 DEFINE_FP16_SCALED_GEMM(false, true, 64, 64, 16, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
 DEFINE_FP16_SCALED_GEMM(false, true, 64, 64, 16, 2, 2, true,  "fp16_gemm_nt_bm64_bn64_bk16_wm2_wn2_a1");
+DEFINE_FP16_SCALED_GEMM(false, false, 64, 64, 32, 2, 2, false, "fp16_gemm_nn_bm64_bn64_bk32_wm2_wn2_a0");
+DEFINE_FP16_SCALED_GEMM(false, false, 64, 64, 32, 2, 2, true,  "fp16_gemm_nn_bm64_bn64_bk32_wm2_wn2_a1");
+
+DEFINE_FP16_SCALED_GEMM(false, true, 64, 64, 32, 2, 2, false, "fp16_gemm_nt_bm64_bn64_bk32_wm2_wn2_a0");
+DEFINE_FP16_SCALED_GEMM(true, false, 64, 64, 32, 2, 2, false, "fp16_gemm_tn_bm64_bn64_bk32_wm2_wn2_a0");
+DEFINE_FP16_SCALED_GEMM(true, false, 64, 64, 32, 2, 2, true,  "fp16_gemm_tn_bm64_bn64_bk32_wm2_wn2_a1");
+
 DEFINE_FP32_GEMM(false, true, 64, 64, 16, 2, 2, false, "fp32_gemm_nt_bm64_bn64_bk16_wm2_wn2_a0");
 DEFINE_FP32_GEMM(false, true, 32, 64, 16, 2, 2, false, "fp32_gemm_nt_bm32_bn64_bk16_wm2_wn2_a0");
 DEFINE_FP32_GEMM(true, false, 32, 64, 16, 2, 2, false, "fp32_gemm_tn_bm32_bn64_bk16_wm2_wn2_a0");
@@ -13998,6 +14278,7 @@ static METAL_FUNC void gemm_splitk_core(
         }
     }
 
+    if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
     if (align_mn || (tgp_bm == BM && tgp_bn == BN)) {
         // mma_op.store(D, ldd);
         mma_op.store_atomic(D, ldd);
@@ -14063,8 +14344,8 @@ void fp16_scaled_gemm_splitk(
     uint simd_group_id                      [[simdgroup_index_in_threadgroup]],
     uint3 tid                               [[threadgroup_position_in_grid]]
 ) {
-    threadgroup half As[gemm_tgp_mem_size_a<half, a_transpose, BM, BK>()];
-    threadgroup half Bs[gemm_tgp_mem_size_b<half, b_transpose, BN, BK>()];
+    alignas(16) threadgroup half As[gemm_tgp_mem_size_a<half, a_transpose, BM, BK>()];
+    alignas(16) threadgroup half Bs[gemm_tgp_mem_size_b<half, b_transpose, BN, BK>()];
     gemm_splitk_core<half, true, a_transpose, b_transpose, align_mn, align_k, BM, BN, BK, WM, WN>(
         As, Bs, A, B, sa, sb, D, M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
         split_k_partitions, split_k_partition_stride, split_k_partition_size, k_iter_aligned,
@@ -14081,7 +14362,13 @@ template [[host_name(NAME)]] [[kernel]] \
 decltype(fp16_scaled_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>) \
 fp16_scaled_gemm_splitk<TRANSPOSE_A, TRANSPOSE_B, ALIGN_MN, ALIGN_K, BM, BN, BK, WM, WN>;
 
-DEFINE_FP16_SCALED_GEMM_SPLITK(false, true,  true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP32_GEMM_SPLITK(false, true,  true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP32_GEMM_SPLITK(false, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP32_GEMM_SPLITK(false, false, true, false, 32, 32, 16, 2, 2, "fp32_gemm_splitk_nntn_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP32_GEMM_SPLITK(true, false, true, true, 32, 32, 16, 2, 2, "fp32_gemm_splitk_tntt_bm32_bn32_bk16_wm2_wn2");
+
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, true,  true, true, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, true,  true,  32, 32, 16, 2, 2, "fp16_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, false, true,  32, 32, 16, 2, 2, "fp16_gemm_splitk_nnnt_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, true,  false, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nntn_bm32_bn32_bk16_wm2_wn2");
+DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, false, false, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nnnn_bm32_bn32_bk16_wm2_wn2");
