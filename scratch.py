@@ -331,18 +331,46 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		hidden_shape = x.shape[:-1] + (H,)
 
 		if x.device == 'mps':
-			fwd = pack_slots([
+			fwd_slots = [
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
-			])
+			]
 			if use_f16_gemm:
 				N = prod(x.shape[:-1])
 				C = x.shape[-1]
 				H2 = wgu.shape[-1]
+				gu_cap = (N * H2 * 4) & ~15
+				hid_cap = (N * H * 4) & ~15
+				s1_bytes = align_up(N * 4, 16)
+				xq_bytes = align_up(N * C * 2, 16)
+				max_h2 = max(1, (hid_cap - s1_bytes - xq_bytes - 32) // (C * 2 + 4))
+				h2_tile = min(H2, (max_h2 // 64) * 64 if max_h2 >= 64 else max(1, (max_h2 // 8) * 8))
+				wgu_fwd_bytes = fp16_quant_bytes(C, h2_tile, h2_tile)
+
+				max_cf = max(1, (gu_cap - 32) // (H * 2 + 4))
+				c_fwd_tile = min(C, (max_cf // 64) * 64 if max_cf >= 64 else max(1, (max_cf // 8) * 8))
+				wdown_fwd_bytes = fp16_quant_bytes(H, c_fwd_tile, c_fwd_tile)
+
+				need_hid = max(align_up(N * H * 2, 16), xq_bytes + wgu_fwd_bytes) + s1_bytes
+				if need_hid > hid_cap or wdown_fwd_bytes > gu_cap:
+					fwd_slots.append(('gemm_quant', (align_up(s1_bytes + max(xq_bytes + wgu_fwd_bytes, wdown_fwd_bytes), 64),), np.uint8))
+
+				h2_sizes = sorted({min(h2_tile, H2 - j0) for j0 in range(0, H2, h2_tile)})
+				cf_sizes = sorted({min(c_fwd_tile, C - c0) for c0 in range(0, C, c_fwd_tile)})
+				fwd = pack_slots(fwd_slots)
 				fwd.gemm_configs = {
-					"gu": get_fp16_gemm_config(M=N, N=H2, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32"),
-					"out": get_fp16_gemm_config(M=N, N=C, K=H, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32")
+					"mlp_fwd_shape": (h2_tile, c_fwd_tile),
+					"gu": {
+						j: get_fp16_gemm_config(M=N, N=j, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp16", ldd=H2)
+						for j in h2_sizes
+					},
+					"out": {
+						c: get_fp16_gemm_config(M=N, N=c, K=H, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp16", ldd=C)
+						for c in cf_sizes
+					},
 				}
+			else:
+				fwd = pack_slots(fwd_slots)
 			bwd_slots = [
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
@@ -385,7 +413,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				h_sizes = sorted({min(h_tile, H - h0) for h0 in range(0, H, h_tile)})
 				c_sizes = sorted({min(c_tile, C - c0) for c0 in range(0, C, c_tile)})
 				bwd_configs = {
-					"gu": fwd.gemm_configs["gu"],
+					"gu": get_fp16_gemm_config(M=N, N=H2, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32"),
 					"mlp_shape": (chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes),
 					"dhidden": {
 						(r, h): get_fp16_gemm_config(M=r, N=h, K=C, a_transpose=False, b_transpose=True, dtype="fp16", ldd=H)

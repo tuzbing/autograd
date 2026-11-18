@@ -3412,7 +3412,7 @@ kernel void fused_rmsnorm_mlp_forward_kernel_bm32(
 kernel void rmsnorm_forward(
     device const float* x [[buffer(0)]],
     device float* out [[buffer(1)]],
-    constant uint& C [[buffer(2)]],
+    constant uint& C_packed [[buffer(2)]],
     constant uint& eps_bits [[buffer(3)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
@@ -3423,122 +3423,70 @@ kernel void rmsnorm_forward(
     constexpr uint kThreads = 256u;
     constexpr uint kSimdWidth = 32u;
     constexpr uint kMaxSimdGroups = kThreads / kSimdWidth;
+    const bool out_fp16 = (C_packed & 0x80000000u) != 0u;
+    const uint C = C_packed & 0x7fffffffu;
 
     if (tid >= kThreads || C == 0u) {
         return;
     }
 
     const uint row = tg_id;
-    const uint base = row * C;
+    const ulong base = ulong(row) * ulong(C);
     const float eps = as_type<float>(eps_bits);
-
     threadgroup float reduce_buf[kMaxSimdGroups];
 
     const uint vector_count = C / 4u;
     const uint vector_end = vector_count * 4u;
-
-    device const packed_float4* x4 =
-        reinterpret_cast<device const packed_float4*>(x + base);
+    device const packed_float4* x4 = reinterpret_cast<device const packed_float4*>(x + base);
 
     float local_square_sum = 0.0f;
-
-    for (
-        uint vector_index = tid;
-        vector_index < vector_count;
-        vector_index += tpg
-    ) {
+    for (uint vector_index = tid; vector_index < vector_count; vector_index += tpg) {
         const float4 value = float4(x4[vector_index]);
-        local_square_sum = fma(
-            value.x,
-            value.x,
-            local_square_sum
-        );
-        local_square_sum = fma(
-            value.y,
-            value.y,
-            local_square_sum
-        );
-        local_square_sum = fma(
-            value.z,
-            value.z,
-            local_square_sum
-        );
-        local_square_sum = fma(
-            value.w,
-            value.w,
-            local_square_sum
-        );
+        local_square_sum = fma(value.x, value.x, local_square_sum);
+        local_square_sum = fma(value.y, value.y, local_square_sum);
+        local_square_sum = fma(value.z, value.z, local_square_sum);
+        local_square_sum = fma(value.w, value.w, local_square_sum);
     }
-
-    for (
-        uint c = vector_end + tid;
-        c < C;
-        c += tpg
-    ) {
+    for (uint c = vector_end + tid; c < C; c += tpg) {
         const float value = x[base + c];
-        local_square_sum = fma(
-            value,
-            value,
-            local_square_sum
-        );
+        local_square_sum = fma(value, value, local_square_sum);
     }
-
-    const float simd_square_sum =
-        simd_sum(local_square_sum);
-
+    const float simd_square_sum = simd_sum(local_square_sum);
     if (lane == 0u) {
         reduce_buf[simd_id] = simd_square_sum;
     }
-
-    threadgroup_barrier(
-        mem_flags::mem_threadgroup
-    );
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0u) {
         float total_square_sum = 0.0f;
-        const uint simd_group_count =
-            (tpg + kSimdWidth - 1u) / kSimdWidth;
-
-        for (
-            uint group = 0u;
-            group < simd_group_count;
-            ++group
-        ) {
+        const uint simd_group_count = (tpg + kSimdWidth - 1u) / kSimdWidth;
+        for (uint group = 0u; group < simd_group_count; ++group) {
             total_square_sum += reduce_buf[group];
         }
-
-        reduce_buf[0] = rsqrt(
-            total_square_sum / float(C) + eps
-        );
+        reduce_buf[0] = rsqrt(total_square_sum / float(C) + eps);
     }
-
-    threadgroup_barrier(
-        mem_flags::mem_threadgroup
-    );
-
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv_rms = reduce_buf[0];
 
-    device packed_float4* out4 =
-        reinterpret_cast<device packed_float4*>(out + base);
-
-    for (
-        uint vector_index = tid;
-        vector_index < vector_count;
-        vector_index += tpg
-    ) {
-        const float4 value = float4(x4[vector_index]);
-        out4[vector_index] = packed_float4(
-            value * inv_rms
-        );
-    }
-
-    for (
-        uint c = vector_end + tid;
-        c < C;
-        c += tpg
-    ) {
-        out[base + c] =
-            x[base + c] * inv_rms;
+    if (out_fp16) {
+        device half* out_h = reinterpret_cast<device half*>(out) + base;
+        device packed_half4* out4 = reinterpret_cast<device packed_half4*>(out_h);
+        for (uint vector_index = tid; vector_index < vector_count; vector_index += tpg) {
+            const float4 value = float4(x4[vector_index]);
+            out4[vector_index] = packed_half4(half4(value * inv_rms));
+        }
+        for (uint c = vector_end + tid; c < C; c += tpg) {
+            out_h[c] = half(x[base + c] * inv_rms);
+        }
+    } else {
+        device packed_float4* out4 = reinterpret_cast<device packed_float4*>(out + base);
+        for (uint vector_index = tid; vector_index < vector_count; vector_index += tpg) {
+            const float4 value = float4(x4[vector_index]);
+            out4[vector_index] = packed_float4(value * inv_rms);
+        }
+        for (uint c = vector_end + tid; c < C; c += tpg) {
+            out[base + c] = x[base + c] * inv_rms;
+        }
     }
 }
 
@@ -3546,7 +3494,7 @@ kernel void rmsnorm_weighted_forward(
     device const float* x       [[buffer(0)]],
     device const float* gamma   [[buffer(1)]],
     device float* out           [[buffer(2)]],
-    constant uint& C            [[buffer(3)]],
+    constant uint& C_packed     [[buffer(3)]],
     constant uint& eps_bits     [[buffer(4)]],
     uint3 tg_pos                [[threadgroup_position_in_grid]],
     uint3 thread_pos            [[thread_position_in_threadgroup]],
@@ -3554,6 +3502,8 @@ kernel void rmsnorm_weighted_forward(
 ) {
     const uint tid = thread_pos.x;
     constexpr uint kSimdWidth = 32u;
+    const bool out_fp16 = (C_packed & 0x80000000u) != 0u;
+    const uint C = C_packed & 0x7fffffffu;
 
     // 只保留第一组执行，消除重复写入。
     if (tid >= kSimdWidth || C == 0u) {
@@ -3561,8 +3511,7 @@ kernel void rmsnorm_weighted_forward(
     }
 
     const uint row = tg_pos.x;
-    const uint base = row * C;
-
+    const ulong base = ulong(row) * ulong(C);
     float local_sum = 0.0f;
 
     for (uint c = lane; c < C; c += kSimdWidth) {
@@ -3575,9 +3524,15 @@ kernel void rmsnorm_weighted_forward(
     const float eps = as_type<float>(eps_bits);
     const float inv_rms = rsqrt(mean + eps);
 
-    for (uint c = lane; c < C; c += kSimdWidth) {
-        out[base + c] =
-            x[base + c] * inv_rms * gamma[c];
+    if (out_fp16) {
+        device half* out_h = reinterpret_cast<device half*>(out) + base;
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            out_h[c] = half(x[base + c] * inv_rms * gamma[c]);
+        }
+    } else {
+        for (uint c = lane; c < C; c += kSimdWidth) {
+            out[base + c] = x[base + c] * inv_rms * gamma[c];
+        }
     }
 }
 

@@ -741,87 +741,113 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	        	[prod(x.shape[:-1]), N_dim, accumulate], 256, (N_dim+15)//16, 1, 256)
 
 	def metal_fused_rmsnorm_mlp_forward(self, inputs, outputs, scratch=None):
-	    if len(inputs) == 3:
-	    	x, wgu, wdown = inputs
-	    	norm_weight = None
-	    elif len(inputs) == 4:
-	    	x, norm_weight, wgu, wdown = inputs
+		if len(inputs) == 3:
+			x, wgu, wdown = inputs
+			norm_weight = None
+		elif len(inputs) == 4:
+			x, norm_weight, wgu, wdown = inputs
 
-	    out = outputs[0]
+		out = outputs[0]
 
-	    N = prod(x.shape[:-1])
-	    C = x.shape[-1]
-	    H2 = wgu.shape[-1]
-	    H = H2 // 2
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		H2 = wgu.shape[-1]
+		H = H2 // 2
 
-	    eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
+		eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
+		use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
 
-	    use_fp16_gemm = bool(getattr(self, "use_fp16_gemm", False))
+		gu = scratch["gu"]
+		hidden = scratch["hidden"]
 
-	    gu = scratch["gu"]
-	    hidden = scratch["hidden"]
+		if use_fp16_gemm:
+			h2_tile, c_tile = scratch.gemm_configs["mlp_fwd_shape"]
+			s1_bytes = align_up(N*4, 16)
+			if "gemm_quant" in scratch._views:
+				q_buf = scratch["gemm_quant"]
+				s1_id = q1_id = q2_id = q_buf.ptr.buffer_id
+				s1_off = q_buf.ptr.offset
+				xq_off = wdq_off = s1_off + s1_bytes
+			else:
+				s1_id = q1_id = hidden.ptr.buffer_id
+				s1_off = hidden.ptr.offset + ((N * H * 4) & ~15) - s1_bytes
+				xq_off = hidden.ptr.offset
+				q2_id, wdq_off = gu.ptr.buffer_id, gu.ptr.offset
 
-	    # 使用 out 暂存 RMSNorm 输出，避免额外的 x_norm scratch
-	    if norm_weight is None:
-		    self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-		        [x.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-		        [x.storage.ptr.offset, hidden.ptr.offset],
-		        [C, eps_bits], N * 256, 1, 1, 256)
-	    else:
-		    self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
-		    	[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-		    	[x.storage.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
-		    	[C, eps_bits], N*256, 1, 1, 256)
+			# 1. X_norm = RMSNorm(x) -> 暂存至 gu (或兜底区)
+			self.ctx.fill_scalar("fill_scalar_kernel", [s1_id], [s1_off], 1.0, N)
+			if norm_weight is None:
+				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+					[x.storage.ptr.buffer_id, q1_id],
+					[x.storage.ptr.offset, xq_off],
+					[C | 0x80000000, eps_bits], N * 256, 1, 1, 256)
+			else:
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+					[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, q1_id],
+					[x.storage.ptr.offset, norm_weight.storage.ptr.offset, xq_off],
+					[C | 0x80000000, eps_bits], N * 256, 1, 1, 256)
 
-	    # GU = X_norm @ Wgu
-	    if False:
-	    	cfg = scratch.gemm_configs["gu"]
-	    	gu_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
-	    	print(f"gu need {gu_kernel}")
-	    	if cfg["is_splitk"]:
-	    		self.ctx.fill_scalar("fill_scalar_kernel", [gu.ptr.buffer_id], [gu.ptr.offset], 0.0, N * H2)
-	    	gu_args = (
-	    		[N, H2, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-	    		if cfg["is_splitk"] else
-	    		[N, H2, C, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-	    	)
-	    	self.ctx.dispatch_with_args_3d(gu_kernel,
-	    			[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-	    			[hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
-	    			gu_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-	    else:
-		    self.ctx.dispatch_gemm_mps(
-		    	[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-		        [hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
-		        [1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
+			# 2. 量化 Wgu 至 hidden，计算 GU = X_norm @ Wgu -> gu
+			wq_off = xq_off + align_up(N * C * 2, 16)
+			sw_off = wq_off + align_up(C * h2_tile * 2, 16)
+			gu_cfgs = scratch.gemm_configs["gu"]
+			for j0 in range(0, H2, h2_tile):
+				h2_sub = min(h2_tile, H2 - j0)
+				self._quantize_fp16_colwise(wgu.storage.ptr.buffer_id, wgu.storage.ptr.offset + j0 * 4,
+					q1_id, wq_off, sw_off, C, h2_sub, H2)
+				self._dispatch_fp16_gemm_raw(gu_cfgs[h2_sub], False,
+					[q1_id, q1_id, s1_id, q1_id, gu.ptr.buffer_id],
+					[xq_off, wq_off, s1_off, sw_off, gu.ptr.offset + j0 * 4],
+					N, h2_sub, C)
 
-	    # HIDDEN = SiLU(gate) * up
-	    self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
-	        [gu.ptr.buffer_id, hidden.ptr.buffer_id],
-	        [gu.ptr.offset, hidden.ptr.offset],
-	        [N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4 , 256))
+			# 3. HIDDEN = SiLU(gate) * up 直出 FP16 -> hidden 前半区
+			self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+				[gu.ptr.offset, hidden.ptr.offset],
+				[N, H | 0x80000000], N * ((H + 3) // 4), 1, 1, min(N * ((H + 3) // 4), 256))
 
-	    # OUT = HIDDEN @ Wdown
-	    if False:
-	    	cfg = scratch.gemm_configs["out"]
-	    	out_kernel = fp16_gemm_kernel_name(cfg, False, prefix="fp32")
-	    	print(f"out need {out_kernel}")
-	    	if cfg["is_splitk"]:
-	    		self.ctx.fill_scalar("fill_scalar_kernel", [out.storage.ptr.buffer_id], [out.storage.ptr.offset], 0.0, N * C)
-	    	out_args = (
-	    		[N, C, H, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
-	    		if cfg["is_splitk"] else
-	    		[N, C, H, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
-	    	)
-	    	self.ctx.dispatch_with_args_3d(out_kernel,
-	    		[hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
-	    		[hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
-	    		out_args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
-	    else:
-		    self.ctx.dispatch_gemm_mps(
-		        [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
-		        [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
-		        [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
+			# 4. 复用空闲 gu 量化 Wdown，复用 s1_off 计算 OUT = HIDDEN @ Wdown -> out
+			swd_off = wdq_off + align_up(H * c_tile * 2, 16)
+			out_cfgs = scratch.gemm_configs["out"]
+			for c0 in range(0, C, c_tile):
+				c_sub = min(c_tile, C - c0)
+				self._quantize_fp16_colwise(wdown.storage.ptr.buffer_id, wdown.storage.ptr.offset + c0 * 4,
+					q2_id, wdq_off, swd_off, H, c_sub, C)
+				self._dispatch_fp16_gemm_raw(out_cfgs[c_sub], False,
+					[hidden.ptr.buffer_id, q2_id, s1_id, q2_id, out.storage.ptr.buffer_id],
+					[hidden.ptr.offset, wdq_off, s1_off, swd_off, out.storage.ptr.offset + c0 * 4],
+					N, c_sub, H)
+			return
+
+		# 使用 out 暂存 RMSNorm 输出，避免额外的 x_norm scratch
+		if norm_weight is None:
+			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+				[x.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+				[x.storage.ptr.offset, hidden.ptr.offset],
+				[C, eps_bits], N * 256, 1, 1, 256)
+		else:
+			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+				[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+				[x.storage.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
+				[C, eps_bits], N*256, 1, 1, 256)
+
+		# GU = X_norm @ Wgu
+		self.ctx.dispatch_gemm_mps(
+			[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+			[hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+			[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
+
+		# HIDDEN = SiLU(gate) * up
+		self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+		    [gu.ptr.buffer_id, hidden.ptr.buffer_id],
+		    [gu.ptr.offset, hidden.ptr.offset],
+		    [N, H], N*(H+3)//4, 1, 1, min(N*(H+3)//4 , 256))
+
+		# OUT = HIDDEN @ Wdown
+		self.ctx.dispatch_gemm_mps(
+		    [hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+		    [hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+		    [1, N, C, H, 0, 0, 0, 0], 1.0, 0.0)
 
 	def metal_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
 		if len(inputs) == 3:
@@ -1213,3 +1239,4 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, tmp_dx.ptr.buffer_id, residual_grad.ptr.buffer_id],
 				[x_offset, dx_norm_storage.ptr.offset, norm_weight.storage.ptr.offset, tmp_dx.ptr.offset, residual_grad.ptr.offset],
 				[N, C, eps_bits], 256, (N+7)//8, 1, 256)
+
