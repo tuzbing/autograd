@@ -2,7 +2,7 @@
 import numpy as np
 import math
 
-FP16_QUANT_BUDGET_BYTES = 32 * 1024 * 1024
+FP16_QUANT_BUDGET_BYTES = 4 * 1024 * 1024
 
 def is_power_of_2(n):
 	return ((n & (n - 1)) == 0) and n != 0
@@ -17,31 +17,70 @@ def _align_up(n, align):
 
 def fp16_gemm_k_tile(M, N, K, budget_bytes=FP16_QUANT_BUDGET_BYTES):
 	meta = _align_up(M*4, 16) + _align_up(N*4, 16)
-	avail = max(0, budget_bytes - meta)
-	max_k = max(128, (avail // (2*(M+N)*128))*128)
+	avail = max(0, budget_bytes - meta - 32)
+	max_k = max(32, (avail // (2*(M+N)*32))*32)
 	if K <= max_k:
 		return K
 	n_chunks = (K + max_k - 1) // max_k
-	return _align_up((K + n_chunks - 1) // n_chunks, 128)
+	return _align_up((K + n_chunks - 1) // n_chunks, 32)
 
 def build_fp16_k_tile_configs(M, N, K, a_transpose=False, b_transpose=False, budget_bytes=FP16_QUANT_BUDGET_BYTES):
-	kt = fp16_gemm_k_tile(M, N, K, budget_bytes)
-	kt_sizes = [kt] + ([K % kt] if K % kt else [])
+	if a_transpose:
+		kt = fp16_gemm_k_tile(M, N, K, budget_bytes)
+		kt_sizes = sorted({min(kt, K-k0) for k0 in range(0, K, kt)})
+		q_bytes = _align_up(M*kt*2, 16) + _align_up(N*kt*2, 16) + _align_up(M*4, 16) + _align_up(N*4, 16)
+		return {
+			"dtype": "fp16",
+			"tile_dim": "k",
+			"k_tile": kt,
+			"quant_bytes": q_bytes,
+			"a_transpose": a_transpose,
+			"b_transpose": b_transpose,
+			"sub_configs": {
+				k_sub: get_fp16_gemm_config(M=M, N=N, K=k_sub, a_transpose=a_transpose, b_transpose=b_transpose, dtype="fp16")
+				for k_sub in kt_sizes
+			},
+		}
+	b_full = _align_up(N*K*2, 16) + _align_up(N*4, 16)
+	per_row = K*2 + 4
+	if b_full <= budget_bytes // 2:
+		nt = N
+	else:
+		max_n = max(64, ((budget_bytes // 2 - 32) // per_row // 64) * 64)
+		n_chunks = (N + max_n - 1)  // max_n
+		nt = min(N, _align_up((N+n_chunks-1) // n_chunks, 64))
+
+	b_bytes = _align_up(nt*K*2, 16) + _align_up(nt*4, 16)
+	avail_a = max(0, budget_bytes - b_bytes - 32)
+	max_m = max(64, (avail_a // per_row // 64) * 64)
+	if M <= max_m:
+		mt = M
+	else:
+		m_chunks = (M + max_m - 1) // max_m
+		mt = min(M, _align_up((M + m_chunks - 1) // m_chunks, 64))
+	q_bytes = _align_up(mt*K*2, 16) + _align_up(nt*K*2, 16) + _align_up(mt*4, 16) + _align_up(nt*4, 16)
+	m_sizes = sorted({min(mt, M - m0) for m0 in range(0, M, mt)})
+	n_sizes = sorted({min(nt, N - n0) for n0 in range(0, N, nt)})
 	return {
 		"dtype": "fp16",
-		"k_tile": kt,
-		"a_transpose": a_transpose,
+		"tile_dim": "mn",
+		"m_tile": mt,
+		"n_tile": nt,
+		"quant_bytes": q_bytes,
+		"a_transpose": False,
 		"b_transpose": b_transpose,
 		"sub_configs": {
-			k_sub: get_fp16_gemm_config(M=M, N=N, K=k_sub, a_transpose=a_transpose, b_transpose=b_transpose, dtype="fp16")
-			for k_sub in kt_sizes
+			(m_sub, n_sub): get_fp16_gemm_config(M=m_sub, N=n_sub, K=K, a_transpose=False, b_transpose=b_transpose, dtype="fp16", ldd=N)
+			for m_sub in m_sizes
+			for n_sub in n_sizes
 		},
 	}
 
-def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp16", lda=None):
+def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp16", 
+						lda=None, ldb=None, ldd=None):
 	tm, tn, tk = (M+15)//16, (N+15)//16, K//16
 	splitk_limit = 256 # M1 8核满载仅需64*64线程组(tm*tn=768), 避免dx误入低效splitk
-	can_splitk = (dtype != "fp16") or (not a_transpose and not b_transpose)
+	can_splitk = ((dtype != "fp16") or (not a_transpose and not b_transpose)) and (ldd is None or ldd == N)
 	if can_splitk and tm*tn<splitk_limit and tk >= 8 and K > max(M, N):
 		tm, tn = (M+31)//32, (N+31)//32
 		tk = K/16
@@ -57,8 +96,8 @@ def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpo
 		mn_aligned = (M % bm == 0) and (N % bn == 0)
 		k_aligned = K % bk == 0
 		lda = (M if a_transpose else K) if lda is None else lda
-		ldb = K if b_transpose else N
-		ldd = N
+		ldb = (K if b_transpose else N) if ldb is None else ldb
+		ldd = N if ldd is None else ldd
 		tn2, tm2 = (N + bn - 1) // bn, (M + bm - 1) // bm
 		grid_x = tn2
 		grid_y = tm2
@@ -81,10 +120,6 @@ def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpo
 		else:
 			bm, bn, bk = 32, 64, 16
 
-		# if dtype != "fp32" or M >= 64:
-		# 	bm, bn, bk = 64, 64, 16
-		# else:
-		# 	bm, bn, bk = 32, 64, 16
 		wm, wn = 2, 2
 		tn, tm = (N+bn-1)//bn, (M+bm-1)//bm 
 		m_aligned = int(M % bm == 0)
@@ -95,8 +130,8 @@ def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpo
 		swizzle_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm>=4 and tn>=4) else (1 if (tm>=2 and tn>=4) else 0))
 		sw = 1 << swizzle_log
 		lda = (M if a_transpose else K) if lda is None else lda
-		ldb = K if b_transpose else N
-		ldd = N
+		ldb = (K if b_transpose else N) if ldb is None else ldb
+		ldd = N if ldd is None else ldd
 		grid_x = tn * sw
 		grid_y = (tm + sw - 1) // sw
 		grid_z = 1

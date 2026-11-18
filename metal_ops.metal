@@ -3854,9 +3854,11 @@ kernel void swiglu_forward_kernel(
     device const float* gu [[buffer(0)]],
     device float* hidden [[buffer(1)]],
     constant uint& N [[buffer(2)]],
-    constant uint& H [[buffer(3)]],
+    constant uint& H_packed [[buffer(3)]],
     uint gid [[thread_position_in_grid]]
 ) {
+    const bool out_fp16 = (H_packed & 0x80000000u) != 0u;
+    const uint H = H_packed & 0x7fffffffu;
     const uint VEC = 4u;
     const uint vectors_per_row = (H + VEC - 1u) / VEC;
     const uint row = gid / vectors_per_row;
@@ -3867,11 +3869,10 @@ kernel void swiglu_forward_kernel(
         return;
     }
 
-    const uint gu_base = row * (2u * H);
-    const uint hidden_base = row * H;
+    const ulong gu_base = ulong(row) * ulong(2u * H);
+    const ulong hidden_base = ulong(row) * ulong(H);
     const uint remain = H - col;
     const uint lanes = min(VEC, remain);
-
     float4 gate = float4(0.0f);
     float4 up = float4(0.0f);
 
@@ -3880,71 +3881,183 @@ kernel void swiglu_forward_kernel(
         up[i] = gu[gu_base + H + col + i];
     }
 
-    const float4 sigmoid_gate =
-        1.0f / (1.0f + exp(-gate));
+    const float4 sigmoid_gate = 1.0f / (1.0f + exp(-gate));
+    const float4 result = gate * sigmoid_gate * up;
 
-    const float4 result =
-        gate * sigmoid_gate * up;
-
-    for (uint i = 0u; i < lanes; ++i) {
-        hidden[hidden_base + col + i] = result[i];
+    if (out_fp16) {
+        device half* hidden_h = reinterpret_cast<device half*>(hidden);
+        if (lanes == 4u) {
+            *reinterpret_cast<device packed_half4*>(hidden_h + hidden_base + col) = packed_half4(half4(result));
+        } else {
+            for (uint i = 0u; i < lanes; ++i) {
+                hidden_h[hidden_base + col + i] = half(result[i]);
+            }
+        }
+    } else {
+        for (uint i = 0u; i < lanes; ++i) {
+            hidden[hidden_base + col + i] = result[i];
+        }
     }
 }
 
 kernel void swiglu_backward_inplace_kernel(
     device float* gu [[buffer(0)]],
     device const float* dhidden [[buffer(1)]],
-    constant uint& N [[buffer(2)]],
-    constant uint& H [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
+    device float* s_dgu [[buffer(2)]],
+    constant uint& N [[buffer(3)]],
+    constant uint& H_packed [[buffer(4)]],
+    uint3 gid3 [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint3 tg_pos [[threadgroup_position_in_grid]]
 ) {
-    const uint VEC = 4u;
-    const uint vectors_per_row = (H + VEC - 1u) / VEC;
-    const uint row = gid / vectors_per_row;
-    const uint vec_id = gid % vectors_per_row;
-    const uint col = vec_id * VEC;
+    const bool out_fp16 = (H_packed & 0x80000000u) != 0u;
+    const uint H = H_packed & 0x7fffffffu;
 
-    if (row >= N || col >= H) {
+    if (!out_fp16) {
+        const uint gid = gid3.x;
+        const uint VEC = 4u;
+        const uint vectors_per_row = (H + VEC - 1u) / VEC;
+        const uint row = gid / vectors_per_row;
+        const uint vec_id = gid % vectors_per_row;
+        const uint col = vec_id * VEC;
+
+        if (row >= N || col >= H) {
+            return;
+        }
+
+        const ulong gu_base = ulong(row) * ulong(2u * H);
+        const ulong hidden_base = ulong(row * H);
+        const uint remain = H - col;
+        const uint lanes = min(VEC, remain);
+
+        float4 gate = float4(0.0f);
+        float4 up = float4(0.0f);
+        float4 d_hidden = float4(0.0f);
+
+        for (uint i = 0u; i < lanes; ++i) {
+            gate[i] = gu[gu_base + col + i];
+            up[i] = gu[gu_base + H + col + i];
+            d_hidden[i] = dhidden[hidden_base + col + i];
+        }
+
+        const float4 sigmoid_gate = 1.0f / (1.0f + exp(-gate));
+        const float4 silu_gate = gate * sigmoid_gate;
+        const float4 dsilu_dgate = sigmoid_gate * (1.0f + gate * (1.0f - sigmoid_gate));
+        const float4 d_gate = d_hidden * up * dsilu_dgate;
+        const float4 d_up = d_hidden * silu_gate;
+
+        for (uint i = 0u; i < lanes; ++i) {
+            gu[gu_base + col + i] = d_gate[i];
+            gu[gu_base + H + col + i] = d_up[i];
+        }
         return;
     }
 
-    const uint gu_base = row * (2u * H);
-    const uint hidden_base = row * H;
-    const uint remain = H - col;
-    const uint lanes = min(VEC, remain);
+    const uint row = tg_pos.y;
+    if (row >= N) return;
 
-    float4 gate = float4(0.0f);
-    float4 up = float4(0.0f);
-    float4 d_hidden = float4(0.0f);
+    device float* row_f = gu + ulong(row) * ulong(2u * H);
+    device half* row_h = reinterpret_cast<device half*>(row_f);
+    device const float* row_dh = dhidden + ulong(row) * ulong(H);
+    threadgroup uint sg_max[8];
+    uint local_max = 0u;
 
-    for (uint i = 0u; i < lanes; ++i) {
-        gate[i] = gu[gu_base + col + i];
-        up[i] = gu[gu_base + H + col + i];
-        d_hidden[i] = dhidden[hidden_base + col + i];
+    if (H <= 1024u) {
+        const uint col = tid * 4u;
+        const uint lanes = (col < H) ? min(4u, H - col) : 0u;
+        float4 gate = float4(0.0f), up = float4(0.0f), dh = float4(0.0f);
+        for (uint i = 0u; i < lanes; ++i) {
+            gate[i] = row_f[col + i];
+            up[i] = row_f[H + col + i];
+            dh[i] = row_dh[col + i];
+        }
+        const float4 sig = 1.0f / (1.0f + exp(-gate));
+        const float4 dg = dh * up * sig * (1.0f + gate * (1.0f - sig));
+        const float4 du = dh * gate * sig;
+        for (uint i = 0u; i < lanes; ++i) {
+            local_max = max(local_max, as_type<uint>(dg[i]) & 0x7fffffffu);
+            local_max = max(local_max, as_type<uint>(du[i]) & 0x7fffffffu);
+        }
+        local_max = simd_max(local_max);
+        if (lane == 0u) sg_max[sg] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            uint rm = (lane < 8u) ? sg_max[lane] : 0u;
+            rm = simd_max(rm);
+            if (lane == 0u) sg_max[0] = rm;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint mb = sg_max[0];
+        const bool invalid = (mb >= 0x7f800000u);
+        const float scale = (mb == 0u || invalid) ? 1.0f : max(as_type<float>(mb) / 65504.0f, 0x1.0p-126f);
+        const float inv_scale = 1.0f / scale;
+        if (tid == 0u) s_dgu[row] = invalid ? as_type<float>(0x7fc00000u) : scale;
+
+        if (lanes == 4u) {
+            const half4 hg = invalid ? half4(as_type<half>(ushort(0x7e00u))) : half4(clamp(dg * inv_scale, -65504.0f, 65504.0f));
+            const half4 hu = invalid ? half4(as_type<half>(ushort(0x7e00u))) : half4(clamp(du * inv_scale, -65504.0f, 65504.0f));
+            *reinterpret_cast<device packed_half4*>(row_h + col) = packed_half4(hg);
+            *reinterpret_cast<device packed_half4*>(row_h + H + col) = packed_half4(hu);
+        } else {
+            for (uint i = 0u; i < lanes; ++i) {
+                row_h[col + i] = invalid ? as_type<half>(ushort(0x7e00u)) : half(clamp(dg[i] * inv_scale, -65504.0f, 65504.0f));
+                row_h[H + col + i] = invalid ? as_type<half>(ushort(0x7e00u)) : half(clamp(du[i] * inv_scale, -65504.0f, 65504.0f));
+            }
+        }
+        return;
     }
 
-    const float4 sigmoid_gate =
-        1.0f / (1.0f + exp(-gate));
+    for (uint col = tid * 4u; col < H; col += 1024u) {
+        const uint lanes = min(4u, H - col);
+        for (uint i = 0u; i < lanes; ++i) {
+            const float g = row_f[col + i];
+            const float u = row_f[H + col + i];
+            const float d = row_dh[col + i];
+            const float sig = 1.0f / (1.0f + exp(-g));
+            const float dg = d * u * sig * (1.0f + g * (1.0f - sig));
+            const float du = d * g * sig;
+            row_f[col + i] = dg;
+            row_f[H + col + i] = du;
+            local_max = max(local_max, as_type<uint>(dg) & 0x7fffffffu);
+            local_max = max(local_max, as_type<uint>(du) & 0x7fffffffu);
+        }
+    }
+    local_max = simd_max(local_max);
+    if (lane == 0u) sg_max[sg] = local_max;
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    if (sg == 0u) {
+        uint rm = (lane < 8u) ? sg_max[lane] : 0u;
+        rm = simd_max(rm);
+        if (lane == 0u) sg_max[0] = rm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const float4 silu_gate =
-        gate * sigmoid_gate;
+    const uint mb = sg_max[0];
+    const bool invalid = (mb >= 0x7f800000u);
+    const float scale = (mb == 0u || invalid) ? 1.0f : max(as_type<float>(mb) / 65504.0f, 0x1.0p-126f);
+    const float inv_scale = 1.0f / scale;
+    if (tid == 0u) s_dgu[row] = invalid ? as_type<float>(0x7fc00000u) : scale;
 
-    const float4 dsilu_dgate =
-        sigmoid_gate *
-        (1.0f + gate * (1.0f - sigmoid_gate));
-
-    const float4 d_gate =
-        d_hidden * up * dsilu_dgate;
-
-    const float4 d_up =
-        d_hidden * silu_gate;
-
-    // 每个线程负责同一组 gate/up 元素，
-    // 先读取原始 gate/up，再写回 dgate/dup，
-    // 不会发生线程间写冲突。
-    for (uint i = 0u; i < lanes; ++i) {
-        gu[gu_base + col + i] = d_gate[i];
-        gu[gu_base + H + col + i] = d_up[i];
+    for (uint base_c = 0u; base_c < H; base_c += 1024u) {
+        const uint col = base_c + tid * 4u;
+        const uint lanes = (col < H) ? min(4u, H - col) : 0u;
+        float4 dg = float4(0.0f);
+        for (uint i = 0u; i < lanes; ++i) dg[i] = row_f[col + i];
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint i = 0u; i < lanes; ++i) {
+            row_h[col + i] = invalid ? as_type<half>(ushort(0x7e00u)) : half(clamp(dg[i] * inv_scale, -65504.0f, 65504.0f));
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    for (uint col = tid * 4u; col < H; col += 1024u) {
+        const uint lanes = min(4u, H - col);
+        for (uint i = 0u; i < lanes; ++i) {
+            const float du = row_f[H + col + i];
+            row_h[H + col + i] = invalid ? as_type<half>(ushort(0x7e00u)) : half(clamp(du * inv_scale, -65504.0f, 65504.0f));
+        }
     }
 }
 
@@ -13206,28 +13319,38 @@ kernel void fp16_quant_colwise(
 }
 
 kernel void fp16_quant_tensor_max(
-    device const float* src       [[buffer(0)]],
-    device atomic_uint* max_bits  [[buffer(1)]],
-    constant uint& numel          [[buffer(2)]],
-    uint tid                      [[thread_index_in_threadgroup]],
-    uint lane                     [[thread_index_in_simdgroup]],
-    uint sg                       [[simdgroup_index_in_threadgroup]],
-    uint3 tg_pos                  [[threadgroup_position_in_grid]],
-    uint3 tgs                     [[threadgroups_per_grid]]
+    device const float* src        [[buffer(0)]],
+    device const float* row_scales [[buffer(1)]],
+    device atomic_uint* max_bits   [[buffer(2)]],
+    constant uint& numel           [[buffer(3)]],
+    constant uint& cols            [[buffer(4)]],
+    uint tid                       [[thread_index_in_threadgroup]],
+    uint lane                      [[thread_index_in_simdgroup]],
+    uint sg                        [[simdgroup_index_in_threadgroup]],
+    uint3 tg_pos                   [[threadgroup_position_in_grid]],
+    uint3 tgs                      [[threadgroups_per_grid]]
 ) {
     threadgroup uint sg_max[8];
     uint local_max = 0u;
     const uint vec_end = numel & ~3u;
     const uint vec_stride = tgs.x * 1024u;
+    const bool fast_row_scale = (cols > 0u) && ((cols & 3u) == 0u);
     for (uint i = (tg_pos.x * 256u + tid) * 4u; i < vec_end; i += vec_stride) {
-        const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        if (fast_row_scale) {
+            v *= row_scales[i / cols];
+        } else if (cols > 0u) {
+            v = float4(v.x * row_scales[i / cols], v.y * row_scales[(i + 1u) / cols],
+                       v.z * row_scales[(i + 2u) / cols], v.w * row_scales[(i + 3u) / cols]);
+        }
         local_max = max(local_max, fp16_quant_abs_bits(v.x));
         local_max = max(local_max, fp16_quant_abs_bits(v.y));
         local_max = max(local_max, fp16_quant_abs_bits(v.z));
         local_max = max(local_max, fp16_quant_abs_bits(v.w));
     }
     for (uint i = vec_end + tg_pos.x * 256u + tid; i < numel; i += tgs.x * 256u) {
-        local_max = max(local_max, fp16_quant_abs_bits(src[i]));
+        const float v = (cols > 0u) ? (src[i] * row_scales[i / cols]) : src[i];
+        local_max = max(local_max, fp16_quant_abs_bits(v));
     }
     local_max = simd_max(local_max);
     if (lane == 0u) sg_max[sg] = local_max;
@@ -13242,12 +13365,14 @@ kernel void fp16_quant_tensor_max(
 }
 
 kernel void fp16_quant_tensor_cast(
-    device const float* src      [[buffer(0)]],
-    device half* dst             [[buffer(1)]],
-    device const uint* max_bits  [[buffer(2)]],
-    device float* scales         [[buffer(3)]],
-    constant uint& numel         [[buffer(4)]],
-    constant uint& scale_len     [[buffer(5)]],
+    device const float* src        [[buffer(0)]],
+    device const float* row_scales [[buffer(1)]],
+    device half* dst               [[buffer(2)]],
+    device const uint* max_bits    [[buffer(3)]],
+    device float* scales           [[buffer(4)]],
+    constant uint& numel           [[buffer(5)]],
+    constant uint& scale_len       [[buffer(6)]],
+    constant uint& cols            [[buffer(7)]],
     uint gid                     [[thread_position_in_grid]],
     uint total_threads           [[threads_per_grid]]
 ) {
@@ -13262,8 +13387,15 @@ kernel void fp16_quant_tensor_cast(
     }
     const uint vec_end = numel & ~3u;
     const uint vec_stride = total_threads * 4u;
+    const bool fast_row_scale = (cols > 0u) && ((cols & 3u) == 0u);
     for (uint i = gid * 4u; i < vec_end; i += vec_stride) {
-        const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + i));
+        if (fast_row_scale) {
+            v *= row_scales[i / cols];
+        } else if (cols > 0u) {
+            v = float4(v.x * row_scales[i / cols], v.y * row_scales[(i + 1u) / cols],
+                       v.z * row_scales[(i + 2u) / cols], v.w * row_scales[(i + 3u) / cols]);
+        }
         const half4 h(
             fp16_quant_value(v.x, inv_sc, invalid),
             fp16_quant_value(v.y, inv_sc, invalid),
@@ -13273,7 +13405,8 @@ kernel void fp16_quant_tensor_cast(
         *reinterpret_cast<device packed_half4*>(dst + i) = packed_half4(h);
     }
     for (uint i = vec_end + gid; i < numel; i += total_threads) {
-        dst[i] = fp16_quant_value(src[i], inv_sc, invalid);
+        const float v = (cols > 0u) ? (src[i] * row_scales[i / cols]) : src[i];
+        dst[i] = fp16_quant_value(v, inv_sc, invalid);
     }
 }
 

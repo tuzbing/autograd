@@ -5,7 +5,7 @@ from math import prod
 from op import AddOp, MulOp, RsqrtOp, SoftmaxOp, GELUOp, LayerNormOp, MatMulOp, PermuteOp, TransposeOp, CrossEntropyLossOp
 from op import ScaledDotProductAttenOp, FusedLinearCrossEntropyOp, FusedMLPOp, FusedQKVProjOp, FlashAttentionOp
 from op import FusedRMSNormLinearCrossEntropyOp
-from gemm import get_fp16_gemm_config, fp16_gemm_k_tile, build_fp16_k_tile_configs
+from gemm import FP16_QUANT_BUDGET_BYTES, get_fp16_gemm_config, fp16_gemm_k_tile, build_fp16_k_tile_configs
 
 def align_up(n, align=64):
 	return (n + align - 1) // align * align
@@ -84,13 +84,12 @@ def pack_slots_reuse(groups, align=64):
 		offset += max_n  
 	return ScratchLayout(slots, align_up(offset, align))
 
-def fp16_gemm_quant_size(M, N, K):
-	kt = fp16_gemm_k_tile(M, N, K)
-	qa_size = align_up(M*kt*2, 16)
-	qb_size = align_up(N*kt*2, 16)
-	sa_size = align_up(M*4, 16)
-	sb_size = align_up(N*4, 16) 
-	return qa_size + qb_size + sa_size + sb_size
+def fp16_gemm_quant_size(*tiled_cfgs, reuse_bytes=0):
+	need = max((cfg["quant_bytes"] for cfg in tiled_cfgs), default=0)
+	return 0 if need <= reuse_bytes else align_up(need, 64)
+
+def fp16_quant_bytes(rows, cols, scale_len):
+	return align_up(rows * cols * 2, 16) + align_up(scale_len * 4, 16)
 
 def plan_node_scratch(node, use_f16_gemm=False):
 	op = node.op 
@@ -344,26 +343,74 @@ def plan_node_scratch(node, use_f16_gemm=False):
 					"gu": get_fp16_gemm_config(M=N, N=H2, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32"),
 					"out": get_fp16_gemm_config(M=N, N=C, K=H, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32")
 				}
-			bwd = pack_slots([
+			bwd_slots = [
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
-			])
+			]
 			if use_f16_gemm:
 				N = prod(x.shape[:-1])
 				C = x.shape[-1]
 				H2 = wgu.shape[-1]
+				gu_bf16 = wgu.requires_grad and str(getattr(wgu, "grad_dtype", "")).lower() in ("bf16", "bfloat16")
+				chunk_rows = (N // 128) * 64 if N >= 128 else (max(4, (N // 8) * 4) if N >= 8 else 1)
+				sdgu_bytes = align_up(N * 4, 16)
+				hid_cap = (N * H * 4) & ~15
+				cap_12 = hid_cap - sdgu_bytes
+				head_bytes = max(align_up(N * H * 2, 16), align_up(chunk_rows * H * 4, 16))
+				dout_bytes = fp16_quant_bytes(N, C, max(chunk_rows, C))
+				rem_12 = cap_12 - head_bytes - dout_bytes
+				h_tile = min(H, max(64, ((rem_12 - 32) // (C * 2 + 4) // 64) * 64))
+				wdown_bytes = max(align_up(H * 4, 16), fp16_quant_bytes(h_tile, C, h_tile))
+
+				xnorm_bytes = align_up(N * C * 4, 16)
+				avail_3 = cap_12 - xnorm_bytes
+				z_bytes = fp16_quant_bytes(N, C, C) + align_up(H2 * 4, 16)
+				if gu_bf16:
+					max_r = max(1, (avail_3 - z_bytes) // (H2 * 4))
+					gu_tile_r = min(C, (max_r // 64) * 64 if max_r >= 64 else max(1, (max_r // 8) * 8))
+					step11_bytes = z_bytes + align_up(gu_tile_r * H2 * 4, 16)
+				else:
+					gu_tile_r = C
+					step11_bytes = z_bytes if wgu.requires_grad else 0
+				max_c = max(1, (avail_3 - 32) // (H2 * 2 + 4))
+				c_tile = min(C, (max_c // 64) * 64 if max_c >= 64 else max(1, (max_c // 8) * 8))
+				wgu_bytes = fp16_quant_bytes(c_tile, H2, c_tile)
+
+				need_a = head_bytes + dout_bytes + wdown_bytes + sdgu_bytes
+				need_b = xnorm_bytes + max(step11_bytes, wgu_bytes) + sdgu_bytes
+				if max(need_a, need_b) > hid_cap:
+					bwd_slots.append(('gemm_quant', (align_up(max(dout_bytes + wdown_bytes, step11_bytes, wgu_bytes) + sdgu_bytes, 64),), np.uint8))
+
+				r_sizes = sorted({min(chunk_rows, N - r0) for r0 in range(0, N, chunk_rows)})
+				h_sizes = sorted({min(h_tile, H - h0) for h0 in range(0, H, h_tile)})
+				c_sizes = sorted({min(c_tile, C - c0) for c0 in range(0, C, c_tile)})
 				bwd_configs = {
 					"gu": fwd.gemm_configs["gu"],
-					"dhidden": get_fp16_gemm_config(M=N, N=H, K=C, with_accum=False, a_transpose=False, b_transpose=True, dtype="fp32"),
-					"dx_norm": get_fp16_gemm_config(M=N, N=C, K=H2, with_accum=False, a_transpose=False, b_transpose=True, dtype="fp32"),
+					"mlp_shape": (chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes),
+					"dhidden": {
+						(r, h): get_fp16_gemm_config(M=r, N=h, K=C, a_transpose=False, b_transpose=True, dtype="fp16", ldd=H)
+						for r in r_sizes for h in h_sizes
+					},
+					"dx_norm": {
+						c: get_fp16_gemm_config(M=N, N=c, K=H2, a_transpose=False, b_transpose=True, dtype="fp16", lda=2*H2, ldd=C)
+						for c in c_sizes
+					},
 				}
-				for accum in (False, True):
-					if wdown.requires_grad:
-						bwd_configs[("dwdown", accum)] = get_fp16_gemm_config(M=H, N=C, K=N, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
-					main_rows = (N // 16) * 16
-					if wgu.requires_grad and main_rows > 0:
-						bwd_configs[("dwgu", accum)] = get_fp16_gemm_config(M=C, N=H2, K=main_rows, with_accum=accum, a_transpose=True, b_transpose=False, dtype="fp32")
+				if wdown.requires_grad:
+					bwd_configs["dwdown"] = get_fp16_gemm_config(M=H, N=C, K=N, a_transpose=True, b_transpose=False, dtype="fp16")
+				if wgu.requires_grad:
+					if gu_bf16:
+						r_bf16_sizes = sorted({min(gu_tile_r, C - c0) for c0 in range(0, C, gu_tile_r)})
+						bwd_configs["dwgu_bf16"] = {
+							r: get_fp16_gemm_config(M=r, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", lda=C, ldb=2*H2)
+							for r in r_bf16_sizes
+						}
+					else:
+						bwd_configs["dwgu"] = get_fp16_gemm_config(M=C, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", ldb=2*H2)
+				bwd = pack_slots(bwd_slots)
 				bwd.gemm_configs = bwd_configs
+			else:
+				bwd = pack_slots(bwd_slots)
 		else:
 			fwd = pack_slots([
 				# RMSNorm
