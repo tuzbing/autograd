@@ -7625,269 +7625,6 @@ METAL_FUNC static float2 tg_load_frag2(threadgroup const float* ptr) {
     return *reinterpret_cast<threadgroup const float2*>(ptr);
 }
 
-kernel void fused_rms_fa_project_kv(
-    device const float* x           [[buffer(0)]],
-    device const float* wq          [[buffer(1)]],
-    device const float* bq          [[buffer(2)]],
-    device const float* wk          [[buffer(3)]],
-    device const float* bk          [[buffer(4)]],
-    device const float* wv          [[buffer(5)]],
-    device const float* bv          [[buffer(6)]],
-    device float* q_out             [[buffer(7)]],
-    device float* k_cache           [[buffer(8)]],
-    device float* v_cache           [[buffer(9)]],
-    constant uint& B                [[buffer(10)]],
-    constant uint& T                [[buffer(11)]],
-    constant uint& C                [[buffer(12)]],
-    constant uint& H                [[buffer(13)]],
-    constant uint& eps_bits         [[buffer(14)]],
-    uint3 tg_pos                    [[threadgroup_position_in_grid]],
-    uint3 thread_pos                [[thread_position_in_threadgroup]],
-    uint lane                       [[thread_index_in_simdgroup]],
-    uint simd_id                    [[simdgroup_index_in_threadgroup]]
-) {
-    constexpr uint kThreads      = 512u;
-    constexpr uint kSimdWidth    = 32u;
-    constexpr uint kBM           = 32u;
-    constexpr uint kBN           = 64u;
-    constexpr uint kBK           = 32u;              // ← 16 → 32
-    constexpr uint kFrag         = 8u;
-    constexpr uint kXStride      = kBK + 4u;         // ← 36
-    constexpr uint kWStride      = 68u;
-    constexpr uint kRowsPerSimd  = 2u;
-    constexpr uint kC4PerBK      = kBK / 4u;         // 8
-    constexpr uint kN4PerTile    = kBN / 4u;         // 16
-    constexpr uint kXFloat4Count = kBM * kC4PerBK;   // 256
-    constexpr uint kWFloat4Count = kBK * kN4PerTile; // 512
-
-    threadgroup float X_tg[kBM][kXStride];
-    threadgroup float Wk_tg[kBK][kWStride];
-    threadgroup float Wv_tg[kBK][kWStride];
-    threadgroup float Wq_tg[kBK][kWStride];
-    threadgroup float inv_rms_tg[kBM];
-    threadgroup float bq_tg[kBN];
-    threadgroup float bk_tg[kBN];
-    threadgroup float bv_tg[kBN];
-
-    const uint tid = thread_pos.x;
-
-    if (tid >= kThreads || tg_pos.x != 0u || tg_pos.z != 0u ||
-        B == 0u || T == 0u || C == 0u || H == 0u || (C & 3u) != 0u || (C % H) != 0u) {
-        return;
-    }
-
-    const uint token_count = B * T;
-    const uint D = C / H;
-    if (D == 0u) { return; }
-    const uint row_base = tg_pos.y * kBM;
-    if (row_base >= token_count) { return; }
-
-    const float eps = as_type<float>(eps_bits);
-
-    // ---------------- RMS 统计：与 5.18ms 版逐字相同 ----------------
-    const uint slr0 = simd_id * kRowsPerSimd;
-    const uint slr1 = slr0 + 1u;
-    const uint sgr0 = row_base + slr0;
-    const uint sgr1 = row_base + slr1;
-    const bool sv0  = sgr0 < token_count;
-    const bool sv1  = sgr1 < token_count;
-    const uint sxb0 = sgr0 * C;
-    const uint sxb1 = sgr1 * C;
-    float lss0 = 0.0f, lss1 = 0.0f;
-    if (sv0) {
-        for (uint c = lane; c < C; c += kSimdWidth) {
-            const float v = x[sxb0 + c];
-            lss0 = fma(v, v, lss0);
-        }
-    }
-    if (sv1) {
-        for (uint c = lane; c < C; c += kSimdWidth) {
-            const float v = x[sxb1 + c];
-            lss1 = fma(v, v, lss1);
-        }
-    }
-    const float ir0 = sv0 ? rsqrt(simd_sum(lss0) / float(C) + eps) : 0.0f;
-    const float ir1 = sv1 ? rsqrt(simd_sum(lss1) / float(C) + eps) : 0.0f;
-    if (lane == 0u) { inv_rms_tg[slr0] = ir0; inv_rms_tg[slr1] = ir1; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ---------------- SIMD mapping：不变 ----------------
-    const uint matrix_row_group = simd_id >> 2u;
-    const uint matrix_col_group = simd_id & 3u;
-    const uint simd_row_base = matrix_row_group * kFrag;
-    const uint simd_col_base = matrix_col_group * 16u;
-    const ushort2 frag = morton_order(ushort(lane));
-
-    threadgroup const float* const x_frag_base =
-        reinterpret_cast<threadgroup const float*>(X_tg)
-        + (simd_row_base + uint(frag.y)) * kXStride + uint(frag.x);
-    const uint w_frag_disp = uint(frag.y) * kWStride + simd_col_base + uint(frag.x);
-    threadgroup const float* const wk_frag_base = reinterpret_cast<threadgroup const float*>(Wk_tg) + w_frag_disp;
-    threadgroup const float* const wv_frag_base = reinterpret_cast<threadgroup const float*>(Wv_tg) + w_frag_disp;
-    threadgroup const float* const wq_frag_base = reinterpret_cast<threadgroup const float*>(Wq_tg) + w_frag_disp;
-
-    // ---------------- 循环不变量提前算好（免费）----------------
-    // X loader
-    const bool  x_loader    = tid < kXFloat4Count;
-    const uint  x_local_row = x_loader ? (tid / kC4PerBK) : 0u;
-    const uint  x_local_c   = x_loader ? ((tid - x_local_row * kC4PerBK) * 4u) : 0u;
-    const uint  x_grow      = row_base + x_local_row;
-    const bool  x_row_ok    = x_loader && (x_grow < token_count);
-    device const float* const x_row_ptr = x + x_grow * C;
-    const float x_scale     = x_loader ? inv_rms_tg[x_local_row] : 0.0f;   // barrier 之后，只读一次
-
-    // W loader（512 线程全部参与）
-    const uint  w_local_k   = tid / kN4PerTile;                            // 0..31
-    const uint  w_local_n   = (tid - w_local_k * kN4PerTile) * 4u;         // 0,4,...,60
-    const uint  w_row_off   = w_local_k * C;
-
-    const bool d_is_pow2 = (D & (D - 1u)) == 0u;
-    const uint d_shift   = uint(popcount(D - 1u));
-    const uint d_mask    = D - 1u;
-    const bool d_even    = (D & 1u) == 0u;
-    const uint kv_head_stride = T * D;
-
-    for (uint output_base = 0u; output_base < C; output_base += kBN) {
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < kN4PerTile) {
-            const uint lc = tid * 4u;
-            const uint gc = output_base + lc;
-            float4 b0 = float4(0.0f), b1 = float4(0.0f), b2 = float4(0.0f);
-            if (gc < C) {
-                b0 = float4(*reinterpret_cast<device const packed_float4*>(bq + gc));
-                b1 = float4(*reinterpret_cast<device const packed_float4*>(bk + gc));
-                b2 = float4(*reinterpret_cast<device const packed_float4*>(bv + gc));
-            }
-            *reinterpret_cast<threadgroup packed_float4*>(bq_tg + lc) = packed_float4(b0);
-            *reinterpret_cast<threadgroup packed_float4*>(bk_tg + lc) = packed_float4(b1);
-            *reinterpret_cast<threadgroup packed_float4*>(bv_tg + lc) = packed_float4(b2);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float2 q_accumulator0 = float2(0.0f), q_accumulator1 = float2(0.0f);
-        float2 k_accumulator0 = float2(0.0f), k_accumulator1 = float2(0.0f);
-        float2 v_accumulator0 = float2(0.0f), v_accumulator1 = float2(0.0f);
-
-        const uint w_col_off  = output_base + w_local_n;
-        const bool w_col_ok   = w_col_off < C;
-
-        for (uint input_base = 0u; input_base < C; input_base += kBK) {
-
-            // X tile：256 线程各 1 个 float4
-            if (x_loader) {
-                const uint gc = input_base + x_local_c;
-                float4 nrm = float4(0.0f);
-                if (x_row_ok && gc < C) {
-                    const float4 xv = float4(*reinterpret_cast<device const packed_float4*>(x_row_ptr + gc));
-                    nrm = xv * float4(x_scale);
-                }
-                *reinterpret_cast<threadgroup packed_float4*>(&X_tg[x_local_row][x_local_c]) = packed_float4(nrm);
-            }
-
-            // W tile：512 线程全员各 3 个 float4（原来只有 256 线程参与）
-            {
-                const uint gk = input_base + w_local_k;
-                float4 wkv = float4(0.0f), wvv = float4(0.0f), wqv = float4(0.0f);
-                if (w_col_ok && gk < C) {
-                    const uint off = input_base * C + w_row_off + w_col_off;
-                    wkv = float4(*reinterpret_cast<device const packed_float4*>(wk + off));
-                    wvv = float4(*reinterpret_cast<device const packed_float4*>(wv + off));
-                    wqv = float4(*reinterpret_cast<device const packed_float4*>(wq + off));
-                }
-                *reinterpret_cast<threadgroup packed_float4*>(&Wk_tg[w_local_k][w_local_n]) = packed_float4(wkv);
-                *reinterpret_cast<threadgroup packed_float4*>(&Wv_tg[w_local_k][w_local_n]) = packed_float4(wvv);
-                *reinterpret_cast<threadgroup packed_float4*>(&Wq_tg[w_local_k][w_local_n]) = packed_float4(wqv);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // 4 个 k_sub（原来 2 个），MMA 顺序与原版完全一致
-            #pragma unroll
-            for (uint k_sub = 0u; k_sub < kBK; k_sub += kFrag) {
-                const uint w_row_disp = k_sub * kWStride;
-                const float2 x_fragment   = tg_load_frag2(x_frag_base + k_sub);
-
-                const float2 wk_fragment0 = tg_load_frag2(wk_frag_base + w_row_disp);
-                const float2 wk_fragment1 = tg_load_frag2(wk_frag_base + w_row_disp + kFrag);
-                k_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wk_fragment0, k_accumulator0);
-                k_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wk_fragment1, k_accumulator1);
-
-                const float2 wv_fragment0 = tg_load_frag2(wv_frag_base + w_row_disp);
-                const float2 wv_fragment1 = tg_load_frag2(wv_frag_base + w_row_disp + kFrag);
-                v_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wv_fragment0, v_accumulator0);
-                v_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wv_fragment1, v_accumulator1);
-
-                const float2 wq_fragment0 = tg_load_frag2(wq_frag_base + w_row_disp);
-                const float2 wq_fragment1 = tg_load_frag2(wq_frag_base + w_row_disp + kFrag);
-                q_accumulator0 = lowreg_matrix::mma_8x8(x_fragment, wq_fragment0, q_accumulator0);
-                q_accumulator1 = lowreg_matrix::mma_8x8(x_fragment, wq_fragment1, q_accumulator1);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // ---------------- epilogue：与 5.18ms 版逐字相同 ----------------
-        const ushort2 mo = morton_order(ushort(lane));
-        const uint local_row  = simd_row_base + uint(mo.y);
-        const uint global_row = row_base + local_row;
-
-        if (global_row < token_count) {
-            const uint b = global_row / T;
-            const uint t = global_row - b * T;
-            const uint q_row_base = global_row * C;
-            const uint kv_bt_base = b * T * C + t * D;
-
-            #pragma unroll
-            for (uint fi = 0u; fi < 2u; ++fi) {
-                const float2 q_value = fi == 0u ? q_accumulator0 : q_accumulator1;
-                const float2 k_value = fi == 0u ? k_accumulator0 : k_accumulator1;
-                const float2 v_value = fi == 0u ? v_accumulator0 : v_accumulator1;
-                const uint fc  = simd_col_base + uint(mo.x) + fi * 8u;
-                const uint oc0 = output_base + fc;
-                const bool pair_ok = (fc + 1u < kBN) && (oc0 + 1u < C) && ((oc0 & 1u) == 0u);
-
-                if (pair_ok) {
-                    const float2 q_store = q_value + float2(bq_tg[fc], bq_tg[fc + 1u]);
-                    const float2 k_store = k_value + float2(bk_tg[fc], bk_tg[fc + 1u]);
-                    const float2 v_store = v_value + float2(bv_tg[fc], bv_tg[fc + 1u]);
-
-                    *reinterpret_cast<device packed_float2*>(q_out + q_row_base + oc0) = packed_float2(q_store);
-
-                    uint h0, d0;
-                    if (d_is_pow2) { h0 = oc0 >> d_shift; d0 = oc0 & d_mask; }
-                    else           { h0 = oc0 / D;        d0 = oc0 - h0 * D; }
-                    const uint ci0 = kv_bt_base + h0 * kv_head_stride + d0;
-
-                    if (d_even) {
-                        *reinterpret_cast<device packed_float2*>(k_cache + ci0) = packed_float2(k_store);
-                        *reinterpret_cast<device packed_float2*>(v_cache + ci0) = packed_float2(v_store);
-                    } else {
-                        k_cache[ci0] = k_store.x; v_cache[ci0] = v_store.x;
-                        uint h1 = h0, d1 = d0 + 1u;
-                        if (d1 >= D) { d1 = 0u; h1 = h0 + 1u; }
-                        const uint ci1 = kv_bt_base + h1 * kv_head_stride + d1;
-                        k_cache[ci1] = k_store.y; v_cache[ci1] = v_store.y;
-                    }
-                } else {
-                    #pragma unroll
-                    for (uint cp = 0u; cp < 2u; ++cp) {
-                        const uint lc = fc + cp;
-                        const uint oc = output_base + lc;
-                        if (lc < kBN && oc < C) {
-                            q_out[q_row_base + oc] = q_value[cp] + bq_tg[lc];
-                            uint h, d;
-                            if (d_is_pow2) { h = oc >> d_shift; d = oc & d_mask; }
-                            else           { h = oc / D;        d = oc - h * D; }
-                            const uint ci = kv_bt_base + h * kv_head_stride + d;
-                            k_cache[ci] = k_value[cp] + bk_tg[lc];
-                            v_cache[ci] = v_value[cp] + bv_tg[lc];
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 template <uint kDChunks>
 METAL_FUNC static void fa_br32_load_q(
     device const float* q,
@@ -14460,3 +14197,322 @@ DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, true,  true,  32, 32, 16, 2, 2, "fp
 DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, false, true,  32, 32, 16, 2, 2, "fp16_gemm_splitk_nnnt_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, true,  false, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nntn_bm32_bn32_bk16_wm2_wn2");
 DEFINE_FP16_SCALED_GEMM_SPLITK(false, false, false, false, 32, 32, 16, 2, 2, "fp16_gemm_splitk_nnnn_bm32_bn32_bk16_wm2_wn2");
+
+kernel void fused_rms_fa_project_kv2(
+    device const float* x           [[buffer(0)]],
+    device const float* wq          [[buffer(1)]],
+    device const float* bq          [[buffer(2)]],
+    device const float* wk          [[buffer(3)]],
+    device const float* bk          [[buffer(4)]],
+    device const float* wv          [[buffer(5)]],
+    device const float* bv          [[buffer(6)]],
+    device float* q_out             [[buffer(7)]],
+    device float* k_cache           [[buffer(8)]],
+    device float* v_cache           [[buffer(9)]],
+    constant uint& B                [[buffer(10)]],
+    constant uint& T                [[buffer(11)]],
+    constant uint& C                [[buffer(12)]],
+    constant uint& H_packed         [[buffer(13)]],
+    constant uint& eps_bits         [[buffer(14)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint simd_id                    [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint BM = 64u, BN = 64u, BK = 16u, WM = 2u, WN = 2u;
+    constexpr uint tgp_size = WM * WN * 32u; // 128
+    constexpr short lda_tgp = BK + 4;        // 20
+    constexpr short ldb_tgp = BN + 4;        // 68
+    
+    const bool pre_norm = (H_packed & 0x80000000u) != 0u;
+    const uint H = H_packed & 0x7fffffffu;
+
+    if (tg_pos.z >= 3u || B == 0u || T == 0u || C == 0u || H == 0u || (C % H) != 0u) return;
+    const uint token_count = B * T;
+    const uint D = C / H;
+
+    const uint tiles_m = (token_count + BM - 1u) / BM;
+    const uint tiles_n = (C + BN - 1u) / BN;
+    const uint swizzle_log = pre_norm
+             ? ((tiles_m >= 8u && tiles_n >= 8u) ? 3u : ((tiles_m >= 4u && tiles_n >= 4u) ? 2u : ((tiles_m >= 2u && tiles_n >= 4u) ? 1u : 0u)))
+             : 0u;
+    const uint tid_y = (tg_pos.y << swizzle_log) + (tg_pos.x & ((1u << swizzle_log) - 1u));
+    const uint tid_x = tg_pos.x >> swizzle_log;
+    if (D == 0u || tid_x >= tiles_n || tid_y >= tiles_m) return;
+    const uint c_row = tid_y * BM;
+    const uint c_col = tid_x * BN;
+
+    threadgroup float As[BM * lda_tgp];
+    threadgroup float Bs[BK * ldb_tgp];
+    threadgroup float inv_rms_tg[BM];
+
+    // 1. 若未预归一化，才在 TG 内计算 inv_rms
+    if (!pre_norm) {
+        const float eps = as_type<float>(eps_bits);
+        for (uint r = simd_id; r < BM; r += (WM * WN)) {
+            const uint gr = c_row + r;
+            float sq = 0.0f;
+            if (gr < token_count) {
+                device const float* xr = x + size_t(gr) * C;
+                for (uint c = lane; c < C; c += 32u) {
+                    const float v = xr[c];
+                    sq = fma(v, v, sq);
+                }
+            }
+            const float inv = (gr < token_count) ? rsqrt(simd_sum(sq) / float(C) + eps) : 0.0f;
+            if (lane == 0u) inv_rms_tg[r] = inv;
+        }
+    }
+
+    // 2. 选择 Q / K / V 权重与偏置
+    device const float* W = (tg_pos.z == 0u) ? wq : ((tg_pos.z == 1u) ? wk : wv);
+    device const float* bias = (tg_pos.z == 0u) ? bq : ((tg_pos.z == 1u) ? bk : bv);
+
+    using mma_t = BlockMMA<float, BM, BN, BK, WM, WN, false, false, lda_tgp, ldb_tgp, float, false>;
+    using loader_a_t = BlockLoader<float, BM, BK, lda_tgp, tgp_size, 1>;
+    using loader_b_t = BlockLoader<float, BK, BN, ldb_tgp, tgp_size, 0>;
+
+    thread mma_t mma_op(simd_id, lane);
+    thread loader_a_t loader_a(x + size_t(c_row) * C, As, int(C), simd_id, lane);
+    thread loader_b_t loader_b(W + c_col, Bs, int(C), simd_id, lane);
+
+    const short tgp_bm = short(min(BM, token_count - c_row));
+    const short tgp_bn = short(min(BN, C - c_col));
+    const int k_iters = int(C / BK);
+    const short lbk = short(C % BK);
+
+    // 3. 复用 gemm_loop 主循环
+    if (lbk == 0) {
+        if (tgp_bm == short(BM) && tgp_bn == short(BN)) {
+            gemm_loop<float, BK, false, false, true, true, true, false>(
+                As, Bs, k_iters, 0u, nullptr, nullptr, token_count, C, int(c_row), int(c_col), 0u,
+                loader_a, loader_b, mma_op, tgp_bm, tgp_bn, lbk);
+        } else {
+            gemm_loop<float, BK, false, false, false, false, true, false>(
+                As, Bs, k_iters, 0u, nullptr, nullptr, token_count, C, int(c_row), int(c_col), 0u,
+                loader_a, loader_b, mma_op, tgp_bm, tgp_bn, lbk);
+        }
+    } else {
+        gemm_loop<float, BK, false, false, false, false, false, false>(
+            As, Bs, k_iters, 0u, nullptr, nullptr, token_count, C, int(c_row), int(c_col), 0u,
+            loader_a, loader_b, mma_op, tgp_bm, tgp_bn, lbk);
+    }
+
+    // 4. Epilogue：乘 inv_rms + bias，按 Q[BT,C] 或 KV[B,H,T,D] 写出
+    const bool is_q = (tg_pos.z == 0u);
+    device float* dst_cache = (tg_pos.z == 1u) ? k_cache : v_cache;
+    const uint kv_head_stride = T * D;
+
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < mma_t::TM; ++i) {
+        const uint local_r = uint(mma_op.sm + i * 8 * int(WM));
+        const uint gr = c_row + local_r;
+        if (gr >= token_count) continue;
+
+        const float scale = pre_norm ? 1.0f : inv_rms_tg[local_r];
+        const uint b = gr / T;
+        const uint t = gr - b * T;
+        const uint kv_bt = b * T * C + t * D;
+
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < mma_t::TN; ++j) {
+            const uint gc = c_col + uint(mma_op.sn + j * 8 * int(WN));
+            if (gc >= C) continue;
+
+            const auto frag = mma_op.Ctile.frag_at(i, j);
+            if (gc + 1u < C) {
+                const float2 val = float2(frag[0], frag[1]) * scale +
+                                   float2(*reinterpret_cast<device const packed_float2*>(bias + gc));
+                if (is_q) {
+                    *reinterpret_cast<device packed_float2*>(q_out + size_t(gr) * C + gc) = packed_float2(val);
+                } else {
+                    const uint h0 = gc / D, d0 = gc - h0 * D;
+                    const uint ci0 = kv_bt + h0 * kv_head_stride + d0;
+                    if (d0 + 1u < D) {
+                        *reinterpret_cast<device packed_float2*>(dst_cache + ci0) = packed_float2(val);
+                    } else {
+                        dst_cache[ci0] = val.x;
+                        dst_cache[kv_bt + (h0 + 1u) * kv_head_stride] = val.y;
+                    }
+                }
+            } else {
+                const float val = frag[0] * scale + bias[gc];
+                if (is_q) {
+                    q_out[size_t(gr) * C + gc] = val;
+                } else {
+                    const uint h0 = gc / D, d0 = gc - h0 * D;
+                    dst_cache[kv_bt + h0 * kv_head_stride + d0] = val;
+                }
+            }
+        }
+    }
+}
+
+kernel void fused_rms_fa_project_kv(
+    device const float* x           [[buffer(0)]],
+    device const float* wq          [[buffer(1)]],
+    device const float* bq          [[buffer(2)]],
+    device const float* wk          [[buffer(3)]],
+    device const float* bk          [[buffer(4)]],
+    device const float* wv          [[buffer(5)]],
+    device const float* bv          [[buffer(6)]],
+    device float* q_out             [[buffer(7)]],
+    device float* k_cache           [[buffer(8)]],
+    device float* v_cache           [[buffer(9)]],
+    constant uint& B                [[buffer(10)]],
+    constant uint& T                [[buffer(11)]],
+    constant uint& C                [[buffer(12)]],
+    constant uint& H                [[buffer(13)]],
+    constant uint& eps_bits         [[buffer(14)]],
+    uint3 tg_pos                    [[threadgroup_position_in_grid]],
+    uint lane                       [[thread_index_in_simdgroup]],
+    uint simd_id                    [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint BM = 32u, BN = 64u, BK = 16u, WM = 2u, WN = 2u;
+    constexpr uint tgp_size = WM * WN * 32u; // 128
+    constexpr short lda_tgp = BK + 4;        // 20
+    constexpr short ldb_tgp = BN + 4;        // 68
+
+    if (tg_pos.x != 0u || tg_pos.z != 0u || B == 0u || T == 0u || C == 0u || H == 0u || (C % H) != 0u) return;
+    const uint token_count = B * T;
+    const uint D = C / H;
+    const uint c_row = tg_pos.y * BM;
+    if (D == 0u || c_row >= token_count) return;
+
+    // 静态 TG 内存仅 ~6.9 KB（原版 30.9 KB）
+    threadgroup float As[BM * lda_tgp];
+    threadgroup float Bqs[BK * ldb_tgp];
+    threadgroup float Bks[BK * ldb_tgp];
+    threadgroup float Bvs[BK * ldb_tgp];
+    threadgroup float inv_rms_tg[BM];
+
+    // 1. 每个 token 只计算 1 遍 inv_rms
+    const float eps = as_type<float>(eps_bits);
+    for (uint r = simd_id; r < BM; r += (WM * WN)) {
+        const uint gr = c_row + r;
+        float sq = 0.0f;
+        if (gr < token_count) {
+            device const float* xr = x + size_t(gr) * C;
+            for (uint c = lane; c < C; c += 32u) {
+                const float v = xr[c];
+                sq = fma(v, v, sq);
+            }
+        }
+        const float inv = (gr < token_count) ? rsqrt(simd_sum(sq) / float(C) + eps) : 0.0f;
+        if (lane == 0u) inv_rms_tg[r] = inv;
+    }
+
+    using mma_t = BlockMMA<float, BM, BN, BK, WM, WN, false, false, lda_tgp, ldb_tgp, float, false>;
+    using loader_a_t = BlockLoader<float, BM, BK, lda_tgp, tgp_size, 1>;
+    using loader_b_t = BlockLoader<float, BK, BN, ldb_tgp, tgp_size, 0>;
+
+    const short tgp_bm = short(min(BM, token_count - c_row));
+    const bool align_m = (tgp_bm == short(BM));
+    const int k_iters = int(C / BK);
+    const short lbk = short(C % BK);
+    const uint kv_head_stride = T * D;
+
+    for (uint c_col = 0u; c_col < C; c_col += BN) {
+        const short tgp_bn = short(min(BN, C - c_col));
+        const bool align_n = (tgp_bn == short(BN));
+        const short2 dim_a = short2(short(BK), tgp_bm);
+        const short2 dim_b = short2(tgp_bn, short(BK));
+
+        thread mma_t mma_q(simd_id, lane);
+        thread mma_t mma_k(simd_id, lane);
+        thread mma_t mma_v(simd_id, lane);
+        thread loader_a_t loader_a(x + size_t(c_row) * C, As, int(C), simd_id, lane);
+        thread loader_b_t loader_bq(wq + c_col, Bqs, int(C), simd_id, lane);
+        thread loader_b_t loader_bk(wk + c_col, Bks, int(C), simd_id, lane);
+        thread loader_b_t loader_bv(wv + c_col, Bvs, int(C), simd_id, lane);
+ 
+        // 2. K 主循环：单轮 2 次 barrier，并发加载 As/Bqs/Bks/Bvs 并连续 MMA
+        for (int k = 0; k < k_iters; ++k) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (align_m) loader_a.load_unsafe(); else loader_a.load_safe(dim_a);
+            const float a_scale = inv_rms_tg[loader_a.bi];
+            *reinterpret_cast<threadgroup packed_float4*>(loader_a.dst) = 
+                    packed_float4(float4(*reinterpret_cast<threadgroup const packed_float4*>(loader_a.dst)) * a_scale);
+            if (align_n) {
+                loader_bq.load_unsafe();
+                loader_bk.load_unsafe();
+                loader_bv.load_unsafe();
+            } else {
+                loader_bq.load_safe(dim_b);
+                loader_bk.load_safe(dim_b);
+                loader_bv.load_safe(dim_b);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_q.mma(As, Bqs);
+            mma_k.mma(As, Bks);
+            mma_v.mma(As, Bvs);
+
+            loader_a.next();
+            loader_bq.next();
+            loader_bk.next();
+            loader_bv.next();
+        }
+
+        if (lbk != 0) {
+            const short2 dim_a_last = short2(lbk, tgp_bm);
+            const short2 dim_b_last = short2(tgp_bn, lbk);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            loader_a.load_safe(dim_a_last);
+            const float a_scale = inv_rms_tg[loader_a.bi];
+            *reinterpret_cast<threadgroup packed_float4*>(loader_a.dst) =
+                    packed_float4(float4(*reinterpret_cast<threadgroup const packed_float4*>(loader_a.dst)) * a_scale);
+            loader_bq.load_safe(dim_b_last);
+            loader_bk.load_safe(dim_b_last);
+            loader_bv.load_safe(dim_b_last);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            mma_q.mma(As, Bqs);
+            mma_k.mma(As, Bks);
+            mma_v.mma(As, Bvs);
+        }
+
+        // 3. Epilogue：同时写出 Q[BT,C] 与 K/V[B,H,T,D]
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < mma_t::TM; ++i) {
+            const uint local_r = uint(mma_q.sm + i * 8 * int(WM));
+            const uint gr = c_row + local_r;
+            if (gr >= token_count) continue;
+
+            const float scale = inv_rms_tg[local_r];
+            const uint b = gr / T;
+            const uint t = gr - b * T;
+            const uint kv_bt = b * T * C + t * D;
+
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < mma_t::TN; ++j) {
+                const uint gc = c_col + uint(mma_q.sn + j * 8 * int(WN));
+                if (gc >= C) continue;
+
+                const auto fq = mma_q.Ctile.frag_at(i, j);
+                const auto fk = mma_k.Ctile.frag_at(i, j);
+                const auto fv = mma_v.Ctile.frag_at(i, j);
+                if (gc + 1u < C) {
+                    const float2 q_val = float2(fq[0], fq[1]) + float2(*reinterpret_cast<device const packed_float2*>(bq + gc));
+                    const float2 k_val = float2(fk[0], fk[1]) + float2(*reinterpret_cast<device const packed_float2*>(bk + gc));
+                    const float2 v_val = float2(fv[0], fv[1]) + float2(*reinterpret_cast<device const packed_float2*>(bv + gc));
+                    *reinterpret_cast<device packed_float2*>(q_out + size_t(gr) * C + gc) = packed_float2(q_val);
+
+                    const uint h0 = gc / D, d0 = gc - h0 * D;
+                    const uint ci0 = kv_bt + h0 * kv_head_stride + d0;
+                    if (d0 + 1u < D) {
+                        *reinterpret_cast<device packed_float2*>(k_cache + ci0) = packed_float2(k_val);
+                        *reinterpret_cast<device packed_float2*>(v_cache + ci0) = packed_float2(v_val);
+                    } else {
+                        k_cache[ci0] = k_val.x; v_cache[ci0] = v_val.x;
+                        const uint ci1 = kv_bt + (h0 + 1u) * kv_head_stride;
+                        k_cache[ci1] = k_val.y; v_cache[ci1] = v_val.y;
+                    }
+                } else {
+                    const uint h0 = gc / D, d0 = gc - h0 * D;
+                    const uint ci0 = kv_bt + h0 * kv_head_stride + d0;
+                    q_out[size_t(gr) * C + gc] = fq[0] + bq[gc];
+                    k_cache[ci0] = fk[0] + bk[gc];
+                    v_cache[ci0] = fv[0] + bv[gc];
+                }
+            }
+        }
+    }
+}

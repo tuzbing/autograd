@@ -640,7 +640,7 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 				wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 				out_buf.ptr.offset, k.ptr.offset, v.ptr.offset],
-			[B, T, C, H, eps_bits], 512, (B*T+31)//32, 1, 512)
+			[B, T, C, H, eps_bits], 128, (B*T + 31) // 32, 1, 128)
 
 		# RoPE
 		self.ctx.dispatch_with_args_3d("rope_qk_inplace",
@@ -915,14 +915,22 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 			N_fla = proj_w.shape[-1]
 
 			# 1. RMSNorm + Q/K/V projection -> reuse h1
-			self.ctx.dispatch_with_args_3d('fused_rms_fa_project_kv',
-				[fa_x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+				[fa_x.storage.ptr.buffer_id, tmp_dx.ptr.buffer_id],
+				[fa_x.storage.ptr.offset, tmp_dx.ptr.offset],
+				[C, fa_eps_bits], (B * T) * 256, 1, 1, 256)
+			tm, tn = (B * T + 63) // 64, (C + 63) // 64
+			sw_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm >= 4 and tn >= 4) else (1 if (tm >= 2 and tn >= 4) else 0))
+			sw = 1 << sw_log
+			self.ctx.dispatch_with_args_3d('fused_rms_fa_project_kv2',
+				[tmp_dx.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
 					wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
 					gu.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id],
-				[fa_x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+				[tmp_dx.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 					wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 					fa_out_offset, fa_k_offset, fa_v_offset],
-				[B, T, C, n_head, fa_eps_bits], 512, (B*T+31)//32, 1, 512)
+				[B, T, C, n_head | 0x80000000, fa_eps_bits], 128 * tn * sw, (tm + sw - 1) // sw, 3, 128)
+
 			# 2. RoPE
 			self.ctx.dispatch_with_args_3d("rope_qk_inplace",
 				[gu.ptr.buffer_id, gu.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],

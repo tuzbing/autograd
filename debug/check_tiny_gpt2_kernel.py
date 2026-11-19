@@ -3375,7 +3375,8 @@ def _dispatch_fa_recompute_project(
             cfg.H,
             _eps_bits(),
         ],
-        512, (cfg.B * cfg.T + 31) // 32, 1, 512,)
+        # 512, (cfg.B * cfg.T + 31) // 32, 1, 512,)
+        128, (cfg.B*cfg.T+31)//32, 1, 128)
 
 def probe_linear_add_internal(cfg, x_np, arrays, block, upstream):
     print("\n=== Internal kernels: FusedLinearAdd (real FA producer path) ===")
@@ -3565,7 +3566,8 @@ def _dispatch_context_recompute(rt, cfg, t, h, dh):
             H,
             _eps_bits(),
         ],
-        512, (B * T + 31) // 32, 1, 512,)
+        # 512, (B * T + 31) // 32, 1, 512,)
+        128, (B * T + 31) // 32, 1, 128,)
 
     return q_offset, k_offset, v_offset
 

@@ -102,7 +102,7 @@ public:
             @"fused_rmsnorm_mlp_forward_kernel_bm16", @"fused_rmsnorm_mlp_forward_kernel_bm32",
             @"fill_scalar_kernel", @"fill_scalar_kernel2",
             @"rope_qk_inplace",
-            @"fused_rms_fa_project_kv",
+            @"fused_rms_fa_project_kv", @"fused_rms_fa_project_kv2",
             @"rmsnorm_backward",
             @"rmsnorm_weighted_forward", @"rmsnorm_weighted_backward", @"rmsnorm_weighted_dgamma",
             @"fused_rms_fa_qkv", 
