@@ -3088,15 +3088,16 @@ class MetalBackend(Backend):
 			[src_id, rs_id, q_id, q_id, q_id], [src_off, rs_off, q_off, max_off, s_off],
 			[numel, scale_len, cols], grid_x, 1, 1, 256)
 
-	def _dispatch_fp16_gemm_raw(self, cfg, with_accum, buf_ids, offsets, m, n, k):
+	def _dispatch_fp16_gemm_raw(self, cfg, with_accum, buf_ids, offsets, m, n, k, out_bf16=False):
 		kernel = fp16_gemm_kernel_name(cfg, with_accum, prefix="fp16")
 		# print(f"Need kernel {kernel}")
 		if cfg["is_splitk"] and not with_accum:
 			self.ctx.fill_scalar("fill_scalar_kernel", [buf_ids[4]], [offsets[4]], 0.0, m * n)
+		swizzle = cfg["swizzle_log"] | (0x80000000 if out_bf16 else 0) if not cfg["is_splitk"] else 0
 		args = (
 			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["split_k_partitions"], cfg["split_k_partition_stride"], cfg["split_k_partition_size"], cfg["k_iter_aligned"]]
 			if cfg["is_splitk"] else
-			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], cfg["swizzle_log"], cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
+			[m, n, k, cfg["lda"], cfg["ldb"], cfg["ldd"], cfg["tm"], cfg["tn"], swizzle, cfg["k_iter_aligned"], cfg["m_aligned"], cfg["n_aligned"], cfg["k_aligned"]]
 		)
 		self.ctx.dispatch_with_args_3d(kernel, buf_ids, offsets, args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 
@@ -3328,7 +3329,8 @@ class MetalBackend(Backend):
 		dx_norm = scratch["dx_norm"]
 		inv_rms = scratch["inv_rms"]
 
-		chunk_rows = min(logits.shape[0], N)
+		raw_rows = min(logits.shape[0], N)
+		chunk_rows = (raw_rows // 64) * 64 if raw_rows >= 64 else raw_rows
 		itemsize = np.dtype(x.dtype).itemsize
 		eps_bits = f32_bits(op.eps)
 
@@ -3808,12 +3810,15 @@ class MetalBackend(Backend):
 			fa_v_offset = fa_k_offset + B*T*CKV*4
 			fa_out_storage = attn_out.grad.storage
 
+			tm, tn = (B * T + 63) // 64, (C + 63) // 64 + 2 * ((CKV + 63) // 64)
+			sw_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm >= 4 and tn >= 4) else (1 if (tm >= 2 and tn >= 4) else 0))
+			sw = 1 << sw_log
 			self.ctx.dispatch_with_args_3d("gqa_rms_qkv",
 				[fa_x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id,
 				 wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, gu.ptr.buffer_id, fa_norm_weight.storage.ptr.buffer_id],
 				[fa_x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset,
 				 wv.storage.ptr.offset, bv.storage.ptr.offset, fa_q_offset, fa_k_offset, fa_v_offset, fa_norm_weight.storage.ptr.offset],
-				[B, T, C, Hq, fa_eps_bits, Hkv], 256, (B*T+15)//16, 1, 256)
+				[B, T, C, Hq, fa_eps_bits, Hkv], 128 * tn * sw, (tm + sw - 1) // sw, 1, 128)
 
 			negative_sin = int(fa_node.op.rope_sign < 0)
 			self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
@@ -3892,7 +3897,20 @@ class MetalBackend(Backend):
 			wq_off = s_dout_off + align_up(scale_len * 4, 16)
 			sw_off = wq_off + align_up(h_tile * C * 2, 16)
 
-		if down_bf16:
+		if use_fp16_gemm:
+			self._quantize_fp16_tensor(out.grad.storage.ptr.buffer_id, out.grad.storage.ptr.offset,
+				q_id, dout_q_off, s_dout_off, wq_off, N * C, scale_len)
+			if wdown.requires_grad:
+				self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+					[gu.ptr.offset, hidden.ptr.offset],
+					[N, H | 0x80000000], N * ((H + 3) // 4), 1, 1, min(N * ((H + 3) // 4), 256))
+				self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [wq_off], 1.0, H)
+				self._dispatch_fp16_gemm_raw(scratch.gemm_configs["dwdown"], bool(accumulate),
+					[hidden.ptr.buffer_id, q_id, q_id, q_id, wdown.grad.storage.ptr.buffer_id],
+					[hidden.ptr.offset, dout_q_off, wq_off, s_dout_off, wdown.grad.storage.ptr.offset],
+					H, C, N, out_bf16=down_bf16)
+		elif down_bf16:
 			dw_offset = hidden.ptr.offset + down_dw_relative
 			for h0 in range(0, H, down_tile_h):
 				h = min(down_tile_h, H - h0)
@@ -3908,22 +3926,6 @@ class MetalBackend(Backend):
 				self.ctx.dispatch_with_args_3d("fp32_to_bf16",
 					[hidden.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id], [dw_offset, wdown.grad.storage.ptr.offset+h0*C*2],
 					[accumulate], h*C, 1, 1, min(h*C, 256))
-			if use_fp16_gemm:
-				self._quantize_fp16_tensor(out.grad.storage.ptr.buffer_id, out.grad.storage.ptr.offset,
-					q_id, dout_q_off, s_dout_off, wq_off, N * C, scale_len)
-		elif use_fp16_gemm:
-			self._quantize_fp16_tensor(out.grad.storage.ptr.buffer_id, out.grad.storage.ptr.offset,
-				q_id, dout_q_off, s_dout_off, wq_off, N * C, scale_len)
-			if wdown.requires_grad:
-				self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
-					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
-					[gu.ptr.offset, hidden.ptr.offset],
-					[N, H | 0x80000000], N * ((H + 3) // 4), 1, 1, min(N * ((H + 3) // 4), 256))
-				self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [wq_off], 1.0, H)
-				self._dispatch_fp16_gemm_raw(scratch.gemm_configs["dwdown"], bool(accumulate),
-					[hidden.ptr.buffer_id, q_id, q_id, q_id, wdown.grad.storage.ptr.buffer_id],
-					[hidden.ptr.offset, dout_q_off, wq_off, s_dout_off, wdown.grad.storage.ptr.offset],
-					H, C, N)
 		else:
 			self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
 				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
@@ -3994,23 +3996,14 @@ class MetalBackend(Backend):
 				self._quantize_fp16_tensor(x_norm_storage.ptr.buffer_id, x_norm_storage.ptr.offset,
 					q_id, zq_off, sz_off, s1_off, N * C, C, q_id, sdgu_off, C)
 				self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [s1_off], 1.0, H2)
-				if gu_bf16:
-					dw_tmp_off = s1_off + align_up(H2 * 4, 16)
-					dwgu_bf16_cfgs = scratch.gemm_configs["dwgu_bf16"]
-					for c0 in range(0, C, gu_tile_r):
-						r = min(gu_tile_r, C - c0)
-						self._dispatch_fp16_gemm_raw(dwgu_bf16_cfgs[r], False,
-							[q_id, gu.ptr.buffer_id, q_id, q_id, q_id],
-							[zq_off + c0 * 2, gu.ptr.offset, sz_off, s1_off, dw_tmp_off],
-							r, H2, N)
-						self.ctx.dispatch_with_args_3d("fp32_to_bf16",
-							[q_id, wgu.grad.storage.ptr.buffer_id], [dw_tmp_off, wgu.grad.storage.ptr.offset + c0 * H2 * 2],
-							[accumulate], r * H2, 1, 1, min(r * H2, 256))
-				else:
-					self._dispatch_fp16_gemm_raw(scratch.gemm_configs["dwgu"], bool(accumulate),
-						[q_id, gu.ptr.buffer_id, q_id, q_id, wgu.grad.storage.ptr.buffer_id],
-						[zq_off, gu.ptr.offset, sz_off, s1_off, wgu.grad.storage.ptr.offset],
-						C, H2, N)
+				dwgu_cfg = scratch.gemm_configs.get("dwgu")
+				if dwgu_cfg is None:
+					dwgu_cfg = get_fp16_gemm_config(M=C, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", ldb=2*H2)
+					scratch.gemm_configs["dwgu"] = dwgu_cfg
+				self._dispatch_fp16_gemm_raw(dwgu_cfg, bool(accumulate),
+					[q_id, gu.ptr.buffer_id, q_id, q_id, wgu.grad.storage.ptr.buffer_id],
+					[zq_off, gu.ptr.offset, sz_off, s1_off, wgu.grad.storage.ptr.offset],
+					C, H2, N, out_bf16=gu_bf16)
 			elif gu_bf16:
 				dw_offset = hidden.ptr.offset + gu_dw_relative
 				for c0 in range(0, C, gu_tile_r):
@@ -4460,9 +4453,14 @@ class MetalBackend(Backend):
 		eps_bits = struct.unpack("<i", struct.pack("<f", op.eps))[0]
 		q, k, v = scratch["q"], scratch["k"], scratch["v"]
 		inp_vars = [x.storage, wq.storage, bq.storage, wk.storage, bk.storage, wv.storage, bv.storage, q, k, v, norm_weight.storage]
+
+		tm, tn = (B * T + 63) // 64, (C + 63) // 64 + 2 * ((HKV * D + 63) // 64)
+		sw_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm >= 4 and tn >= 4) else (1 if (tm >= 2 and tn >= 4) else 0))
+		sw = 1 << sw_log
 		self.ctx.dispatch_with_args_3d("gqa_rms_qkv",
 			[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
-			[B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+			[B, T, C, H, eps_bits, HKV], 128 * tn * sw, (tm + sw - 1) // sw, 1, 128)
+
 		negative_sin = int(op.rope_sign < 0)
 		inp_vars2 = [q, rope_cos.storage, rope_sin.storage]
 		self.ctx.dispatch_with_args_3d("gqa_rope_inplace",
@@ -4495,11 +4493,14 @@ class MetalBackend(Backend):
 		dq, dk, dv = scratch['dq'], scratch['dk'], scratch['dv']
 		lse, d_val = scratch['lse'], scratch['d_val']
 
-		# 1. 重算 QKV 以及 RoPE。
+		# 1. 重算 QKV 以及 RoPE
+		tm, tn = (N + 63) // 64, (C + 63) // 64 + 2 * ((CKV + 63) // 64)
+		sw_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm >= 4 and tn >= 4) else (1 if (tm >= 2 and tn >= 4) else 0))
+		sw = 1 << sw_log
 		self.ctx.dispatch_with_args_3d('gqa_rms_qkv',
 		    [x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, norm_weight.storage.ptr.buffer_id],
 		    [x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset, norm_weight.storage.ptr.offset],
-		    [B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+		    [B, T, C, H, eps_bits, HKV], 128 * tn * sw, (tm + sw - 1) // sw, 1, 128)
 		negative_sin = int(op.rope_sign < 0)
 		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
 		    [q.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -4662,10 +4663,13 @@ class MetalBackend(Backend):
 		D = C // H
 		eps_bits = struct.unpack('<i', struct.pack('<f', op.eps))[0]
 		q, k, v = scratch['fa_q'], scratch['fa_k'], scratch['fa_v']
+		tm, tn = (B * T + 63) // 64, (C + 63) // 64 + 2 * ((HKV * D + 63) // 64)
+		sw_log = 3 if (tm >= 8 and tn >= 8) else (2 if (tm >= 4 and tn >= 4) else (1 if (tm >= 2 and tn >= 4) else 0))
+		sw = 1 << sw_log
 		self.ctx.dispatch_with_args_3d('gqa_rms_qkv',
 		    [x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id, wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id, q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, norm_weight.storage.ptr.buffer_id],
 		    [x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset, wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset, q.ptr.offset, k.ptr.offset, v.ptr.offset, norm_weight.storage.ptr.offset],
-		    [B, T, C, H, eps_bits, HKV], 256, (B*T+15)//16, 1, 256)
+		    [B, T, C, H, eps_bits, HKV], 128 * tn * sw, (tm + sw - 1) // sw, 1, 128)
 		negative_sin = int(op.rope_sign < 0)
 		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
 		    [q.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],

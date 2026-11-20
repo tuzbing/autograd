@@ -80,12 +80,20 @@ def get_fp16_gemm_config(M, N, K, with_accum=False, a_transpose=False, b_transpo
 						lda=None, ldb=None, ldd=None):
 	tm, tn, tk = (M+15)//16, (N+15)//16, K//16
 	splitk_limit = 256 # M1 8核满载仅需64*64线程组(tm*tn=768), 避免dx误入低效splitk
-	can_splitk = ((dtype != "fp16") or (not a_transpose and not b_transpose)) and (ldd is None or ldd == N)
+	# can_splitk = ((dtype != "fp16") or (not a_transpose and not b_transpose)) and (ldd is None or ldd == N)
+	if dtype == "fp16":
+		can_splitk = (not a_transpose and not b_transpose)
+	else:
+		can_splitk = (M % 32 == 0 and N % 32 == 0) and (
+			(not a_transpose and not b_transpose)
+			or ((a_transpose != b_transpose) and K % 16 == 0))
+	can_splitk = can_splitk and (ldd is None or ldd == N)
 	if can_splitk and tm*tn<splitk_limit and tk >= 8 and K > max(M, N):
 		tm, tn = (M+31)//32, (N+31)//32
 		tk = K/16
-		bm = 32 if dtype == "fp16" else (16 if M < 40 else 32)
-		bn = 32 if dtype == "fp16" else (16 if N < 40 else 32)
+		# bm = 32 if dtype == "fp16" else (16 if M < 40 else 32)
+		# bn = 32 if dtype == "fp16" else (16 if N < 40 else 32)
+		bm, bn = 32, 32
 		bk = 16
 		wm, wn = 2, 2
 		max_k_pow2 = 1 << ((K // bk).bit_length() - 1)

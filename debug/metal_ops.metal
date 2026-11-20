@@ -10587,245 +10587,6 @@ inline void gqa_store_pair(device float* out, float2 value,
     }
 }
 
-
-template <bool kChecked> inline void gqa_mma_sweep(
-    threadgroup const float* Z,
-    device const float* wq, device const float* wk, device const float* wv,
-    uint C, uint CKV, uint input_base,
-    uint matrix_x, uint matrix_y,
-    uint weight_col0, uint weight_col1,
-    thread float2& q00, thread float2& q01, thread float2& q10, thread float2& q11,
-    thread float2& k00, thread float2& k01, thread float2& k10, thread float2& k11,
-    thread float2& v00, thread float2& v01, thread float2& v10, thread float2& v11)
-{
-    constexpr uint kFq2BM      = 16u;
-    constexpr uint kFq2BK      = 128u;              // 可调: 128 / 192 / 256
-    constexpr uint kFq2BN      = 128u;              // 输出 supertile, 不变
-    constexpr uint kFq2Frag    = 8u;
-    constexpr uint kFq2ZStride = kFq2BK + 4u;       // 132: 行长 528B, 16B 对齐
-    constexpr uint kFq2Fill    = kFq2BK / 64u;      // 每线程每次 fill 的 float4 数 = 2
-
-    uint z_off0 = matrix_y * kFq2ZStride + matrix_x;
-    uint z_off1 = z_off0 + 8u * kFq2ZStride;
-    uint w_row  = input_base + matrix_y;
-    uint w_off  = w_row * C + weight_col0;
-    const uint w_step = kFq2Frag * C;
-
-    for (uint ks = 0u; ks < kFq2BK; ks += kFq2Frag) {
-        const float2 z0 = float2(*reinterpret_cast<threadgroup const packed_float2*>(Z + z_off0));
-        const float2 z1 = float2(*reinterpret_cast<threadgroup const packed_float2*>(Z + z_off1));
-
-        float2 wqf0, wqf1;
-        if (kChecked) {
-            wqf0 = gqa_load_weight_pair(wq, w_row, weight_col0, C, C);
-            wqf1 = gqa_load_weight_pair(wq, w_row, weight_col1, C, C);
-        } else {
-            wqf0 = float2(*reinterpret_cast<device const packed_float2*>(wq+w_off));
-            wqf1 = float2(*reinterpret_cast<device const packed_float2*>(wq+w_off+8u));
-        }
-
-        q00 = lowreg_matrix::mma_8x8(z0, wqf0, q00);
-        q10 = lowreg_matrix::mma_8x8(z1, wqf0, q10);
-        q01 = lowreg_matrix::mma_8x8(z0, wqf1, q01);
-        q11 = lowreg_matrix::mma_8x8(z1, wqf1, q11);
-        // Uniform within each SIMD group; Q-only tiles skip K/V MMAs.
-        if (weight_col0 - matrix_x < CKV) {
-            const float2 wkf0 = gqa_load_weight_pair(wk, w_row, weight_col0, C, CKV);
-            const float2 wkf1 = gqa_load_weight_pair(wk, w_row, weight_col1, C, CKV);
-            const float2 wvf0 = gqa_load_weight_pair(wv, w_row, weight_col0, C, CKV);
-            const float2 wvf1 = gqa_load_weight_pair(wv, w_row, weight_col1, C, CKV);
-        k00 = lowreg_matrix::mma_8x8(z0, wkf0, k00);
-        k10 = lowreg_matrix::mma_8x8(z1, wkf0, k10);
-        k01 = lowreg_matrix::mma_8x8(z0, wkf1, k01);
-        k11 = lowreg_matrix::mma_8x8(z1, wkf1, k11);
-        v00 = lowreg_matrix::mma_8x8(z0, wvf0, v00);
-        v10 = lowreg_matrix::mma_8x8(z1, wvf0, v10);
-        v01 = lowreg_matrix::mma_8x8(z0, wvf1, v01);
-        v11 = lowreg_matrix::mma_8x8(z1, wvf1, v11);
-        }
-
-        z_off0 += kFq2Frag;
-        z_off1 += kFq2Frag;
-        w_row  += kFq2Frag;
-        w_off  += w_step;
-    }
-}
-
-
-kernel void gqa_rms_qkv(
-    device const float* x        [[buffer(0)]],
-    device const float* wq       [[buffer(1)]],
-    device const float* bq       [[buffer(2)]],
-    device const float* wk       [[buffer(3)]],
-    device const float* bk       [[buffer(4)]],
-    device const float* wv       [[buffer(5)]],
-    device const float* bv       [[buffer(6)]],
-    device float* q_cache        [[buffer(7)]],
-    device float* k_cache        [[buffer(8)]],
-    device float* v_cache        [[buffer(9)]],
-    device const float* gamma [[buffer(10)]],
-    constant uint& B             [[buffer(11)]],
-    constant uint& T             [[buffer(12)]],
-    constant uint& C             [[buffer(13)]],
-    constant uint& H             [[buffer(14)]],
-    constant uint& eps_bits      [[buffer(15)]],
-    constant uint& HKV [[buffer(16)]],
-    uint3 tg_pos                 [[threadgroup_position_in_grid]],
-    uint3 thread_pos             [[thread_position_in_threadgroup]],
-    uint  lane                   [[thread_index_in_simdgroup]],
-    uint  simd_id                [[simdgroup_index_in_threadgroup]])
-{
-    constexpr uint kFq2BM      = 16u;
-    constexpr uint kFq2BK      = 128u;              // 可调: 128 / 192 / 256
-    constexpr uint kFq2BN      = 128u;              // 输出 supertile, 不变
-    constexpr uint kFq2Frag    = 8u;
-    constexpr uint kFq2ZStride = kFq2BK + 4u;       // 132: 行长 528B, 16B 对齐
-    constexpr uint kFq2Fill    = kFq2BK / 64u;      // 每线程每次 fill 的 float4 数 = 2
-
-    threadgroup float4 Z4[kFq2BM][kFq2ZStride / 4u];   // 8.25KB (kBK=128)
-    threadgroup float  inv_rms_tg[kFq2BM];
-    threadgroup float* Z = reinterpret_cast<threadgroup float*>(&Z4[0][0]);
-
-    const uint tid = thread_pos.x;
-    if (tg_pos.x != 0u || tg_pos.z != 0u ||
-        B == 0u || T == 0u || C == 0u || H == 0u || HKV == 0u || H % HKV != 0u || (C & 3u) != 0u || C % H != 0u) {
-        return;
-    }
-    const uint D = C / H;
-    const uint CKV = HKV * D;
-    if (D == 0u || D > 128u) return;
-
-    const uint token_count = B * T;
-    const uint row_base = tg_pos.y * kFq2BM;
-    if (row_base >= token_count) return;
-
-    const float eps = as_type<float>(eps_bits);
-
-    // ---- fill 坐标: 16 线程一行, f_row == simd_id*2 + (lane>>4) ----
-    const uint f_row  = tid >> 4;
-    const uint f_c16  = tid & 15u;
-    const uint f_grow = row_base + f_row;
-    const bool f_valid = f_grow < token_count;
-    device const float* x_row = x + f_grow * C;
-
-    // ---- 输出坐标(与原版一致) ----
-    const ushort2 mo = morton_order(ushort(lane));
-    const uint matrix_x = uint(mo.x);
-    const uint matrix_y = uint(mo.y);
-    const uint simd_col_base = simd_id * 16u;
-    const uint out_grow0 = row_base + matrix_y;
-    const uint out_grow1 = out_grow0 + 8u;
-    const bool out_row0_valid = out_grow0 < token_count;
-    const bool out_row1_valid = out_grow1 < token_count;
-    uint ob0 = 0u, ot0 = 0u, ob1 = 0u, ot1 = 0u;
-    if (out_row0_valid) { ob0 = out_grow0 / T; ot0 = out_grow0 - ob0 * T; }
-    if (out_row1_valid) { ob1 = out_grow1 / T; ot1 = out_grow1 - ob1 * T; }
-
-    // ---- 首次填充: 原始 x(无乘法), 顺手累加 x^2 ----
-    float sumsq = 0.0f;
-    for (uint i = 0u; i < kFq2Fill; ++i) {
-        const uint col = (f_c16 + i * 16u) * 4u;
-        const float4 v = f_valid ? fq2_load_x4(x_row, col, C) : float4(0.0f);
-        Z4[f_row][f_c16 + i * 16u] = v * fq2_load_x4(gamma, col, C);
-        fq2_acc_sq(v, sumsq);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    bool sumsq_pending = true;
-    const bool z_resident = (C <= kFq2BK);   // 小 C 时 Z 常驻, 后续 output tile 零 refill
-
-    for (uint output_base = 0u; output_base < C; output_base += kFq2BN) {
-        float2 q00 = float2(0.0f), q01 = float2(0.0f), q10 = float2(0.0f), q11 = float2(0.0f);
-        float2 k00 = float2(0.0f), k01 = float2(0.0f), k10 = float2(0.0f), k11 = float2(0.0f);
-        float2 v00 = float2(0.0f), v01 = float2(0.0f), v10 = float2(0.0f), v11 = float2(0.0f);
-
-        const uint weight_col0 = output_base + simd_col_base + matrix_x;
-        const uint weight_col1 = weight_col0 + 8u;
-        const bool full_output_tile = output_base + simd_col_base + 16u <= C;
-
-        for (uint input_base = 0u; input_base < C; input_base += kFq2BK) {
-            // 1) 先发射下一块的 device load 到寄存器, 与 MMA 重叠
-            const bool has_next_input = input_base + kFq2BK < C;
-            const bool prep_next_out  = (!z_resident) && (!has_next_input) &&
-                                        (output_base + kFq2BN < C);
-            const bool do_refill = has_next_input || prep_next_out;
-            const uint next_base = has_next_input ? (input_base + kFq2BK) : 0u;
-
-            float4 pre[kFq2Fill];
-            if (do_refill) {
-                for (uint i = 0u; i < kFq2Fill; ++i) {
-                    const uint col = next_base + (f_c16 + i * 16u) * 4u;
-                    pre[i] = f_valid ? fq2_load_x4(x_row, col, C) : float4(0.0f);
-                }
-            }
-
-            // 2) MMA: 分支已提出内层循环
-            if (full_output_tile && (input_base + kFq2BK <= C)) {
-                gqa_mma_sweep<false>(Z, wq, wk, wv, C, CKV, input_base,
-                    matrix_x, matrix_y, weight_col0, weight_col1,
-                    q00, q01, q10, q11, k00, k01, k10, k11, v00, v01, v10, v11);
-            } else {
-                gqa_mma_sweep<true>(Z, wq, wk, wv, C, CKV, input_base,
-                    matrix_x, matrix_y, weight_col0, weight_col1,
-                    q00, q01, q10, q11, k00, k01, k10, k11, v00, v01, v10, v11);
-            }
-
-            // 3) 写回 Z; 第一遍扫描期间继续累加 x^2 (prep_next_out 重装 block0 不重复累加)
-            if (do_refill) {
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint i = 0u; i < kFq2Fill; ++i) {
-                    const uint col = next_base + (f_c16 + i * 16u) * 4u;
-                    Z4[f_row][f_c16 + i * 16u] = pre[i] * fq2_load_x4(gamma, col, C);
-                }
-                if (sumsq_pending && has_next_input) {
-                    for (uint i = 0u; i < kFq2Fill; ++i) fq2_acc_sq(pre[i], sumsq);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-
-        // ---- 第一遍 K 扫描结束: sumsq 完整, 归约一次, 全程复用 ----
-        if (sumsq_pending) {
-            const float s = fq2_reduce16(sumsq);
-            if ((lane & 15u) == 0u) {
-                inv_rms_tg[f_row] = f_valid ? rsqrt(s / float(C) + eps) : 0.0f;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            sumsq_pending = false;
-        }
-
-        // ---- 出口: s·acc, 再由 store helper 加 bias(与原版一致) ----
-        const float s0 = inv_rms_tg[matrix_y];
-        const float s1 = inv_rms_tg[8u + matrix_y];
-
-        const uint output_channel0 = output_base + simd_col_base + matrix_x;
-        const uint output_channel1 = output_channel0 + 8u;
-        const float2 bq0 = fa_qkv_load_bias_pair_bm16(bq, output_channel0, C);
-        const float2 bq1 = fa_qkv_load_bias_pair_bm16(bq, output_channel1, C);
-        const float2 bk0 = fa_qkv_load_bias_pair_bm16(bk, output_channel0, CKV);
-        const float2 bk1 = fa_qkv_load_bias_pair_bm16(bk, output_channel1, CKV);
-        const float2 bv0 = fa_qkv_load_bias_pair_bm16(bv, output_channel0, CKV);
-        const float2 bv1 = fa_qkv_load_bias_pair_bm16(bv, output_channel1, CKV);
-        if (out_row0_valid) {
-            gqa_store_pair(q_cache,q00*s0+bq0,ob0,ot0,T,H,D,output_channel0);
-            gqa_store_pair(q_cache,q01*s0+bq1,ob0,ot0,T,H,D,output_channel1);
-            gqa_store_pair(k_cache,k00*s0+bk0,ob0,ot0,T,HKV,D,output_channel0);
-            gqa_store_pair(k_cache,k01*s0+bk1,ob0,ot0,T,HKV,D,output_channel1);
-            gqa_store_pair(v_cache,v00*s0+bv0,ob0,ot0,T,HKV,D,output_channel0);
-            gqa_store_pair(v_cache,v01*s0+bv1,ob0,ot0,T,HKV,D,output_channel1);
-        }
-        if (out_row1_valid) {
-            gqa_store_pair(q_cache,q10*s1+bq0,ob1,ot1,T,H,D,output_channel0);
-            gqa_store_pair(q_cache,q11*s1+bq1,ob1,ot1,T,H,D,output_channel1);
-            gqa_store_pair(k_cache,k10*s1+bk0,ob1,ot1,T,HKV,D,output_channel0);
-            gqa_store_pair(k_cache,k11*s1+bk1,ob1,ot1,T,HKV,D,output_channel1);
-            gqa_store_pair(v_cache,v10*s1+bv0,ob1,ot1,T,HKV,D,output_channel0);
-            gqa_store_pair(v_cache,v11*s1+bv1,ob1,ot1,T,HKV,D,output_channel1);
-        }
-    }
-}
-
-
 kernel void gqa_from_qkv_d64(
     device const float* q_cache     [[buffer(0)]],
     device const float* k_cache     [[buffer(1)]],
@@ -13934,6 +13695,14 @@ void fp16_scaled_gemm(
 ) {
     alignas(16) threadgroup half As[gemm_tgp_mem_size_a<half, a_transpose, BM, BK>()];
     alignas(16) threadgroup half Bs[gemm_tgp_mem_size_b<half, b_transpose, BN, BK>()];
+    if ((swizzle_log & 0x80000000u) != 0u) {
+        gemm_core<half, true, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum, ushort>(
+            As, Bs, A, B, sa, sb, reinterpret_cast<device ushort*>(D),
+            M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
+            swizzle_log & 0x7fffffffu, k_iter_aligned, align_m, align_n, align_k,
+            simd_lane_id, simd_group_id, tid);
+        return;
+    }
     gemm_core<half, true, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum>(
         As, Bs, A, B, sa, sb, D,
         M, N, K, lda, ldb, ldd, tiles_m, tiles_n,
@@ -14746,3 +14515,180 @@ void rmsnorm_weighted_dgamma(
         }
     }
 }
+
+kernel void gqa_rms_qkv(
+    device const float* x        [[buffer(0)]],
+    device const float* wq       [[buffer(1)]],
+    device const float* bq       [[buffer(2)]],
+    device const float* wk       [[buffer(3)]],
+    device const float* bk       [[buffer(4)]],
+    device const float* wv       [[buffer(5)]],
+    device const float* bv       [[buffer(6)]],
+    device float* q_cache        [[buffer(7)]],
+    device float* k_cache        [[buffer(8)]],
+    device float* v_cache        [[buffer(9)]],
+    device const float* gamma    [[buffer(10)]],
+    constant uint& B             [[buffer(11)]],
+    constant uint& T             [[buffer(12)]],
+    constant uint& C             [[buffer(13)]],
+    constant uint& H             [[buffer(14)]],
+    constant uint& eps_bits      [[buffer(15)]],
+    constant uint& HKV           [[buffer(16)]],
+    uint3 tg_pos                 [[threadgroup_position_in_grid]],
+    uint  lane                   [[thread_index_in_simdgroup]],
+    uint  simd_id                [[simdgroup_index_in_threadgroup]])
+{
+    constexpr uint BM = 64u, BN = 64u, BK = 16u, WM = 2u, WN = 2u;
+    constexpr uint tgp_size = WM * WN * 32u; // 128
+    constexpr short lda_tgp = BK + 4;        // 20
+    constexpr short ldb_tgp = BN + 4;        // 68
+
+    if (tg_pos.z != 0u || B == 0u || T == 0u || C == 0u || H == 0u ||
+        HKV == 0u || (H % HKV) != 0u || (C % H) != 0u) {
+        return;
+    }
+    const uint D = C / H;
+    if (D == 0u || D > 128u) return;
+    const uint CKV = HKV * D;
+    const uint token_count = B * T;
+
+    const uint tiles_m = (token_count + BM - 1u) / BM;
+    const uint tiles_q = (C + BN - 1u) / BN;
+    const uint tiles_kv = (CKV + BN - 1u) / BN;
+    const uint tiles_n = tiles_q + 2u * tiles_kv;
+    const uint swizzle_log = (tiles_m >= 8u && tiles_n >= 8u) ? 3u
+                           : ((tiles_m >= 4u && tiles_n >= 4u) ? 2u
+                           : ((tiles_m >= 2u && tiles_n >= 4u) ? 1u : 0u));
+    const uint tid_y = (tg_pos.y << swizzle_log) + (tg_pos.x & ((1u << swizzle_log) - 1u));
+    const uint tid_x = tg_pos.x >> swizzle_log;
+    if (tid_x >= tiles_n || tid_y >= tiles_m) return;
+
+    device const float* W;
+    device const float* bias;
+    device float* dst_cache;
+    uint N_cols, H_out, local_tx;
+    if (tid_x < tiles_q) {
+        W = wq; bias = bq; dst_cache = q_cache;
+        N_cols = C; H_out = H; local_tx = tid_x;
+    } else if (tid_x < tiles_q + tiles_kv) {
+        W = wk; bias = bk; dst_cache = k_cache;
+        N_cols = CKV; H_out = HKV; local_tx = tid_x - tiles_q;
+    } else {
+        W = wv; bias = bv; dst_cache = v_cache;
+        N_cols = CKV; H_out = HKV; local_tx = tid_x - tiles_q - tiles_kv;
+    }
+
+    const uint c_row = tid_y * BM;
+    const uint c_col = local_tx * BN;
+
+    threadgroup float As[BM * lda_tgp];
+    threadgroup float Bs[BK * ldb_tgp];
+    threadgroup float inv_rms_tg[BM];
+
+    using mma_t = BlockMMA<float, BM, BN, BK, WM, WN, false, false, lda_tgp, ldb_tgp, float, false>;
+    using loader_b_t = BlockLoader<float, BK, BN, ldb_tgp, tgp_size, 0>;
+
+    thread mma_t mma_op(simd_id, lane);
+    thread loader_b_t loader_b(W + c_col, Bs, int(N_cols), simd_id, lane);
+
+    const short tgp_bm = short(min(BM, token_count - c_row));
+    const short tgp_bn = short(min(BN, N_cols - c_col));
+    const bool align_n = (tgp_bn == short(BN));
+    const short2 tile_dims_B = short2(tgp_bn, short(BK));
+
+    const uint tid = simd_id * 32u + lane;
+    const uint bi = tid >> 1;               // 0..63: 2 个相邻 lane 协作 1 行
+    const uint bj = (tid & 1u) << 3;        // 0 或 8
+    const bool a_row_valid = (bi < uint(tgp_bm));
+    device const float* a_row = x + size_t(c_row + bi) * C;
+    threadgroup float* as_row = As + bi * uint(lda_tgp) + bj;
+
+    const int k_iters = int(C / BK);
+    const short lbk = short(C % BK);
+    float sumsq = 0.0f;
+
+    for (int k = 0; k < k_iters; ++k) {
+        const uint k_base = uint(k) * BK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (a_row_valid) {
+            const float4 x0 = float4(*reinterpret_cast<device const packed_float4*>(a_row + k_base + bj));
+            const float4 x1 = float4(*reinterpret_cast<device const packed_float4*>(a_row + k_base + bj + 4u));
+            const float4 g0 = float4(*reinterpret_cast<device const packed_float4*>(gamma + k_base + bj));
+            const float4 g1 = float4(*reinterpret_cast<device const packed_float4*>(gamma + k_base + bj + 4u));
+            fq2_acc_sq(x0, sumsq);
+            fq2_acc_sq(x1, sumsq);
+            *reinterpret_cast<threadgroup packed_float4*>(as_row)      = packed_float4(x0 * g0);
+            *reinterpret_cast<threadgroup packed_float4*>(as_row + 4u) = packed_float4(x1 * g1);
+        } else {
+            *reinterpret_cast<threadgroup packed_float4*>(as_row)      = packed_float4(0.0f);
+            *reinterpret_cast<threadgroup packed_float4*>(as_row + 4u) = packed_float4(0.0f);
+        }
+        if (align_n) loader_b.load_unsafe();
+        else loader_b.load_safe(tile_dims_B);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(As, Bs);
+        loader_b.next();
+    }
+
+    if (lbk > 0) {
+        const uint k_base = uint(k_iters) * BK;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma clang loop unroll(full)
+        for (uint j = 0u; j < 8u; ++j) {
+            const uint gk = k_base + bj + j;
+            const float xv = (a_row_valid && gk < C) ? a_row[gk] : 0.0f;
+            sumsq = fma(xv, xv, sumsq);
+            as_row[j] = xv * ((gk < C) ? gamma[gk] : 0.0f);
+        }
+        loader_b.load_safe(short2(tgp_bn, lbk));
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_op.mma(As, Bs);
+    }
+
+    const float eps = as_type<float>(eps_bits);
+    const float row_sumsq = sumsq + simd_shuffle_xor(sumsq, ushort(1u));
+    if ((lane & 1u) == 0u) {
+        inv_rms_tg[bi] = a_row_valid ? rsqrt(row_sumsq / float(C) + eps) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint head_stride = T * D;
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < mma_t::TM; ++i) {
+        const uint local_r = uint(mma_op.sm + i * 8 * int(WM));
+        const uint gr = c_row + local_r;
+        if (gr >= token_count) continue;
+
+        const float scale = inv_rms_tg[local_r];
+        const uint b = gr / T;
+        const uint t = gr - b * T;
+        const size_t bt_base = (size_t(b) * H_out * T + size_t(t)) * D;
+
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < mma_t::TN; ++j) {
+            const uint gc = c_col + uint(mma_op.sn + j * 8 * int(WN));
+            if (gc >= N_cols) continue;
+
+            const auto frag = mma_op.Ctile.frag_at(i, j);
+            if (gc + 1u < N_cols) {
+                const float2 val = float2(frag[0], frag[1]) * scale +
+                                   float2(*reinterpret_cast<device const packed_float2*>(bias + gc));
+                const uint h0 = gc / D, d0 = gc - h0 * D;
+                const size_t ci0 = bt_base + size_t(h0) * head_stride + d0;
+                if (d0 + 1u < D) {
+                    *reinterpret_cast<device packed_float2*>(dst_cache + ci0) = packed_float2(val);
+                } else {
+                    dst_cache[ci0] = val.x;
+                    dst_cache[bt_base + size_t(h0 + 1u) * head_stride] = val.y;
+                }
+            } else {
+                const float val = frag[0] * scale + bias[gc];
+                const uint h0 = gc / D, d0 = gc - h0 * D;
+                dst_cache[bt_base + size_t(h0) * head_stride + d0] = val;
+            }
+        }
+    }
+}
+

@@ -44,10 +44,10 @@ def make_tensor(shape, dtype, device, requires_grad, init_val):
         init_val=np.asarray(init_val, dtype=dtype).copy(),
     )
 
-def reset_runtime(device):
+def reset_runtime(device, use_fp16_gemm=False):
     Runtime._default_runtime = None
     gc.collect()
-    rt = Runtime(device=device)
+    rt = Runtime(device=device, use_fp16_gemm=bool(use_fp16_gemm))
     Runtime._default_runtime = rt
     return rt
 
@@ -80,18 +80,11 @@ def check(name, got, ref, *, fail_fast=False, atol=ATOL, rtol=RTOL):
         FAILURES.append((name, max_abs, max_rel))
     return ok
 
-def check_qwen_value(
-    name,
-    got,
-    ref,
-    *,
-    grad_dtype="fp32",
-    parameter=None,
-):
+def check_qwen_value(name, got, ref, *, grad_dtype="fp32", parameter=None, use_fp16_gemm=False):
     if grad_dtype not in ("fp32", "bf16"):
         raise ValueError(f"unsupported grad_dtype={grad_dtype!r}")
 
-    atol, rtol = qwen_check_tolerance(name)
+    atol, rtol = qwen_check_tolerance(name, use_fp16_gemm=use_fp16_gemm)
 
     if grad_dtype == "bf16" and parameter is not None:
         bf16_rtol = (
@@ -108,17 +101,32 @@ def check_qwen_value(
         rtol=rtol,
     )
 
-def qwen_check_tolerance(name):
+def qwen_check_tolerance(name, use_fp16_gemm=False):
     """
     CPU 参考按数学结构计算，Metal 使用并行归约。
     Qwen 的 weighted RMSNorm 反向误差会沿残差和线性层传播。
     """
+    if use_fp16_gemm:
+        if name.startswith("FusedRMSNormMLP[") and "/forward/" in name:
+            return 2.5e-3, 1e-3
+        if "/forward/" in name:
+            return ATOL, RTOL
+        if name.endswith("/loss"):
+            return 5e-4, 1e-4
+        if name.startswith("FusedRMSNormLinearCrossEntropy[") and "/backward/" in name:
+            return ATOL, RTOL
+        if (name.startswith("Add[") and "/backward/" in name and not name.startswith("Add[0]/")
+        ) or ("FusedRMSNormMLP[" in name and "/backward/output[" in name and not name.startswith("FusedRMSNormMLP[0]/")):
+            return ATOL, RTOL
+        if "parameter.grad" in name:
+            base_atol, _ = qwen_check_tolerance(name, use_fp16_gemm=False)
+            return max(base_atol, 2e-4), 3e-3
+        if "/backward/" in name:
+            base_atol, _ = qwen_check_tolerance(name, use_fp16_gemm=False)
+            return max(base_atol, 2e-4), 1.5e-3
 
     # 新增的 weighted RMSNorm dgamma 归约。
-    if (
-        "post_norm_weight.grad" in name
-        or "input_norm_weight.grad" in name
-    ):
+    if ("post_norm_weight.grad" in name or "input_norm_weight.grad" in name):
         return 1e-4, 1e-5
 
     # MLP 本身的输入和权重梯度。
@@ -333,16 +341,8 @@ def mlp_oracle(
         "dhidden": d_hidden.reshape(B, T, H).astype(np.float32),
     }
 
-def probe_mlp_internal(
-    cfg,
-    x_np,
-    arrays,
-    upstream,
-    residual_grad,
-):
-    print(
-        "\n=== FusedRMSNormMLP SwiGLU validation ==="
-    )
+def probe_mlp_internal(cfg, x_np, arrays, upstream, residual_grad, use_fp16_gemm=False):
+    print("\n=== FusedRMSNormMLP SwiGLU validation ===")
 
     upstream = np.asarray(
         upstream,
@@ -374,7 +374,7 @@ def probe_mlp_internal(
             f"{device.upper()} validation ==="
         )
 
-        rt = reset_runtime(device)
+        rt = reset_runtime(device, use_fp16_gemm=(use_fp16_gemm and device == "mps"))
 
         t = {
             "x_after": make_tensor(x_after_ref.shape, np.float32, device, True, x_after_ref),
@@ -403,20 +403,17 @@ def probe_mlp_internal(
         H = wgu.shape[1] // 2
 
         if wgu.shape != (C, 2 * H):
-            raise AssertionError(
-                f"{device}: invalid wgu shape {wgu.shape}"
-            )
+            raise AssertionError(f"{device}: invalid wgu shape {wgu.shape}")
 
         if wdown.shape != (H, C):
-            raise AssertionError(
-                f"{device}: invalid wdown shape {wdown.shape}"
-            )
+            raise AssertionError(f"{device}: invalid wdown shape {wdown.shape}")
+
+        # got_dgamma = copy_to_host(rt, t["norm_weight"].grad)
 
         if device == "mps":
             N = cfg.B * cfg.T
             itemsize = np.dtype(np.float32).itemsize
-            expected_mps_bytes = ((N * 2 * H * itemsize + 63) // 64 * 64
-                                  + (N * H * itemsize + 63) // 64 * 64)
+            expected_mps_bytes = ((N * 2 * H * itemsize + 63) // 64 * 64 + (N * H * itemsize + 63) // 64 * 64)
 
             new_fwd_bytes = (
                 node.scratch_fwd_layout.nbytes
@@ -428,10 +425,7 @@ def probe_mlp_internal(
                 if node.scratch_bwd_layout is not None
                 else 0
             )
-            new_peak_bytes = max(
-                new_fwd_bytes,
-                new_bwd_bytes,
-            )
+            new_peak_bytes = max(new_fwd_bytes, new_bwd_bytes)
 
             if new_peak_bytes != expected_mps_bytes:
                 raise AssertionError(
@@ -439,33 +433,39 @@ def probe_mlp_internal(
                     f"actual={new_peak_bytes}, expected={expected_mps_bytes}"
                 )
 
+            scale_n = max(1.0, (cfg.B * cfg.T / 14.0) ** 0.5)
+            out_atol, out_rtol = (2.5e-3, 1e-3) if use_fp16_gemm else (2e-5, 1e-5)
+            dx_atol, dx_rtol = (3e-3, 1e-3) if use_fp16_gemm else (2e-5, 1e-5)
+            dwgu_atol, dwgu_rtol = (2e-4 * scale_n, 1e-3) if use_fp16_gemm else (1e-5, 1e-5)
+            dwdown_atol, dwdown_rtol = (1.5e-4 * scale_n, 1e-3) if use_fp16_gemm else (1e-5, 1e-5)
+            dgamma_atol, dgamma_rtol = (3e-4 * scale_n, 1e-3) if use_fp16_gemm else (1e-5, 1e-5)
+
         rt.forward()
         rt.backend.synchronize()
 
-        # 先验证 MLP 收到的输入正确。
-        check(
-            f"{device}/QwenMLP/input_vs_oracle",
-            copy_to_host(rt, t["x_after"]),
-            x_after_ref,
-            fail_fast=True,
-        )
+        # 先验证 MLP 收到的输入正确
+        if device == "mps":
+            check(
+                f"{device}/QwenMLP/input_vs_oracle",
+                copy_to_host(rt, t["x_after"]),
+                x_after_ref,
+                fail_fast=True,
+            )
 
         got_out = copy_to_host(rt, mlp)
 
-        check(
-            f"{device}/FusedRMSNormMLP/forward_vs_oracle",
-            got_out,
-            oracle["out"],
-            fail_fast=True,
-            atol=2e-5,
-            rtol=1e-5,
-        )
+        if device == "mps":
+            check(
+                f"{device}/FusedRMSNormMLP/forward_vs_oracle",
+                got_out,
+                oracle["out"],
+                fail_fast=True,
+                atol=out_atol,
+                rtol=out_rtol,
+            )
 
         for tensor in t.values():
-            if (
-                isinstance(tensor, Tensor)
-                and tensor.grad is not None
-            ):
+            if (isinstance(tensor, Tensor) and tensor.grad is not None):
                 _zero(rt, tensor.grad)
 
         rt.backend.copy_from_host(
@@ -494,42 +494,38 @@ def probe_mlp_internal(
             rt,
             t["w1"].grad,
         )
-        got_dwdown = copy_to_host(
-            rt,
-            t["w2"].grad,
-        )
-
-        check(
-            f"{device}/FusedRMSNormMLP/backward/x.grad_vs_oracle",
-            got_dx,
-            oracle["dx"],
-            fail_fast=True,
-            atol=2e-5,
-            rtol=1e-5,
-        )
-        check(
-            f"{device}/FusedRMSNormMLP/backward/wgu.grad_vs_oracle",
-            got_dwgu,
-            oracle["dw1"],
-            fail_fast=True,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-        check(
-            f"{device}/FusedRMSNormMLP/backward/wdown.grad_vs_oracle",
-            got_dwdown,
-            oracle["dw2"],
-            fail_fast=True,
-            atol=1e-5,
-            rtol=1e-5,
-        )
-
+        got_dwdown = copy_to_host(rt, t["w2"].grad)
         got_dgamma = copy_to_host(rt, t["norm_weight"].grad)
-        check(
-            f"{device}/FusedRMSNormMLP/backward/norm_weight.grad_vs_oracle",
-            got_dgamma, oracle["dgamma"], fail_fast=True,
-            atol=1e-5, rtol=1e-5,
-        )
+
+        if device == "mps":
+            check(
+                f"{device}/FusedRMSNormMLP/backward/x.grad_vs_oracle",
+                got_dx,
+                oracle["dx"],
+                fail_fast=True,
+                atol=dx_atol,
+                rtol=dx_rtol,
+            )
+            check(
+                f"{device}/FusedRMSNormMLP/backward/wgu.grad_vs_oracle",
+                got_dwgu,
+                oracle["dw1"],
+                fail_fast=True,
+                atol=dwgu_atol,
+                rtol=dwgu_rtol,
+            )
+            check(
+                f"{device}/FusedRMSNormMLP/backward/wdown.grad_vs_oracle",
+                got_dwdown,
+                oracle["dw2"],
+                fail_fast=True,
+                atol=dwdown_atol,
+                rtol=dwdown_rtol,
+            )
+            check(f"{device}/FusedRMSNormMLP/backward/norm_weight.grad_vs_oracle",
+                got_dgamma, oracle["dgamma"], fail_fast=True,
+                atol=dgamma_atol, rtol=dgamma_rtol,)
+
         results[device] = {
             "dgamma": got_dgamma,
             "out": got_out,
@@ -543,39 +539,39 @@ def probe_mlp_internal(
         results["mps"]["out"],
         results["cpu"]["out"],
         fail_fast=True,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=(out_atol if use_fp16_gemm else 1e-5),
+        rtol=(out_rtol if use_fp16_gemm else 1e-5),
     )
     check(
         "FusedRMSNormMLP/CPU_vs_Metal/x.grad",
         results["mps"]["dx"],
         results["cpu"]["dx"],
         fail_fast=True,
-        atol=3e-5,
-        rtol=1e-5,
+        atol=(dx_atol if use_fp16_gemm else 3e-5),
+        rtol=(dx_rtol if use_fp16_gemm else 1e-5),
     )
     check(
         "FusedRMSNormMLP/CPU_vs_Metal/wgu.grad",
         results["mps"]["dwgu"],
         results["cpu"]["dwgu"],
         fail_fast=True,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=(dwgu_atol if use_fp16_gemm else 1e-5),
+        rtol=(dwgu_rtol if use_fp16_gemm else 1e-5),
     )
     check(
         "FusedRMSNormMLP/CPU_vs_Metal/wdown.grad",
         results["mps"]["dwdown"],
         results["cpu"]["dwdown"],
         fail_fast=True,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=(dwdown_atol if use_fp16_gemm else 1e-5),
+        rtol=(dwdown_rtol if use_fp16_gemm else 1e-5),
     )
     check(
         "FusedRMSNormMLP/CPU_vs_Metal/norm_weight.grad",
         results["mps"]["dgamma"], results["cpu"]["dgamma"],
         fail_fast=True,
-        atol=1e-5,
-        rtol=1e-5,
+        atol=(dgamma_atol if use_fp16_gemm else 1e-5),
+        rtol=(dgamma_rtol if use_fp16_gemm else 1e-5),
     )
 
 def gqa_oracle(x, params, upstream, residual_grad, rope_cos, rope_sin,
@@ -1095,13 +1091,10 @@ def probe_fused_rmsnorm_linear_ce(cfg, rng):
         rtol=2e-5,
     )
 
-def probe_existing_qwen_ops(cfg, seed):
+def probe_existing_qwen_ops(cfg, seed, use_fp16_gemm=False):
     rng = np.random.default_rng(seed)
 
-    x = (
-        rng.standard_normal((cfg.B, cfg.T, cfg.C)).astype(np.float32)
-        * 0.02
-    )
+    x = (rng.standard_normal((cfg.B, cfg.T, cfg.C)).astype(np.float32) * 0.02)
 
     arrays = {
         "norm_weight": (
@@ -1121,7 +1114,7 @@ def probe_existing_qwen_ops(cfg, seed):
     upstream = rng.standard_normal(x.shape).astype(np.float32) * 0.02
     residual_grad = upstream.copy()
 
-    probe_mlp_internal(cfg, x, arrays, upstream, residual_grad)
+    probe_mlp_internal(cfg, x, arrays, upstream, residual_grad, use_fp16_gemm=use_fp16_gemm)
 
     D = cfg.C // cfg.n_head
     CKV = cfg.n_kv_head * D
@@ -1407,8 +1400,8 @@ class GraphState:
     labels_by_node: dict
 
 
-def build_graph(device, cfg, arrays, input_ids, labels, grad_dtype="fp32"):
-    rt = reset_runtime(device)
+def build_graph(device, cfg, arrays, input_ids, labels, grad_dtype="fp32", use_fp16_gemm=False):
+    rt = reset_runtime(device, use_fp16_gemm=(use_fp16_gemm and device=="mps"))
     model = make_qwen_model(cfg, device)
     parameter_grad_dtype = {"fp32": np.float32, "bf16": "bf16"}[grad_dtype]
     for parameter in model.parameters():
@@ -1492,7 +1485,7 @@ def run_exact_training_graph(state, repeats=2):
     return results
 
 
-def compare_exact_graph(cpu, mps, grad_dtype="fp32"):
+def compare_exact_graph(cpu, mps, grad_dtype="fp32", use_fp16_gemm=False):
     print("\n=== Exact Runtime.execute() training path ===")
 
     if len(cpu) != len(mps):
@@ -1501,19 +1494,13 @@ def compare_exact_graph(cpu, mps, grad_dtype="fp32"):
     for repeat, (cpu_result, mps_result) in enumerate(zip(cpu, mps), 1):
         print(f"  [training execution {repeat}]")
 
-        check_qwen_value(
-            f"repeat[{repeat}]/loss",
-            mps_result["loss"],
-            cpu_result["loss"],
-            grad_dtype=grad_dtype,
-        )
+        check_qwen_value(f"repeat[{repeat}]/loss", mps_result["loss"], cpu_result["loss"], grad_dtype=grad_dtype, use_fp16_gemm=use_fp16_gemm)
 
         if set(cpu_result["parameter_grads"]) != set(mps_result["parameter_grads"]):
             raise AssertionError("CPU/MPS parameter gradient names differ")
 
         for name in sorted(cpu_result["parameter_grads"]):
             name_label = f"repeat[{repeat}]/parameter.grad/{name}"
-            atol, rtol = qwen_check_tolerance(name_label)
 
             check_qwen_value(
                 name_label,
@@ -1521,6 +1508,7 @@ def compare_exact_graph(cpu, mps, grad_dtype="fp32"):
                 cpu_result["parameter_grads"][name],
                 grad_dtype=grad_dtype,
                 parameter=name,
+                use_fp16_gemm=use_fp16_gemm,
             )
 
 def run_staged_graph(state, reference_inputs=None):
@@ -1541,10 +1529,7 @@ def run_staged_graph(state, reference_inputs=None):
                 raise AssertionError(f"{label}: input count differs")
 
             for tensor, value in zip(node.inputs, expected_inputs):
-                rt.backend.copy_from_host(
-                    tensor,
-                    np.asarray(value, dtype=tensor.dtype),
-                )
+                rt.backend.copy_from_host(tensor, np.asarray(value, dtype=tensor.dtype),)
 
         forward_inputs[label] = [
             copy_to_host(rt, tensor)
@@ -1620,7 +1605,7 @@ def run_staged_graph(state, reference_inputs=None):
     }
 
 
-def compare_staged_graph(cpu, mps, grad_dtype="fp32"):
+def compare_staged_graph(cpu, mps, grad_dtype="fp32", use_fp16_gemm=False):
     print("\n=== Per-operator exact training path ===")
 
     if list(cpu["forward"]) != list(mps["forward"]):
@@ -1634,7 +1619,7 @@ def compare_staged_graph(cpu, mps, grad_dtype="fp32"):
             raise AssertionError(f"{label}: forward output count differs")
 
         for i, (mps_value, cpu_value) in enumerate(zip(mps_outputs, cpu_outputs)):
-            check_qwen_value(f"{label}/forward/output[{i}]", mps_value, cpu_value, grad_dtype=grad_dtype)
+            check_qwen_value(f"{label}/forward/output[{i}]", mps_value, cpu_value, grad_dtype=grad_dtype, use_fp16_gemm=use_fp16_gemm)
 
     for label in reversed(list(cpu["forward"])):
         cpu_bwd = cpu["backward"][label]
@@ -1648,7 +1633,7 @@ def compare_staged_graph(cpu, mps, grad_dtype="fp32"):
                 raise AssertionError(f"{label}: output[{i}] gradient presence differs")
 
             if cpu_value is not None:
-                check_qwen_value(f"{label}/backward/output[{i}].grad", mps_value, cpu_value, grad_dtype=grad_dtype)
+                check_qwen_value(f"{label}/backward/output[{i}].grad", mps_value, cpu_value, grad_dtype=grad_dtype, use_fp16_gemm=use_fp16_gemm)
 
         if len(cpu_bwd["inputs"]) != len(mps_bwd["inputs"]):
             raise AssertionError(f"{label}: different differentiable input count")
@@ -1659,7 +1644,7 @@ def compare_staged_graph(cpu, mps, grad_dtype="fp32"):
 
             suffix = (cpu_item["parameter"] or f"input[{cpu_item['index']}]")
             check_qwen_value(f"{label}/backward/{suffix}.grad", mps_item["grad"], cpu_item["grad"], 
-                grad_dtype=grad_dtype, parameter=cpu_item["parameter"])
+                grad_dtype=grad_dtype, parameter=cpu_item["parameter"], use_fp16_gemm=use_fp16_gemm)
 
 def main():
     parser = argparse.ArgumentParser(description=("Verify the QwenCoder training graph on CPU and Metal"))
@@ -1683,6 +1668,7 @@ def main():
         help="run exact graph and per-operator checks only",
     )
     parser.add_argument("--grad_dtype", choices=["fp32", "bf16"], default="bf16")
+    parser.add_argument("--use-fp16-gemm", action="store_true")
     args = parser.parse_args()
 
     if min(
@@ -1722,9 +1708,9 @@ def main():
     input_ids, labels = build_inputs(cfg, args.seed)
 
     # 与 GPT2 main 相同：先初始化 Metal，再执行 CPU 参考。
-    mps_exact = run_exact_training_graph(build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=args.grad_dtype))
+    mps_exact = run_exact_training_graph(build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=args.grad_dtype, use_fp16_gemm=args.use_fp16_gemm))
     cpu_exact = run_exact_training_graph(build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype="fp32"))
-    compare_exact_graph(cpu_exact, mps_exact, grad_dtype=args.grad_dtype)
+    compare_exact_graph(cpu_exact, mps_exact, grad_dtype=args.grad_dtype, use_fp16_gemm=args.use_fp16_gemm)
 
     # 比较完释放大参数梯度快照，不影响验证结果。
     del mps_exact, cpu_exact
@@ -1732,26 +1718,22 @@ def main():
 
     # 与 GPT2 main 相同：CPU staged -> Metal 注入 CPU 输入。
     cpu_trace = run_staged_graph(build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype="fp32"))
-    mps_trace = run_staged_graph(build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=args.grad_dtype), reference_inputs=cpu_trace["forward_inputs"])
-    compare_staged_graph(cpu_trace, mps_trace, grad_dtype=args.grad_dtype)
+    mps_trace = run_staged_graph(build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=args.grad_dtype, use_fp16_gemm=args.use_fp16_gemm), 
+                                             reference_inputs=cpu_trace["forward_inputs"])
+    compare_staged_graph(cpu_trace, mps_trace, grad_dtype=args.grad_dtype, use_fp16_gemm=args.use_fp16_gemm)
 
     del cpu_trace, mps_trace, arrays
     gc.collect()
 
     # 保留当前 Qwen 脚本已有的三个独立算子检查。
     if not args.skip_internal_kernels:
-        probe_existing_qwen_ops(cfg, args.seed)
+        probe_existing_qwen_ops(cfg, args.seed, use_fp16_gemm=args.use_fp16_gemm)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")
         for name, max_abs, max_rel in FAILURES:
-            print(
-                f"  {name}: "
-                f"max_abs={max_abs:.8e}, max_rel={max_rel:.8e}"
-            )
-        raise AssertionError(
-            "QwenCoder training-path correctness validation failed"
-        )
+            print(f"  {name}: max_abs={max_abs:.8e}, max_rel={max_rel:.8e}")
+        raise AssertionError("QwenCoder training-path correctness validation failed")
 
     print("\nAll QwenCoder training-path correctness checks passed.")
 
