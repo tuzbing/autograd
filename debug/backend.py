@@ -6,8 +6,8 @@ import numpy as np
 from math import prod
 import struct
 from scratch import align_up
-from gemm import fp16_gemm_kernel_name
-from utils import next_power_of_2
+from gemm import fp16_gemm_kernel_name, get_fp16_gemm_config
+from utils import next_power_of_2, f32_bits
 
 _ROOT_BACKEND_PATH = Path(__file__).resolve().parent.parent / "backend.py"
 _SPEC = importlib.util.spec_from_file_location("_autograd_root_backend", _ROOT_BACKEND_PATH)
@@ -622,6 +622,147 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	def metal_fused_linear_ce_backward(self, inputs, outputs, scratch=None):
 		return
 
+	def metal_fused_rmsnorm_linear_ce_forward(self, inputs, outputs, scratch=None):
+		x, w, norm_weight, targets = inputs[:4]
+		row_scale = inputs[4] if len(inputs) == 5 else None
+		out_loss = outputs[0]
+		op = out_loss.op.op
+
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		V = w.shape[0]
+
+		row_loss = scratch["row_loss"]
+		lse = scratch["lse"]
+		logits = scratch["logits"]
+		x_norm = scratch["x_norm"]
+		dx_norm = scratch["dx_norm"]
+		inv_rms = scratch["inv_rms"]
+
+		chunk_rows = min(logits.shape[0], N)
+		itemsize = np.dtype(x.dtype).itemsize
+		eps_bits = f32_bits(op.eps)
+
+		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
+		need_grad = out_loss.grad is not None and (x.requires_grad or w.requires_grad or norm_weight.requires_grad)
+		need_dz = need_grad and (x.requires_grad or norm_weight.requires_grad)
+		dw_bf16 = need_grad and w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+		dgamma_bf16 = need_grad and norm_weight.requires_grad and np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
+		if dgamma_bf16:
+			dgamma_acc_offset = x.grad.storage.ptr.offset + (N-1)*C*4
+
+		if row_scale is None:
+			kernel_name = "fused_linear_ce_logits_to_dlogits"
+			scale = float(getattr(self, "grad_scale", 1.0)) / float(N)
+			scale_bits = f32_bits(scale)
+			scale_storage = row_loss
+		else:
+			kernel_name = "fused_linear_ce_logits_to_dlogits_row_scaled"
+			scale_bits = 0
+			scale_storage = row_scale.storage
+
+		for row_base in range(0, N, chunk_rows):
+			rows = min(chunk_rows, N - row_base)
+			x_offset = x.storage.ptr.offset + row_base*C*itemsize
+
+			# 1) Z = RMSNorm(X_chunk, gamma), 同时保存每行inv_rms
+			self.ctx.dispatch_with_args_3d("gqa_rms_recompute",
+				[x.storage.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, x_norm.ptr.buffer_id, inv_rms.ptr.buffer_id],
+				[x_offset, norm_weight.storage.ptr.offset, x_norm.ptr.offset, inv_rms.ptr.offset],
+				[rows, C, eps_bits], 128, (rows+3)//4, 1, 128)
+
+			# 2) logits = Z @ W.T
+			self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+				[x_norm.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+				[x_norm.ptr.offset, w.storage.ptr.offset, logits.ptr.offset],
+				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+
+			# 3) row_loss/lse以及原地logits->dlogits
+			if row_scale is None:
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id],
+					[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset],
+					[rows, V, row_base, scale_bits, int(need_grad)], 256, rows, 1, 256)
+			else:
+				inp_vars = [logits, targets.storage, row_loss, lse, row_scale.storage]
+				self.ctx.dispatch_with_args_3d(kernel_name,
+					[e.ptr.buffer_id for e in inp_vars], [e.ptr.offset for e in inp_vars],
+					[rows, V, row_base, N, int(need_grad)], 256, rows, 1, 256)
+
+			if not need_grad:
+				continue
+
+			# 4) 先完成dW, 后覆盖Z
+			if w.requires_grad:
+				add_dw = bool(accumulate or row_base != 0)
+				dw_cfg = get_fp16_gemm_config(M=V, N=C, K=rows, with_accum=add_dw, a_transpose=True, b_transpose=False, dtype="fp32")
+				if dw_bf16:
+					if not dw_cfg["is_splitk"]:
+						tg = dw_cfg["wm"] * dw_cfg["wn"] * 32
+						dw_flags = int(add_dw) | (dw_cfg["swizzle_log"] << 2) | (dw_cfg["bm"] << 8)
+						self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+							[logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+							[logits.ptr.offset, x_norm.ptr.offset, w.grad.storage.ptr.offset],
+							[rows, C, V, dw_flags], dw_cfg["grid_x"] * tg, dw_cfg["grid_y"], dw_cfg["grid_z"], tg)
+					else:
+						self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+							[logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+							[logits.ptr.offset, x_norm.ptr.offset, w.grad.storage.ptr.offset],
+							[rows, C, V, int(add_dw)], C, V, 1, min(C, 256))
+				else:
+					self._dispatch_fp32_gemm(dw_cfg, add_dw,
+						[logits.ptr.buffer_id, x_norm.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+						[logits.ptr.offset, x_norm.ptr.offset, w.grad.storage.ptr.offset],
+						V, C, rows)
+
+			if not need_dz:
+				continue
+
+			# 恢复target概率: dlogits[target] = scale * P[target]
+			self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_restore_target",
+				[x_norm.ptr.buffer_id, w.storage.ptr.buffer_id, targets.storage.ptr.buffer_id, lse.ptr.buffer_id, scale_storage.ptr.buffer_id, logits.ptr.buffer_id],
+				[x_norm.ptr.offset, w.storage.ptr.offset, targets.storage.ptr.offset, lse.ptr.offset, scale_storage.ptr.offset, logits.ptr.offset],
+				[rows, C, V, row_base, scale_bits, int(row_scale is not None)], 32, rows, 1, 32)
+
+			# 5) dZ = dlogits @ W
+			dz_cfg = get_fp16_gemm_config(M=rows, N=C, K=V, with_accum=False, b_transpose=False, dtype="fp32")
+			self._dispatch_fp32_gemm(dz_cfg, False,
+				[logits.ptr.buffer_id, w.storage.ptr.buffer_id, dx_norm.ptr.buffer_id],
+				[logits.ptr.offset, w.storage.ptr.offset, dx_norm.ptr.offset],
+				rows, C, V)
+
+			# 7) dZ = scale * P @ W - scale * W[target]
+			self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_subtract_target",
+				[w.storage.ptr.buffer_id, targets.storage.ptr.buffer_id, scale_storage.ptr.buffer_id, dx_norm.ptr.buffer_id],
+				[w.storage.ptr.offset, targets.storage.ptr.offset, scale_storage.ptr.offset, dx_norm.ptr.offset],
+				[rows, C, V, row_base, scale_bits, int(row_scale is not None)], C, rows, 1, min(C, 256))
+
+			# 8) dgamma = sum(dZ * X * inv_rms)
+			if norm_weight.requires_grad:
+				if dgamma_bf16:
+					self.ctx.dispatch_with_args_3d("gqa_rms_dgamma_bf16",
+						[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, inv_rms.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+						[x_offset, dx_norm.ptr.offset, inv_rms.ptr.offset, norm_weight.grad.storage.ptr.offset, dgamma_acc_offset],
+						[rows, C, int(accumulate), int(row_base == 0), int(row_base+rows == N)], C, 1, 1, min(C, 256))
+				else:
+					inp_vars = [x.storage, dx_norm, inv_rms, norm_weight.grad.storage]
+					self.ctx.dispatch_with_args_3d("gqa_rms_dgamma",
+						[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, inv_rms.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id,],
+						[x_offset, dx_norm.ptr.offset, inv_rms.ptr.offset, norm_weight.grad.storage.ptr.offset],
+						[rows, C, int(accumulate or row_base != 0)], C, 1, 1, min(C, 256))
+
+			# 7) 直接写入
+			if x.requires_grad:
+				self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dx",
+					[x.storage.ptr.buffer_id, dx_norm.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, inv_rms.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+					[x_offset, dx_norm.ptr.offset, norm_weight.storage.ptr.offset, inv_rms.ptr.offset, x.grad.storage.ptr.offset + row_base*C*itemsize],
+					[rows, C], 32, rows, 1, 32)
+
+		self.ctx.dispatch_with_args_3d("fused_linear_ce_forward_reduce",
+			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
+			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
+			[N], 256, 1, 1, 256)
+
 	def metal_recompute_fused_rms_fa(self, act, scratch, out_buf):
 		x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = act.op.inputs
 		B, T, C = x.shape
@@ -700,6 +841,14 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	    	else:
 	    		act_buf = act.grad.storage
 	    		self.metal_recompute_fused_rms_fa(act, scratch, act_buf)
+	    elif act.op is not None and act.op.op.op_name == "FusedRMSNormGQA":
+	    	cached = getattr(self, "_recomputed_attention_cache", None)
+	    	if cached is not None and id(act) in cached:
+	    		cached.remove(id(act))
+	    		act_buf = getattr(act.grad, "storage")
+	    	else:
+	    		act_buf = scratch["fa_out"]
+	    		self.metal_recompute_fused_rms_gqa(act, scratch, act_buf)
 	    else:
 	        act_buf = act.storage
 	    if w.requires_grad:
@@ -1227,10 +1376,25 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 		# 13. RMSNorm backward
 		if norm_weight is not None and norm_weight.requires_grad:
 			norm_grad_bf16 = np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16)
-			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_dgamma",
-				[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
-				[x_offset, dx_norm_storage.ptr.offset, norm_weight.grad.storage.ptr.offset],
-				[N, C, eps_bits, int(accumulate), int(norm_grad_bf16)], C, 1, 1, min(C, 256))
+			split_n = min(32, (N + 31) // 32) if (not norm_grad_bf16 or gu.nbytes >= C * 4) else 1
+			if split_n > 1 and norm_grad_bf16:
+				self.ctx.fill_scalar("fill_scalar_kernel", [gu.ptr.buffer_id], [gu.ptr.offset], 0.0, C)
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_dgamma",
+					[x_buffer_id, dx_norm_storage.ptr.buffer_id, gu.ptr.buffer_id],
+					[x_offset, dx_norm_storage.ptr.offset, gu.ptr.offset],
+					[N, C, eps_bits, 0, split_n << 1], 256, 1, split_n, 256)
+				self.ctx.dispatch_with_args_3d("fp32_to_bf16",
+					[gu.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+					[gu.ptr.offset, norm_weight.grad.storage.ptr.offset],
+					[int(accumulate)], C, 1, 1, min(C, 256))
+			else:
+				if split_n > 1 and not accumulate:
+					self.ctx.fill_scalar("fill_scalar_kernel",
+						[norm_weight.grad.storage.ptr.buffer_id], [norm_weight.grad.storage.ptr.offset], 0.0, C)
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_dgamma",
+					[x_buffer_id, dx_norm_storage.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+					[x_offset, dx_norm_storage.ptr.offset, norm_weight.grad.storage.ptr.offset],
+					[N, C, eps_bits, int(accumulate), int(norm_grad_bf16) | (split_n << 1)], 256, 1, split_n, 256)
 
 		if norm_weight is None:
 			self.ctx.dispatch_with_args_3d("rmsnorm_backward",

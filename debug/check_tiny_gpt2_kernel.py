@@ -349,57 +349,43 @@ def tolerances_for_tensor(tensor, *, value_kind):
 def tolerances_for_grad_dtype(
     grad_dtype,
     value_kind,
+    use_fp16_gemm=False,
 ):
     """
     CPU reference 始终使用 FP32。
-
     grad_dtype 只决定比较时允许的误差。
     """
     if value_kind == "parameter":
-        # 参数值始终是 FP32。
         return 2e-7, 3e-5
 
+    if value_kind == "loss":
+        if use_fp16_gemm:
+            return 2e-5, 2e-5
+        return 1e-6, 1e-6
+
     if value_kind == "parameter_grad":
-        if str(grad_dtype).lower() in (
-            "bf16",
-            "bfloat16",
-        ):
-            # CPU reference 仍然是 FP32。
-            # MPS 参数梯度为 BF16 精度时放宽比较误差。
-            return 2e-5, 4e-3
-
+        if str(grad_dtype).lower() in ("bf16", "bfloat16",):
+            # CPU reference 仍然是 FP32。MPS 参数梯度为 BF16 精度时放宽比较误差。
+            return (3e-5 if use_fp16_gemm else 2e-5), 4e-3
+        if use_fp16_gemm:
+            return 3e-5, 5e-4
         return 1e-6, 1e-6
 
-    if value_kind in (
-        "activation",
-        "activation_grad",
-    ):
+    if value_kind in ("activation"):
+        if use_fp16_gemm:
+            return 3e-4, 5e-4
         return 1e-6, 1e-6
 
-    raise ValueError(
-        f"unknown value_kind={value_kind!r}"
-    )
+    if value_kind == "activation_grad":
+        if use_fp16_gemm:
+            return 3e-5, 5e-4
+        return 1e-6, 1e-6
 
-def check_parameter_gradient(
-    name,
-    got,
-    reference,
-    grad_dtype,
-    fail_fast=False,
-):
-    atol, rtol = tolerances_for_grad_dtype(
-        grad_dtype,
-        "parameter_grad",
-    )
+    raise ValueError(f"unknown value_kind={value_kind!r}")
 
-    return check(
-        name,
-        got,
-        reference,          # [保持] FP32 CPU reference
-        fail_fast=fail_fast,
-        atol=atol,
-        rtol=rtol,
-    )
+def check_parameter_gradient(name, got, reference, grad_dtype, fail_fast=False, use_fp16_gemm=False):
+    atol, rtol = tolerances_for_grad_dtype(grad_dtype, "parameter_grad", use_fp16_gemm=use_fp16_gemm)
+    return check(name, got, reference, fail_fast=fail_fast, atol=atol, rtol=rtol)
 
 def check_tensor_value(
     name,
@@ -733,44 +719,23 @@ def run_exact_training_graph(state, repeats=2):
     return results
 
 
-def compare_exact_graph(
-    cpu,
-    mps,
-    mps_grad_dtype=np.float32,
-):
-    print(
-        "\n=== Exact Runtime.execute() training path ==="
-    )
+def compare_exact_graph(cpu, mps, mps_grad_dtype=np.float32, use_fp16_gemm=False):
+    print("\n=== Exact Runtime.execute() training path ===")
 
     if len(cpu) != len(mps):
-        raise AssertionError(
-            "CPU/MPS repeat count differs"
-        )
+        raise AssertionError("CPU/MPS repeat count differs")
 
-    for repeat, (
-        cpu_result,
-        mps_result,
-    ) in enumerate(zip(cpu, mps), 1):
-        print(
-            f"  [training execution {repeat}]"
-        )
+    loss_atol, loss_rtol = tolerances_for_grad_dtype(mps_grad_dtype, "loss", use_fp16_gemm=use_fp16_gemm)
 
-        check(
-            f"repeat[{repeat}]/loss",
-            mps_result["loss"],
-            cpu_result["loss"],
-        )
+    for repeat, (cpu_result, mps_result,) in enumerate(zip(cpu, mps), 1):
+        print(f"  [training execution {repeat}]")
+        check(f"repeat[{repeat}]/loss", mps_result["loss"], cpu_result["loss"],
+                atol=loss_atol, rtol=loss_rtol)
 
-        for name in sorted(
-            cpu_result["parameter_grads"]
-        ):
-            check_parameter_gradient(
-                f"repeat[{repeat}]"
-                f"/parameter.grad/{name}",
-                mps_result["parameter_grads"][name],
-                cpu_result["parameter_grads"][name],
-                mps_grad_dtype,
-            )
+        for name in sorted(cpu_result["parameter_grads"]):
+            check_parameter_gradient(f"repeat[{repeat}]/parameter.grad/{name}",
+                mps_result["parameter_grads"][name], cpu_result["parameter_grads"][name], 
+                mps_grad_dtype, use_fp16_gemm=use_fp16_gemm)
 
 
 def run_staged_graph(state, reference_inputs=None):
@@ -878,101 +843,43 @@ def run_staged_graph(state, reference_inputs=None):
     }
 
 
-def compare_staged_graph(
-    cpu,
-    mps,
-    mps_grad_dtype=np.float32,
-):
-    print(
-        "\n=== Per-operator exact training path ==="
-    )
+def compare_staged_graph(cpu, mps, mps_grad_dtype=np.float32, use_fp16_gemm=False):
+    print("\n=== Per-operator exact training path ===")
 
     if list(cpu["forward"]) != list(mps["forward"]):
-        raise AssertionError(
-            "CPU/MPS forward topology labels differ"
-        )
+        raise AssertionError("CPU/MPS forward topology labels differ")
+
+    act_atol, act_rtol = tolerances_for_grad_dtype(mps_grad_dtype, "activation", use_fp16_gemm=use_fp16_gemm)
+    loss_atol, loss_rtol = tolerances_for_grad_dtype(mps_grad_dtype, "loss", use_fp16_gemm=use_fp16_gemm)
+    act_grad_atol, act_grad_rtol = tolerances_for_grad_dtype(mps_grad_dtype, "activation_grad", use_fp16_gemm=use_fp16_gemm)
 
     for label in cpu["forward"]:
-        for index, (
-            mps_value,
-            cpu_value,
-        ) in enumerate(
-            zip(
-                mps["forward"][label],
-                cpu["forward"][label],
-            )
-        ):
-            check(
-                f"{label}/forward/output[{index}]",
-                mps_value,
-                cpu_value,
-            )
+        fwd_atol, fwd_rtol = ((loss_atol, loss_rtol) if label.startswith("FusedLinearCrossEntropy") else (act_atol, act_rtol))
+        for index, (mps_value, cpu_value) in enumerate(zip(mps["forward"][label], cpu["forward"][label],)):
+            check(f"{label}/forward/output[{index}]", mps_value, cpu_value, atol=fwd_atol, rtol=fwd_rtol)
 
-    for label in reversed(
-        list(cpu["forward"])
-    ):
+    for label in reversed(list(cpu["forward"])):
         cpu_bwd = cpu["backward"][label]
         mps_bwd = mps["backward"][label]
 
-        for index, (
-            mps_value,
-            cpu_value,
-        ) in enumerate(
-            zip(
-                mps_bwd["output_grads"],
-                cpu_bwd["output_grads"],
-            )
-        ):
+        for index, (mps_value, cpu_value) in enumerate(zip(mps_bwd["output_grads"], cpu_bwd["output_grads"])):
             if cpu_value is not None:
-                check(
-                    f"{label}"
-                    f"/backward/output[{index}].grad",
-                    mps_value,
-                    cpu_value,
-                )
+                check(f"{label}/backward/output[{index}].grad", mps_value, cpu_value, atol=act_grad_atol, rtol=act_grad_rtol)
 
-        if len(cpu_bwd["inputs"]) != len(
-            mps_bwd["inputs"]
-        ):
-            raise AssertionError(
-                f"{label}: different "
-                "differentiable input count"
-            )
+        if len(cpu_bwd["inputs"]) != len(mps_bwd["inputs"]):
+            raise AssertionError(f"{label}: different differentiable input count")
 
-        for cpu_item, mps_item in zip(
-            cpu_bwd["inputs"],
-            mps_bwd["inputs"],
-        ):
-            if (
-                cpu_item["index"],
-                cpu_item["parameter"],
-            ) != (
-                mps_item["index"],
-                mps_item["parameter"],
-            ):
-                raise AssertionError(
-                    f"{label}: input mapping differs"
-                )
-
+        for cpu_item, mps_item in zip(cpu_bwd["inputs"], mps_bwd["inputs"]):
+            if (cpu_item["index"], cpu_item["parameter"]) != (mps_item["index"], mps_item["parameter"]):
+                raise AssertionError(f"{label}: input mapping differs")
             parameter_name = cpu_item["parameter"]
-
             if parameter_name is not None:
-                check_parameter_gradient(
-                    f"{label}"
-                    f"/backward/"
-                    f"{parameter_name}.grad",
-                    mps_item["grad"],
-                    cpu_item["grad"],
-                    mps_grad_dtype,
-                )
+                check_parameter_gradient(f"{label}/backward/{parameter_name}.grad", mps_item["grad"], cpu_item["grad"], 
+                    mps_grad_dtype, use_fp16_gemm=use_fp16_gemm)
             else:
-                check(
-                    f"{label}"
-                    f"/backward/input"
-                    f"[{cpu_item['index']}].grad",
-                    mps_item["grad"],
-                    cpu_item["grad"],
-                )
+                check(f"{label}/backward/input[{cpu_item['index']}].grad", mps_item["grad"], cpu_item["grad"],
+                    atol=act_grad_atol, rtol=act_grad_rtol)
+
 
 
 def layernorm_values(x, gamma, beta, eps=1e-6):
@@ -4654,7 +4561,7 @@ def main():
     cpu_exact = run_exact_training_graph(
         build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype=np.float32)
     )
-    compare_exact_graph(cpu_exact, mps_exact, mps_grad_dtype=grad_dtype)
+    compare_exact_graph(cpu_exact, mps_exact, mps_grad_dtype=grad_dtype, use_fp16_gemm=args.use_fp16_gemm)
 
     cpu_trace = run_staged_graph(
         build_graph("cpu", cfg, arrays, input_ids, labels, grad_dtype=np.float32)
@@ -4663,7 +4570,7 @@ def main():
         build_graph("mps", cfg, arrays, input_ids, labels, grad_dtype=grad_dtype, use_fp16_gemm=args.use_fp16_gemm),
         reference_inputs=cpu_trace["forward_inputs"],
     )
-    compare_staged_graph(cpu_trace, mps_trace, mps_grad_dtype=grad_dtype)
+    compare_staged_graph(cpu_trace, mps_trace, mps_grad_dtype=grad_dtype, use_fp16_gemm=args.use_fp16_gemm)
 
     probe_kv_cache_attention(cfg, args.seed + 1000)
 

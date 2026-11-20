@@ -8256,64 +8256,6 @@ kernel void rmsnorm_weighted_backward(
     }
 }
 
-kernel void rmsnorm_weighted_dgamma(
-    device const float* x              [[buffer(0)]],
-    device const float* d_xnorm        [[buffer(1)]],
-    device uchar* dgamma               [[buffer(2)]],
-    constant uint& N                   [[buffer(3)]],
-    constant uint& C                   [[buffer(4)]],
-    constant uint& eps_bits            [[buffer(5)]],
-    constant uint& accumulate          [[buffer(6)]],
-    constant uint& grad_bf16           [[buffer(7)]],
-    uint c                             [[thread_position_in_grid]]
-) {
-    if (c >= C) {
-        return;
-    }
-
-    const float eps = as_type<float>(eps_bits);
-    float result = 0.0f;
-
-    for (uint row = 0; row < N; ++row) {
-        const uint base = row * C;
-
-        float square_sum = 0.0f;
-
-        for (uint j = 0; j < C; ++j) {
-            const float value = x[base + j];
-            square_sum = fma(value, value, square_sum);
-        }
-
-        const float inv_rms =
-            rsqrt(square_sum / float(C) + eps);
-
-        const float x_hat = x[base + c] * inv_rms;
-
-        result += d_xnorm[base + c] * x_hat;
-    }
-
-    if (grad_bf16 != 0u) {
-        device ushort* dst = reinterpret_cast<device ushort*>(dgamma);
-        if (accumulate != 0u) {
-            result += as_type<float>(uint(dst[c]) << 16);
-        }
-        const uint bits = as_type<uint>(result);
-        if ((bits & 0x7f800000u) == 0x7f800000u) {
-            dst[c] = ushort((bits >> 16) | ((bits & 0x007fffffu) != 0u ? 0x0040u : 0u));
-        } else {
-            // Round-to-nearest, ties-to-even。
-            dst[c] = ushort((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
-        }
-    } else {
-        device float* dst = reinterpret_cast<device float*>(dgamma);
-        if (accumulate != 0u) {
-            dst[c] += result;
-        } else {
-            dst[c] = result;
-        }
-    }
-}
-
 kernel void kv_cache_rope_store(
     device float* q                 [[buffer(0)]],
     device float* k                 [[buffer(1)]],
@@ -12742,35 +12684,6 @@ kernel void gather_backward_bf16_kernel(
     }
 }
 
-kernel void fused_rmsnorm_linear_ce_dw_bf16(
-    device const float* dlogits [[buffer(0)]],
-    device const float* z       [[buffer(1)]],
-    device ushort* dw          [[buffer(2)]],
-    constant uint& rows        [[buffer(3)]],
-    constant uint& C           [[buffer(4)]],
-    constant uint& V           [[buffer(5)]],
-    constant uint& accumulate  [[buffer(6)]],
-    uint3 gid                  [[thread_position_in_grid]]
-) {
-    const uint c = gid.x;
-    const uint v = gid.y;
-
-    if (c >= C || v >= V) {
-        return;
-    }
-
-    float sum = 0.0f;
-    for (uint row = 0u; row < rows; ++row) {
-        sum = fma(dlogits[row * V + v], z[row * C + c], sum);
-    }
-
-    const size_t index = size_t(v) * size_t(C) + size_t(c);
-    if (accumulate != 0u) {
-        sum += as_type<float>(uint(dw[index]) << 16);
-    }
-    dw[index] = fla_float_to_bf16_rne(sum);
-}
-
 kernel void gqa_rms_dgamma_bf16(
     device const float* x      [[buffer(0)]],
     device const float* dz     [[buffer(1)]],
@@ -13519,14 +13432,26 @@ struct MMATile {
             for (short j = 0; j < kTileCols_; j++) {
                 const thread frag_type& src = frag_at(i, j);
                 device U* dst2 = &(dst[(i * kFragRows) * w_x * ld + (j * kFragCols) * w_y]);
-                #pragma clang loop unroll(full)
-                for (short ii = 0; ii < kElemRows; ii++) {
+                if constexpr(is_same<U, ushort>::value) {
+                    float v0 = static_cast<float>(src[0]);
+                    float v1 = static_cast<float>(src[1]);
+                    if constexpr (ACC) {
+                        const ushort2 prev = ushort2(*reinterpret_cast<device const packed_ushort2*>(dst2));
+                        v0 += as_type<float>(uint(prev.x) << 16);
+                        v1 += as_type<float>(uint(prev.y) << 16);
+                    }
+                    *reinterpret_cast<device packed_ushort2*>(dst2) = packed_ushort2(
+                        fla_float_to_bf16_rne(v0), fla_float_to_bf16_rne(v1));
+                } else {
                     #pragma clang loop unroll(full)
-                    for (short jj = 0; jj < kElemCols; jj++) {
-                        if constexpr (ACC) {
-                            dst2[ii*ld+jj*1] += static_cast<U>(src[ii*kElemCols+jj]);
-                        } else {
-                            dst2[ii*ld+jj*1] = static_cast<U>(src[ii*kElemCols+jj]);
+                    for (short ii = 0; ii < kElemRows; ii++) {
+                        #pragma clang loop unroll(full)
+                        for (short jj = 0; jj < kElemCols; jj++) {
+                            if constexpr (ACC) {
+                                dst2[ii*ld+jj*1] += static_cast<U>(src[ii*kElemCols+jj]);
+                            } else {
+                                dst2[ii*ld+jj*1] = static_cast<U>(src[ii*kElemCols+jj]);
+                            }
                         }
                     }
                 }
@@ -13548,7 +13473,13 @@ struct MMATile {
                     #pragma clang loop unroll(full)
                     for (short jj = 0; jj < kElemCols; jj++) {
                         if (off_x + ii < dst_tile_dims.y && (off_y + jj) < dst_tile_dims.x) {
-                            if constexpr (ACC) {
+                            if constexpr (is_same<U, ushort>::value) {
+                                float val = static_cast<float>(src[ii * kElemCols + jj]);
+                                if constexpr (ACC) {
+                                    val += as_type<float>(uint(dst[(off_x + ii) * ld + (off_y + jj)]) << 16);
+                                }
+                                dst[(off_x + ii) * ld + (off_y + jj)] = fla_float_to_bf16_rne(val);
+                            } else if constexpr (ACC) {
                                 dst[(off_x + ii) * ld + (off_y + jj)*1] += static_cast<U>(src[ii*kElemCols+jj]);
                             } else {
                                 dst[(off_x + ii) * ld + (off_y + jj)*1] = static_cast<U>(src[ii*kElemCols+jj]);
@@ -13743,14 +13674,14 @@ struct BlockMMA {
         }
     }
 
-    template<bool ACC=false>
-    METAL_FUNC void store(device AccumType* dst, const int ld) const thread {
-        Ctile.template store<AccumType, WM, WN, ACC>(dst + sm * ld + sn, ld);
+    template<bool ACC=false, typename OutT=AccumType>
+    METAL_FUNC void store(device OutT* dst, const int ld) const thread {
+        Ctile.template store<OutT, WM, WN, ACC>(dst + sm * ld + sn, ld);
     }
 
-    template<bool ACC=false>
-    METAL_FUNC void store_safe(device AccumType* dst, const int ld, const short2 dst_tile_dims) const thread {
-        Ctile.template store_safe<AccumType, WM, WN, ACC>(dst + sm * ld + sn, ld, dst_tile_dims - short2(sn, sm));
+    template<bool ACC=false, typename OutT=AccumType>
+    METAL_FUNC void store_safe(device OutT* dst, const int ld, const short2 dst_tile_dims) const thread {
+        Ctile.template store_safe<OutT, WM, WN, ACC>(dst + sm * ld + sn, ld, dst_tile_dims - short2(sn, sm));
     }
 
     METAL_FUNC void store_atomic(device atomic_float* dst, const int ld) const thread {
@@ -13807,7 +13738,7 @@ static METAL_FUNC void gemm_loop(
 }
 
 template<typename T, bool has_scale, bool a_transpose, bool b_transpose,
-         uint BM, uint BN, uint BK, uint WM, uint WN, bool accum=false>
+         uint BM, uint BN, uint BK, uint WM, uint WN, bool accum=false, typename OutT=float>
 static METAL_FUNC void gemm_core(
         threadgroup T* As,
         threadgroup T* Bs,
@@ -13815,7 +13746,7 @@ static METAL_FUNC void gemm_core(
         device const T* B,
         device const float* sa,
         device const float* sb,
-        device float* D,
+        device OutT* D,
         uint M, uint N, uint K,
         uint lda, uint ldb, uint ldd,
         uint tiles_m, uint tiles_n,
@@ -13892,25 +13823,25 @@ static METAL_FUNC void gemm_core(
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
         if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
-        mma_op.template store<accum>(D, ldd);
+        mma_op.template store<accum, OutT>(D, ldd);
     } else if (align_n || tgp_bn == BN) {
         gemm_loop<T, BK, a_transpose, b_transpose, false, true, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
         if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
-        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+        mma_op.template store_safe<accum, OutT>(D, ldd, short2(tgp_bn, tgp_bm));
     } else if (align_m || tgp_bm == BM) {
         gemm_loop<T, BK, a_transpose, b_transpose, true, false, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
         if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
-        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+        mma_op.template store_safe<accum, OutT>(D, ldd, short2(tgp_bn, tgp_bm));
     } else {
         gemm_loop<T, BK, a_transpose, b_transpose, false, false, true, has_scale>(As, Bs, k_iter_aligned,
                   0u, sa, sb, M, N, c_row, c_col, groups_k,
                   loader_a, loader_b, mma_op, tgp_bm, tgp_bn, leftover_bk);
         if constexpr (has_scale) mma_op.apply_epilogue_scale(sa, sb, M, N, c_row, c_col);
-        mma_op.template store_safe<accum>(D, ldd, short2(tgp_bn, tgp_bm));
+        mma_op.template store_safe<accum, OutT>(D, ldd, short2(tgp_bn, tgp_bm));
     }
 }
 
@@ -14512,6 +14443,284 @@ kernel void fused_rms_fa_project_kv(
                     k_cache[ci0] = fk[0] + bk[gc];
                     v_cache[ci0] = fv[0] + bv[gc];
                 }
+            }
+        }
+    }
+}
+
+kernel void fused_rmsnorm_linear_ce_dw_bf16(
+    device const float* dlogits [[buffer(0)]],
+    device const float* z       [[buffer(1)]],
+    device ushort* dw           [[buffer(2)]],
+    constant uint& rows         [[buffer(3)]],
+    constant uint& C            [[buffer(4)]],
+    constant uint& V            [[buffer(5)]],
+    constant uint& accumulate   [[buffer(6)]],
+    uint3 gid                   [[thread_position_in_grid]],
+    uint3 tid                   [[threadgroup_position_in_grid]],
+    uint simd_lane_id           [[thread_index_in_simdgroup]],
+    uint simd_group_id          [[simdgroup_index_in_threadgroup]]
+) {
+    const uint bm = accumulate >> 8u;
+    if (bm == 0u) {
+        const uint c = gid.x;
+        const uint v = gid.y;
+        if (c >= C || v >= V) {
+            return;
+        }
+        float sum = 0.0f;
+        for (uint row = 0u; row < rows; ++row) {
+            sum = fma(dlogits[row * V + v], z[row * C + c], sum);
+        }
+        const size_t index = size_t(v) * size_t(C) + size_t(c);
+        if ((accumulate & 1u) != 0u) {
+            sum += as_type<float>(uint(dw[index]) << 16);
+        }
+        dw[index] = fla_float_to_bf16_rne(sum);
+        return;
+    }
+
+    threadgroup float As[gemm_tgp_mem_size_a<float, true, 64, 16>()];
+    threadgroup float Bs[gemm_tgp_mem_size_b<float, false, 64, 16>()];
+
+    const bool acc = (accumulate & 1u) != 0u;
+    const uint swizzle_log = (accumulate >> 2u) & 0x3fu;
+    const uint tiles_m = (V + bm - 1u) / bm;
+    const uint tiles_n = (C + 63u) / 64u;
+    const uint k_iter_aligned = rows / 16u;
+    const uint align_m = uint((V % bm) == 0u);
+    const uint align_n = uint((C % 64u) == 0u);
+    const uint align_k = uint((rows % 16u) == 0u);
+
+    if (bm == 32u) {
+        if (acc) {
+            gemm_core<float, false, true, false, 32, 64, 16, 2, 2, true, ushort>(
+                As, Bs, dlogits, z, nullptr, nullptr, dw,
+                V, C, rows, V, C, C, tiles_m, tiles_n, swizzle_log, k_iter_aligned,
+                align_m, align_n, align_k, simd_lane_id, simd_group_id, tid);
+        } else {
+            gemm_core<float, false, true, false, 32, 64, 16, 2, 2, false, ushort>(
+                As, Bs, dlogits, z, nullptr, nullptr, dw,
+                V, C, rows, V, C, C, tiles_m, tiles_n, swizzle_log, k_iter_aligned,
+                align_m, align_n, align_k, simd_lane_id, simd_group_id, tid);
+        }
+    } else {
+        if (acc) {
+            gemm_core<float, false, true, false, 64, 64, 16, 2, 2, true, ushort>(
+                As, Bs, dlogits, z, nullptr, nullptr, dw,
+                V, C, rows, V, C, C, tiles_m, tiles_n, swizzle_log, k_iter_aligned,
+                align_m, align_n, align_k, simd_lane_id, simd_group_id, tid);
+        } else {
+            gemm_core<float, false, true, false, 64, 64, 16, 2, 2, false, ushort>(
+                As, Bs, dlogits, z, nullptr, nullptr, dw,
+                V, C, rows, V, C, C, tiles_m, tiles_n, swizzle_log, k_iter_aligned,
+                align_m, align_n, align_k, simd_lane_id, simd_group_id, tid);
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void rmsnorm_weighted_dgamma(
+    device const float* x              [[buffer(0)]],
+    device const float* d_xnorm        [[buffer(1)]],
+    device uchar* dgamma               [[buffer(2)]],
+    constant uint& N                   [[buffer(3)]],
+    constant uint& C                   [[buffer(4)]],
+    constant uint& eps_bits            [[buffer(5)]],
+    constant uint& accumulate          [[buffer(6)]],
+    constant uint& grad_bf16           [[buffer(7)]],
+    uint3 gid                          [[thread_position_in_grid]],
+    uint3 tg_pos                       [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_index_in_threadgroup]],
+    uint lane                          [[thread_index_in_simdgroup]],
+    uint simd_id                       [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kThreads = 256u;
+    constexpr uint kSimdGroups = 8u;
+    threadgroup float sg_sum[kSimdGroups];
+    threadgroup float sg_inv_rms;
+
+    const uint split_n = grad_bf16 >> 1u;
+    const bool is_bf16 = (grad_bf16 & 1u) != 0u;
+    const float eps = as_type<float>(eps_bits);
+
+    if (split_n == 0u) {
+        const uint c = gid.x;
+        if (c >= C) return;
+        float result = 0.0f;
+        for (uint row = 0u; row < N; ++row) {
+            const size_t base = size_t(row) * size_t(C);
+            float sq = 0.0f;
+            for (uint j = 0u; j < C; ++j) {
+                const float v = x[base + j];
+                sq = fma(v, v, sq);
+            }
+            result = fma(d_xnorm[base + c], x[base + c] * rsqrt(sq / float(C) + eps), result);
+        }
+        if (is_bf16) {
+            device ushort* dst = reinterpret_cast<device ushort*>(dgamma);
+            if (accumulate != 0u) result += as_type<float>(uint(dst[c]) << 16);
+            dst[c] = fla_float_to_bf16_rne(result);
+        } else {
+            device float* dst = reinterpret_cast<device float*>(dgamma);
+            dst[c] = (accumulate != 0u) ? (dst[c] + result) : result;
+        }
+        return;
+    }
+
+    if (tid >= kThreads || tg_pos.x != 0u || tg_pos.y != 0u || tg_pos.z >= split_n || N == 0u || C == 0u) {
+        return;
+    }
+    const uint rows_per_tg = (N + split_n - 1u) / split_n;
+    const uint row_begin = tg_pos.z * rows_per_tg;
+    const uint row_end = min(N, row_begin + rows_per_tg);
+    if (row_begin >= row_end) {
+        return;
+    }
+
+    if (C <= 4096u && (C & 3u) == 0u) {
+        const uint vec_cols = C >> 2u;
+        float4 acc0 = float4(0.0f), acc1 = float4(0.0f), acc2 = float4(0.0f), acc3 = float4(0.0f);
+
+        for (uint row = row_begin; row < row_end; ++row) {
+            device const float* x_row = x + size_t(row) * size_t(C);
+            device const float* dy_row = d_xnorm + size_t(row) * size_t(C);
+            float4 x0 = float4(0.0f), x1 = float4(0.0f), x2 = float4(0.0f), x3 = float4(0.0f);
+            float local_sq = 0.0f;
+
+            if (tid < vec_cols) {
+                x0 = float4(*reinterpret_cast<device const packed_float4*>(x_row + tid * 4u));
+                local_sq = fma(x0.x, x0.x, fma(x0.y, x0.y, fma(x0.z, x0.z, fma(x0.w, x0.w, local_sq))));
+            }
+            if (tid + 256u < vec_cols) {
+                x1 = float4(*reinterpret_cast<device const packed_float4*>(x_row + (tid + 256u) * 4u));
+                local_sq = fma(x1.x, x1.x, fma(x1.y, x1.y, fma(x1.z, x1.z, fma(x1.w, x1.w, local_sq))));
+            }
+            if (tid + 512u < vec_cols) {
+                x2 = float4(*reinterpret_cast<device const packed_float4*>(x_row + (tid + 512u) * 4u));
+                local_sq = fma(x2.x, x2.x, fma(x2.y, x2.y, fma(x2.z, x2.z, fma(x2.w, x2.w, local_sq))));
+            }
+            if (tid + 768u < vec_cols) {
+                x3 = float4(*reinterpret_cast<device const packed_float4*>(x_row + (tid + 768u) * 4u));
+                local_sq = fma(x3.x, x3.x, fma(x3.y, x3.y, fma(x3.z, x3.w == x3.w ? x3.z : 0.0f, fma(x3.w, x3.w, local_sq))));
+            }
+
+            local_sq = simd_sum(local_sq);
+            if (lane == 0u) sg_sum[simd_id] = local_sq;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_id == 0u) {
+                const float val = (lane < kSimdGroups) ? sg_sum[lane] : 0.0f;
+                const float total_sq = simd_sum(val);
+                if (lane == 0u) sg_inv_rms = rsqrt(total_sq / float(C) + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv_rms = sg_inv_rms;
+
+            if (tid < vec_cols) {
+                const float4 dy0 = float4(*reinterpret_cast<device const packed_float4*>(dy_row + tid * 4u));
+                acc0 = fma(dy0, x0 * inv_rms, acc0);
+            }
+            if (tid + 256u < vec_cols) {
+                const float4 dy1 = float4(*reinterpret_cast<device const packed_float4*>(dy_row + (tid + 256u) * 4u));
+                acc1 = fma(dy1, x1 * inv_rms, acc1);
+            }
+            if (tid + 512u < vec_cols) {
+                const float4 dy2 = float4(*reinterpret_cast<device const packed_float4*>(dy_row + (tid + 512u) * 4u));
+                acc2 = fma(dy2, x2 * inv_rms, acc2);
+            }
+            if (tid + 768u < vec_cols) {
+                const float4 dy3 = float4(*reinterpret_cast<device const packed_float4*>(dy_row + (tid + 768u) * 4u));
+                acc3 = fma(dy3, x3 * inv_rms, acc3);
+            }
+        }
+
+        const float4 accs[4] = {acc0, acc1, acc2, acc3};
+        if (split_n > 1u) {
+            device atomic_float* dst = reinterpret_cast<device atomic_float*>(dgamma);
+            #pragma unroll
+            for (uint i = 0u; i < 4u; ++i) {
+                const uint v_idx = tid + i * 256u;
+                if (v_idx < vec_cols) {
+                    const uint col = v_idx * 4u;
+                    atomic_fetch_add_explicit(&dst[col + 0u], accs[i].x, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dst[col + 1u], accs[i].y, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dst[col + 2u], accs[i].z, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&dst[col + 3u], accs[i].w, memory_order_relaxed);
+                }
+            }
+        } else if (is_bf16) {
+            device ushort* dst = reinterpret_cast<device ushort*>(dgamma);
+            #pragma unroll
+            for (uint i = 0u; i < 4u; ++i) {
+                const uint v_idx = tid + i * 256u;
+                if (v_idx < vec_cols) {
+                    const uint col = v_idx * 4u;
+                    float4 out = accs[i];
+                    if (accumulate != 0u) {
+                        out.x += as_type<float>(uint(dst[col + 0u]) << 16);
+                        out.y += as_type<float>(uint(dst[col + 1u]) << 16);
+                        out.z += as_type<float>(uint(dst[col + 2u]) << 16);
+                        out.w += as_type<float>(uint(dst[col + 3u]) << 16);
+                    }
+                    dst[col + 0u] = fla_float_to_bf16_rne(out.x);
+                    dst[col + 1u] = fla_float_to_bf16_rne(out.y);
+                    dst[col + 2u] = fla_float_to_bf16_rne(out.z);
+                    dst[col + 3u] = fla_float_to_bf16_rne(out.w);
+                }
+            }
+        } else {
+            device float* dst = reinterpret_cast<device float*>(dgamma);
+            #pragma unroll
+            for (uint i = 0u; i < 4u; ++i) {
+                const uint v_idx = tid + i * 256u;
+                if (v_idx < vec_cols) {
+                    const uint col = v_idx * 4u;
+                    float4 out = accs[i];
+                    if (accumulate != 0u) {
+                        out += float4(*reinterpret_cast<device const packed_float4*>(dst + col));
+                    }
+                    *reinterpret_cast<device packed_float4*>(dst + col) = packed_float4(out);
+                }
+            }
+        }
+        return;
+    }
+
+    for (uint col_base = 0u; col_base < C; col_base += kThreads) {
+        const uint col = col_base + tid;
+        float acc = 0.0f;
+        for (uint row = row_begin; row < row_end; ++row) {
+            device const float* x_row = x + size_t(row) * size_t(C);
+            float local_sq = 0.0f;
+            for (uint j = tid; j < C; j += kThreads) {
+                const float v = x_row[j];
+                local_sq = fma(v, v, local_sq);
+            }
+            local_sq = simd_sum(local_sq);
+            if (lane == 0u) sg_sum[simd_id] = local_sq;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_id == 0u) {
+                const float val = (lane < kSimdGroups) ? sg_sum[lane] : 0.0f;
+                const float total_sq = simd_sum(val);
+                if (lane == 0u) sg_inv_rms = rsqrt(total_sq / float(C) + eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (col < C) {
+                const size_t idx = size_t(row) * size_t(C) + size_t(col);
+                acc = fma(d_xnorm[idx], x[idx] * sg_inv_rms, acc);
+            }
+        }
+        if (col < C) {
+            if (split_n > 1u) {
+                device atomic_float* dst = reinterpret_cast<device atomic_float*>(dgamma);
+                atomic_fetch_add_explicit(&dst[col], acc, memory_order_relaxed);
+            } else if (is_bf16) {
+                device ushort* dst = reinterpret_cast<device ushort*>(dgamma);
+                if (accumulate != 0u) acc += as_type<float>(uint(dst[col]) << 16);
+                dst[col] = fla_float_to_bf16_rne(acc);
+            } else {
+                device float* dst = reinterpret_cast<device float*>(dgamma);
+                dst[col] = (accumulate != 0u) ? (dst[col] + acc) : acc;
             }
         }
     }
