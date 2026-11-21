@@ -3061,19 +3061,10 @@ class MetalBackend(Backend):
 		self.ctx.dispatch_with_args_3d(kernel, buf_ids, offsets, args, cfg["grid_x"], cfg["grid_y"], cfg["grid_z"], cfg["wm"] * cfg["wn"] * 32)
 
 	def _quantize_fp16_colwise(self, src_id, src_off, q_id, q_off, s_off, rows, cols, src_ld):
-		groups_c = (cols + 63) // 64
-		groups_r = max(1, min(32, (rows + 15) // 16))
-		self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [s_off], 0.0, cols)
-		self.ctx.dispatch_with_args_3d("fp16_quant_col_max",
-			[src_id, q_id],
-			[src_off, s_off],
-			[rows, cols, src_ld], groups_c * 256, groups_r, 1, 256)
-		self.ctx.dispatch_with_args_3d("fp16_bits_to_scale",
-			[q_id], [s_off], [cols], cols, 1, 1, min(cols, 256))
-		self.ctx.dispatch_with_args_3d("fp16_quant_colwise",
+		self.ctx.dispatch_with_args_3d("fp16_quant_colwise_fused",
 			[src_id, q_id, q_id],
 			[src_off, q_off, s_off],
-			[rows, cols, src_ld], groups_c * 256, groups_r, 1, 256)
+			[rows, cols, src_ld], ((cols + 63) // 64) * 256, 1, 1, 256)
 
 	def _quantize_fp16_tensor(self, src_id, src_off, q_id, q_off, s_off, max_off, numel, scale_len,
 		                      row_scale_id=None, row_scale_off=0, cols=0):
@@ -3330,7 +3321,7 @@ class MetalBackend(Backend):
 		inv_rms = scratch["inv_rms"]
 
 		raw_rows = min(logits.shape[0], N)
-		chunk_rows = (raw_rows // 64) * 64 if raw_rows >= 64 else raw_rows
+		chunk_rows = (raw_rows // 16) * 16 if raw_rows >= 16 else raw_rows
 		itemsize = np.dtype(x.dtype).itemsize
 		eps_bits = f32_bits(op.eps)
 
@@ -3363,10 +3354,11 @@ class MetalBackend(Backend):
 				[rows, C, eps_bits], 128, (rows+3)//4, 1, 128)
 
 			# 2) logits = Z @ W.T
-			self.ctx.dispatch_with_args_3d("fused_linear_ce_chunk_logits",
+			logits_cfg = get_fp16_gemm_config(M=rows, N=V, K=C, with_accum=False, b_transpose=True, dtype="fp32")
+			self._dispatch_fp32_gemm(logits_cfg, False,
 				[x_norm.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
 				[x_norm.ptr.offset, w.storage.ptr.offset, logits.ptr.offset],
-				[rows, C, V], 256, (rows+63)//64, (V+95)//96, 256)
+				rows, V, C)
 
 			# 3) row_loss/lse以及原地logits->dlogits
 			if row_scale is None:

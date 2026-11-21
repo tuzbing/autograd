@@ -256,8 +256,19 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		N = prod(x.shape[:-1])
 
 		if x.device == "mps":
-			logits_budget_elements = max(V, 8*N*C)
-			logits_rows = max(1, min(512, logits_budget_elements//V, N))
+			# logits_budget_elements = max(V, 8*N*C)
+			# logits_rows = max(1, min(512, logits_budget_elements//V, N))
+			
+			mlp_node = x.op.inputs[1].op if (x.op is not None and x.op.op.op_name == "Add" and len(x.op.inputs) == 2) else None
+			if mlp_node is not None and mlp_node.op.op_name == "FusedRMSNormMLP":
+				H = mlp_node.inputs[-2].shape[1] // 2
+				avail_bytes = align_up(N * 2 * H * 4, 64) + align_up(N * H * 4, 64) - 2 * align_up(N * 4, 64) - 512
+				raw_rows = max(1, min(512, avail_bytes // ((V + C + 1) * 4), N))
+				logits_rows = (raw_rows // 16) * 16 if raw_rows >= 16 else raw_rows
+			else:
+				logits_budget_elements = max(V, 8*N*C)
+				logits_rows = max(1, min(512, logits_budget_elements//V, N))
+
 			fwd = pack_slots_reuse([
 				[("row_loss", (N, 1), x.dtype)],
 				[("lse", (N, 1), x.dtype)],

@@ -12750,6 +12750,256 @@ kernel void fp16_quant_tensor_max(
     }
 }
 
+kernel void fp16_quant_colwise_fused(
+    device const float* src [[buffer(0)]],
+    device half* dst        [[buffer(1)]],
+    device float* scales    [[buffer(2)]],
+    constant uint& R        [[buffer(3)]],
+    constant uint& C        [[buffer(4)]],
+    constant uint& src_ld   [[buffer(5)]],
+    uint3 tg                [[threadgroup_position_in_grid]],
+    uint3 tid3              [[thread_position_in_threadgroup]],
+    uint lane               [[thread_index_in_simdgroup]],
+    uint sg                 [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr uint kTgSteps = 7u;   // 112 rows -> 28672 B
+    constexpr uint kRegSteps = 4u;  //  64 rows -> 16 floats/thread
+    constexpr uint kCachedRows = (kTgSteps + kRegSteps) * 16u; // 176 rows
+    // 28672 + 2048 = 30720 B (30 KB <= 32 KB, 固定每核 1 TG = 全芯片 8 活跃 TG)
+    threadgroup packed_float4 tg_cache[kTgSteps * 256u];
+    threadgroup uint4 smax[8][16];
+
+    if (R == 0u || C == 0u || tg.x * 64u >= C) return;
+
+    const uint tid = tid3.x;
+    const uint tx = tid & 15u;
+    const uint ty = tid >> 4;
+    const uint col0 = tg.x * 64u + tx * 4u;
+
+    uint4 local_max = uint4(0u);
+    float4 reg_cache[kRegSteps];
+    #pragma unroll
+    for (uint i = 0u; i < kRegSteps; ++i) {
+        reg_cache[i] = float4(0.0f);
+    }
+
+    const uint tg_steps = min(kTgSteps, (R + 15u) >> 4);
+    if (col0 + 3u < C) {
+        for (uint s = 0u; s < tg_steps; ++s) {
+            const uint r = (s << 4) + ty;
+            if (r < R) {
+                const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0));
+                local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x));
+                local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y));
+                local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z));
+                local_max.w = max(local_max.w, fp16_quant_abs_bits(v.w));
+                tg_cache[s * 256u + tid] = packed_float4(v);
+            }
+        }
+        if (R > kTgSteps * 16u) {
+            #pragma unroll
+            for (uint i = 0u; i < kRegSteps; ++i) {
+                const uint r = ((kTgSteps + i) << 4) + ty;
+                if (r < R) {
+                    const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0));
+                    local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x));
+                    local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y));
+                    local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z));
+                    local_max.w = max(local_max.w, fp16_quant_abs_bits(v.w));
+                    reg_cache[i] = v;
+                }
+            }
+        }
+        if (R > kCachedRows) {
+            uint rb = kCachedRows;
+            const ulong s16 = ulong(16u) * ulong(src_ld);
+            for (; rb + 64u <= R; rb += 64u) {
+                device const float* ps = src + ulong(rb + ty) * ulong(src_ld) + col0;
+                const float4 v0 = float4(*reinterpret_cast<device const packed_float4*>(ps));
+                const float4 v1 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16));
+                const float4 v2 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16 * 2ul));
+                const float4 v3 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16 * 3ul));
+                local_max.x = max(max(local_max.x, fp16_quant_abs_bits(v0.x)), max(fp16_quant_abs_bits(v1.x), max(fp16_quant_abs_bits(v2.x), fp16_quant_abs_bits(v3.x))));
+                local_max.y = max(max(local_max.y, fp16_quant_abs_bits(v0.y)), max(fp16_quant_abs_bits(v1.y), max(fp16_quant_abs_bits(v2.y), fp16_quant_abs_bits(v3.y))));
+                local_max.z = max(max(local_max.z, fp16_quant_abs_bits(v0.z)), max(fp16_quant_abs_bits(v1.z), max(fp16_quant_abs_bits(v2.z), fp16_quant_abs_bits(v3.z))));
+                local_max.w = max(max(local_max.w, fp16_quant_abs_bits(v0.w)), max(fp16_quant_abs_bits(v1.w), max(fp16_quant_abs_bits(v2.w), fp16_quant_abs_bits(v3.w))));
+            }
+            for (uint r = rb + ty; r < R; r += 16u) {
+                const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0));
+                local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x));
+                local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y));
+                local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z));
+                local_max.w = max(local_max.w, fp16_quant_abs_bits(v.w));
+            }
+        }
+    } else if (col0 < C) {
+        for (uint s = 0u; s < tg_steps; ++s) {
+            const uint r = (s << 4) + ty;
+            if (r < R) {
+                device const float* row_src = src + ulong(r) * ulong(src_ld);
+                float4 v = float4(0.0f);
+                if (col0 + 0u < C) { v.x = row_src[col0 + 0u]; local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x)); }
+                if (col0 + 1u < C) { v.y = row_src[col0 + 1u]; local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y)); }
+                if (col0 + 2u < C) { v.z = row_src[col0 + 2u]; local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z)); }
+                tg_cache[s * 256u + tid] = packed_float4(v);
+            }
+        }
+        if (R > kTgSteps * 16u) {
+            #pragma unroll
+            for (uint i = 0u; i < kRegSteps; ++i) {
+                const uint r = ((kTgSteps + i) << 4) + ty;
+                if (r < R) {
+                    device const float* row_src = src + ulong(r) * ulong(src_ld);
+                    float4 v = float4(0.0f);
+                    if (col0 + 0u < C) { v.x = row_src[col0 + 0u]; local_max.x = max(local_max.x, fp16_quant_abs_bits(v.x)); }
+                    if (col0 + 1u < C) { v.y = row_src[col0 + 1u]; local_max.y = max(local_max.y, fp16_quant_abs_bits(v.y)); }
+                    if (col0 + 2u < C) { v.z = row_src[col0 + 2u]; local_max.z = max(local_max.z, fp16_quant_abs_bits(v.z)); }
+                    reg_cache[i] = v;
+                }
+            }
+        }
+        if (R > kCachedRows) {
+            for (uint r = kCachedRows + ty; r < R; r += 16u) {
+                device const float* row_src = src + ulong(r) * ulong(src_ld);
+                if (col0 + 0u < C) local_max.x = max(local_max.x, fp16_quant_abs_bits(row_src[col0 + 0u]));
+                if (col0 + 1u < C) local_max.y = max(local_max.y, fp16_quant_abs_bits(row_src[col0 + 1u]));
+                if (col0 + 2u < C) local_max.z = max(local_max.z, fp16_quant_abs_bits(row_src[col0 + 2u]));
+            }
+        }
+    }
+
+    local_max = max(local_max, simd_shuffle_down(local_max, ushort(16u)));
+    if (lane < 16u) {
+        smax[sg][lane] = local_max;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (col0 >= C) return;
+
+    uint4 mb4 = smax[0][tx];
+    #pragma unroll
+    for (uint g = 1u; g < 8u; ++g) {
+        mb4 = max(mb4, smax[g][tx]);
+    }
+
+    float4 sc4 = float4(1.0f);
+    float4 inv4 = float4(1.0f);
+    bool4 invld4 = bool4(false);
+    #pragma unroll
+    for (uint j = 0u; j < 4u; ++j) {
+        const uint mb = mb4[j];
+        const bool invld = mb >= 0x7f800000u;
+        const float sc = fp16_quant_scale(mb);
+        invld4[j] = invld;
+        sc4[j] = invld ? as_type<float>(0x7fc00000u) : sc;
+        inv4[j] = invld ? 0.0f : (1.0f / sc);
+    }
+
+    if (ty == 0u) {
+        if (col0 + 3u < C) {
+            *reinterpret_cast<device packed_float4*>(scales + col0) = packed_float4(sc4);
+        } else {
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                if (col0 + j < C) scales[col0 + j] = sc4[j];
+            }
+        }
+    }
+
+    if (col0 + 3u < C) {
+        // 先 LIFO 逆序消费刚装入 GPU L2 / SLC 的 [kCachedRows, R) 热数据，再写出片上缓存
+        if (R > kCachedRows) {
+            const uint r_tail = kCachedRows + ((R - kCachedRows) & ~63u);
+            for (uint r = r_tail + ty; r < R; r += 16u) {
+                const float4 v = float4(*reinterpret_cast<device const packed_float4*>(src + ulong(r) * ulong(src_ld) + col0));
+                *reinterpret_cast<device packed_half4*>(dst + ulong(r) * ulong(C) + col0) = packed_half4(half4(
+                    fp16_quant_value(v.x, inv4.x, invld4.x), fp16_quant_value(v.y, inv4.y, invld4.y),
+                    fp16_quant_value(v.z, inv4.z, invld4.z), fp16_quant_value(v.w, inv4.w, invld4.w)));
+            }
+            const ulong s16_src = ulong(16u) * ulong(src_ld);
+            const ulong s16_dst = ulong(16u) * ulong(C);
+            for (uint rb = r_tail; rb > kCachedRows; ) {
+                rb -= 64u;
+                device const float* ps = src + ulong(rb + ty) * ulong(src_ld) + col0;
+                device half* pd = dst + ulong(rb + ty) * ulong(C) + col0;
+                const float4 v0 = float4(*reinterpret_cast<device const packed_float4*>(ps));
+                const float4 v1 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16_src));
+                const float4 v2 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16_src * 2ul));
+                const float4 v3 = float4(*reinterpret_cast<device const packed_float4*>(ps + s16_src * 3ul));
+                *reinterpret_cast<device packed_half4*>(pd) = packed_half4(half4(
+                    fp16_quant_value(v0.x, inv4.x, invld4.x), fp16_quant_value(v0.y, inv4.y, invld4.y),
+                    fp16_quant_value(v0.z, inv4.z, invld4.z), fp16_quant_value(v0.w, inv4.w, invld4.w)));
+                *reinterpret_cast<device packed_half4*>(pd + s16_dst) = packed_half4(half4(
+                    fp16_quant_value(v1.x, inv4.x, invld4.x), fp16_quant_value(v1.y, inv4.y, invld4.y),
+                    fp16_quant_value(v1.z, inv4.z, invld4.z), fp16_quant_value(v1.w, inv4.w, invld4.w)));
+                *reinterpret_cast<device packed_half4*>(pd + s16_dst * 2ul) = packed_half4(half4(
+                    fp16_quant_value(v2.x, inv4.x, invld4.x), fp16_quant_value(v2.y, inv4.y, invld4.y),
+                    fp16_quant_value(v2.z, inv4.z, invld4.z), fp16_quant_value(v2.w, inv4.w, invld4.w)));
+                *reinterpret_cast<device packed_half4*>(pd + s16_dst * 3ul) = packed_half4(half4(
+                    fp16_quant_value(v3.x, inv4.x, invld4.x), fp16_quant_value(v3.y, inv4.y, invld4.y),
+                    fp16_quant_value(v3.z, inv4.z, invld4.z), fp16_quant_value(v3.w, inv4.w, invld4.w)));
+            }
+        }
+        for (uint s = 0u; s < tg_steps; ++s) {
+            const uint r = (s << 4) + ty;
+            if (r < R) {
+                const float4 v = float4(tg_cache[s * 256u + tid]);
+                *reinterpret_cast<device packed_half4*>(dst + ulong(r) * ulong(C) + col0) = packed_half4(half4(
+                    fp16_quant_value(v.x, inv4.x, invld4.x), fp16_quant_value(v.y, inv4.y, invld4.y),
+                    fp16_quant_value(v.z, inv4.z, invld4.z), fp16_quant_value(v.w, inv4.w, invld4.w)));
+            }
+        }
+        if (R > kTgSteps * 16u) {
+            #pragma unroll
+            for (uint i = 0u; i < kRegSteps; ++i) {
+                const uint r = ((kTgSteps + i) << 4) + ty;
+                if (r < R) {
+                    const float4 v = reg_cache[i];
+                    *reinterpret_cast<device packed_half4*>(dst + ulong(r) * ulong(C) + col0) = packed_half4(half4(
+                        fp16_quant_value(v.x, inv4.x, invld4.x), fp16_quant_value(v.y, inv4.y, invld4.y),
+                        fp16_quant_value(v.z, inv4.z, invld4.z), fp16_quant_value(v.w, inv4.w, invld4.w)));
+                }
+            }
+        }
+    } else {
+        if (R > kCachedRows) {
+            for (uint r = kCachedRows + ty; r < R; r += 16u) {
+                device const float* row_src = src + ulong(r) * ulong(src_ld);
+                device half* row_dst = dst + ulong(r) * ulong(C);
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    if (col0 + j < C) row_dst[col0 + j] = fp16_quant_value(row_src[col0 + j], inv4[j], invld4[j]);
+                }
+            }
+        }
+        for (uint s = 0u; s < tg_steps; ++s) {
+            const uint r = (s << 4) + ty;
+            if (r < R) {
+                const float4 v = float4(tg_cache[s * 256u + tid]);
+                device half* row_dst = dst + ulong(r) * ulong(C);
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    if (col0 + j < C) row_dst[col0 + j] = fp16_quant_value(v[j], inv4[j], invld4[j]);
+                }
+            }
+        }
+        if (R > kTgSteps * 16u) {
+            #pragma unroll
+            for (uint i = 0u; i < kRegSteps; ++i) {
+                const uint r = ((kTgSteps + i) << 4) + ty;
+                if (r < R) {
+                    const float4 v = reg_cache[i];
+                    device half* row_dst = dst + ulong(r) * ulong(C);
+                    #pragma unroll
+                    for (uint j = 0u; j < 4u; ++j) {
+                        if (col0 + j < C) row_dst[col0 + j] = fp16_quant_value(v[j], inv4[j], invld4[j]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 kernel void fp16_quant_tensor_cast(
     device const float* src        [[buffer(0)]],
     device const float* row_scales [[buffer(1)]],

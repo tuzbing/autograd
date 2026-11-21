@@ -134,7 +134,7 @@ public:
             @"mini_update_v", @"adamw_mini8bit_step",
             @"per_token_cast_to_fp16", @"per_block_cast_to_fp16",
             @"fp16_quant_rowwise", @"fp16_quant_col_max",
-            @"fp16_bits_to_scale", @"fp16_quant_colwise",
+            @"fp16_bits_to_scale", @"fp16_quant_colwise", @"fp16_quant_colwise_fused",
             @"fp16_quant_tensor_max", @"fp16_quant_tensor_cast",
             @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
             @"fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
