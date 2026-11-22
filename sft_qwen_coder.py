@@ -7,9 +7,9 @@
   --model-out '/Users/a58/Documents/code/autograd/checkpoints/sft_qwen_coder/model_{step:06d}.gguf' \
   --load-optimizer 0 \
   --max-seq-len 512 \
-  --device-batch-size 4 \
+  --device-batch-size 2 \
   --total-batch-size 16384 \
-  --matrix-lr 0.02 \
+  --matrix-lr 0.0002 \
   --num-iterations -1 \
   --eval-every 200 \
   --eval-tokens 524288
@@ -250,7 +250,7 @@ def main():
         model.parameters(),
         lr=effective_lr * args.init_lr_frac,
         weight_decay=0.0,
-        state_mode="8bit", # fp32/8bit/mini
+        state_mode="mini", # fp32/8bit/mini
     )
     clip_grad_norm = optimizer.build_grad_clip()
 

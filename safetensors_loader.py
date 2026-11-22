@@ -67,7 +67,7 @@ def _numel(shape):
     return result
 
 
-def _tensor_from_file(mm, data_start, entry, file_size, path):
+def _tensor_from_file(mm, data_start, entry, file_size, path, out=None):
     if not isinstance(entry, dict):
         raise ValueError("invalid safetensors tensor entry")
     dtype_name = entry.get("dtype")
@@ -99,15 +99,27 @@ def _tensor_from_file(mm, data_start, entry, file_size, path):
         raw = np.frombuffer(mm, dtype=dtype, count=_numel(shape), offset=absolute_start)
         raw = raw.reshape(shape)
 
+    if out is not None:
+        if dtype_name == "BF16":
+            dst_u32 = out.view(np.uint32)
+            np.copyto(dst_u32, raw)
+            dst_u32 <<= 16
+        else:
+            np.copyto(out, raw, casting="unsafe")
+        return out
+
     if dtype_name == "BF16":
         # BF16 bits occupy the high 16 bits of an IEEE754 float32.
-        words = np.asarray(raw, dtype=np.uint16)
-        result = (words.astype(np.uint32) << 16).view(np.float32)
-        return np.ascontiguousarray(result)
+        result = raw.astype(np.uint32, order="C")
+        result <<= 16
+        return result.view(np.float32)
+
+    if dtype_name == "F32":
+        return raw
+
     if dtype_name == "BOOL":
         return np.ascontiguousarray(raw.astype(np.float32))
     return np.ascontiguousarray(raw.astype(np.float32))
-
 
 def _check_config(config, header):
     if config is None:
@@ -127,22 +139,17 @@ def _check_config(config, header):
                 f"source={config[hf_key]}, model={config[local_key]}"
             )
 
-
-def _target_arrays(source, model):
+def _target_specs(source):
     def get(name):
         if name not in source:
             raise KeyError(f"missing source tensor: {name}")
-        return source[name]
+        return name
 
     result = {}
-    result["tok_emb.weight"] = get("model.embed_tokens.weight")
-    result["final_norm_weight"] = get("model.norm.weight")
+    result["tok_emb.weight"] = ("copy", get("model.embed_tokens.weight"), False)
+    result["final_norm_weight"] = ("copy", get("model.norm.weight"), False)
 
-    layers = sorted({
-        int(name.split(".")[2])
-        for name in source
-        if name.startswith("model.layers.")
-    })
+    layers = sorted({int(name.split(".")[2]) for name in source if name.startswith("model.layers.")})
 
     if not layers or layers != list(range(max(layers) + 1)):
         raise ValueError("safetensors layers are missing or not contiguous")
@@ -151,36 +158,18 @@ def _target_arrays(source, model):
         prefix = f"model.layers.{i}"
         target = f"blocks.{i}"
 
-        result[f"{target}.input_norm_weight"] = get(
-            f"{prefix}.input_layernorm.weight"
-        )
-        result[f"{target}.post_norm_weight"] = get(
-            f"{prefix}.post_attention_layernorm.weight"
-        )
+        result[f"{target}.input_norm_weight"] = ("copy", get(f"{prefix}.input_layernorm.weight"), False)
+        result[f"{target}.post_norm_weight"] = ("copy", get(f"{prefix}.post_attention_layernorm.weight"), False)
 
         for proj in ("q_proj", "k_proj", "v_proj"):
-            result[f"{target}.{proj}.weight"] = get(
-                f"{prefix}.self_attn.{proj}.weight"
-            ).T
-            result[f"{target}.{proj}.bias"] = get(
-                f"{prefix}.self_attn.{proj}.bias"
-            )
+            result[f"{target}.{proj}.weight"] = ("copy", get(f"{prefix}.self_attn.{proj}.weight"), True)
+            result[f"{target}.{proj}.bias"] = ("copy", get(f"{prefix}.self_attn.{proj}.bias"), False)
 
-        result[f"{target}.proj.weight"] = get(
-            f"{prefix}.self_attn.o_proj.weight"
-        ).T
-
-        gate = get(f"{prefix}.mlp.gate_proj.weight").T
-        up = get(f"{prefix}.mlp.up_proj.weight").T
-        result[f"{target}.mlp.fc1.weight"] = np.ascontiguousarray(
-            np.concatenate((gate, up), axis=1)
-        )
-        result[f"{target}.mlp.fc2.weight"] = get(
-            f"{prefix}.mlp.down_proj.weight"
-        ).T
+        result[f"{target}.proj.weight"] = ("copy", get(f"{prefix}.self_attn.o_proj.weight"), True)
+        result[f"{target}.mlp.fc1.weight"] = ("fc1", get(f"{prefix}.mlp.gate_proj.weight"), get(f"{prefix}.mlp.up_proj.weight"),)
+        result[f"{target}.mlp.fc2.weight"] = ("copy", get(f"{prefix}.mlp.down_proj.weight"), True)
 
     return result
-
 
 def load_safetensors(path, model, backend, config=None, strict=True):
     """Load Qwen2.5-Coder weights into an already-built QwenCoder model.
@@ -234,13 +223,7 @@ def load_safetensors(path, model, backend, config=None, strict=True):
 
     _check_config(config, config or {})
 
-    with open(path, "rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-        source = {
-            name: _tensor_from_file(mm, data_start, entry, file_size, name)
-            for name, entry in tensor_entries.items()
-        }
-
-    targets = _target_arrays(source, model)
+    targets = _target_specs(tensor_entries)
     parameters = dict(named_parameters(model))
     target_names = set(parameters)
     source_target_names = set(targets)
@@ -253,52 +236,78 @@ def load_safetensors(path, model, backend, config=None, strict=True):
         )
 
     copied = 0
-    for name, tensor in parameters.items():
-        if name not in targets:
-            continue
-        values = np.asarray(targets[name], dtype=np.float32)
-        if tuple(values.shape) != tuple(tensor.shape):
-            raise ValueError(
-                f"{name}: checkpoint shape {values.shape}, "
-                f"model shape {tensor.shape}"
-            )
-        backend.copy_from_host(tensor, values)
-        copied += 1
+    with open(path, "rb") as file, mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        for name, tensor in parameters.items():
+            if name not in targets:
+                continue
+            dst = None
+            if tensor.storage is not None:
+                if (hasattr(backend, "numpy_view") and np.dtype(tensor.storage.dtype) == np.dtype(np.float32)
+                        and np.dtype(tensor.dtype) == np.dtype(np.float32)):
+                    dst = backend.numpy_view(tensor)
+                elif (isinstance(tensor.storage.data, np.ndarray) and np.dtype(tensor.storage.data.dtype) == np.dtype(np.float32)):
+                    dst = tensor.storage.data
+
+            spec = targets[name]
+            if spec[0] == "copy":
+                _, src_name, transpose = spec
+                entry = tensor_entries[src_name]
+                raw_shape = tuple(entry.get("shape", ()))
+                if not transpose and dst is not None and raw_shape == tuple(tensor.shape):
+                    _tensor_from_file(mm, data_start, entry, file_size, src_name, out=dst)
+                else:
+                    values = _tensor_from_file(mm, data_start, entry, file_size, src_name)
+                    if transpose:
+                        if values.ndim != 2:
+                            raise ValueError(f"{src_name}: expected 2D tensor, got {values.shape}")
+                        values = values.T
+                    if tuple(values.shape) != tuple(tensor.shape):
+                        raise ValueError(f"{name}: checkpoint shape {values.shape}, model shape {tensor.shape}")
+                    if dst is not None:
+                        dst[:] = values
+                    else:
+                        backend.copy_from_host(tensor, values)
+                    del values
+            else:
+                _, gate_name, up_name = spec
+                gate_entry = tensor_entries[gate_name]
+                up_entry = tensor_entries[up_name]
+                gate = _tensor_from_file(mm, data_start, gate_entry, file_size, gate_name)
+                up_shape = tuple(up_entry.get("shape", ()))
+                if gate.ndim != 2 or len(up_shape) != 2 or gate.shape[1] != up_shape[1]:
+                    raise ValueError(f"{name}: incompatible gate/up shapes {gate.shape} and {up_shape}")
+                ckpt_shape = (gate.shape[1], gate.shape[0] + up_shape[0])
+                if ckpt_shape != tuple(tensor.shape):
+                    raise ValueError(f"{name}: checkpoint shape {ckpt_shape}, model shape {tensor.shape}")
+                half = gate.shape[0]
+                if dst is not None:
+                    dst[:, :half] = gate.T
+                    del gate
+                    up = _tensor_from_file(mm, data_start, up_entry, file_size, up_name)
+                    dst[:, half:] = up.T
+                    del up
+                else:
+                    up = _tensor_from_file(mm, data_start, up_entry, file_size, up_name)
+                    backend.copy_from_host(tensor, np.concatenate((gate.T, up.T), axis=1))
+                    del gate, up
+            copied += 1
 
     if strict:
-        layer_ids = sorted({
-            int(name.split(".")[2])
-            for name in source
-            if name.startswith("model.layers.")
-        })
+        layer_ids = sorted({int(name.split(".")[2]) for name in tensor_entries if name.startswith("model.layers.")})
         expected_source = {"model.embed_tokens.weight", "model.norm.weight"}
         for i in layer_ids:
             prefix = f"model.layers.{i}"
-            expected_source.update({
-                f"{prefix}.input_layernorm.weight",
-                f"{prefix}.post_attention_layernorm.weight",
-            })
+            expected_source.update({f"{prefix}.input_layernorm.weight", f"{prefix}.post_attention_layernorm.weight",})
         for i in layer_ids:
             prefix = f"model.layers.{i}"
-            expected_source.update({
-                f"{prefix}.self_attn.{p}.weight" for p in ("q_proj", "k_proj", "v_proj")
-            })
-            expected_source.update({
-                f"{prefix}.self_attn.{p}.bias" for p in ("q_proj", "k_proj", "v_proj")
-            })
-            expected_source.update({
-                f"{prefix}.self_attn.o_proj.weight",
-                f"{prefix}.mlp.gate_proj.weight",
-                f"{prefix}.mlp.up_proj.weight",
-                f"{prefix}.mlp.down_proj.weight",
-            })
-        extra_source = sorted(set(source) - expected_source)
-        missing_source = sorted(expected_source - set(source))
+            expected_source.update({f"{prefix}.self_attn.{p}.weight" for p in ("q_proj", "k_proj", "v_proj")})
+            expected_source.update({f"{prefix}.self_attn.{p}.bias" for p in ("q_proj", "k_proj", "v_proj")})
+            expected_source.update({f"{prefix}.self_attn.o_proj.weight", f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight", f"{prefix}.mlp.down_proj.weight",})
+        extra_source = sorted(set(tensor_entries) - expected_source)
+        missing_source = sorted(expected_source - set(tensor_entries))
         if extra_source or missing_source:
-            raise ValueError(
-                "safetensors source names mismatch; "
-                f"missing={missing_source}, unexpected={extra_source}"
-            )
+            raise ValueError(f"safetensors source names mismatch; missing={missing_source}, unexpected={extra_source}")
 
     backend.synchronize()
     return {
@@ -307,7 +316,6 @@ def load_safetensors(path, model, backend, config=None, strict=True):
         "loaded_tensor_count": copied,
         "metadata": header.get("__metadata__", {}),
     }
-
 
 if __name__ == "__main__":
     raise SystemExit(
