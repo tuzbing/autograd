@@ -795,6 +795,20 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 	    M = prod(x.shape[:-1])
 	    K = act.shape[-1]
 	    N = w.shape[-1]
+
+	    if not self._rollout_cache_dirty and out.grad is None and M <= 16 and self._rollout_cache is not None:
+	        c_w = self._rollout_cache.get(id(w))
+	        if c_w is not None:
+	            b_id = b.storage.ptr.buffer_id if b is not None else 0
+	            b_off = b.storage.ptr.offset if b is not None else 0
+	            self._dispatch_decode_linear(
+	                act.storage.ptr.buffer_id, act.storage.ptr.offset,
+	                c_w[0], c_w[1], c_w[2], out.storage.ptr.buffer_id, out.storage.ptr.offset,
+	                M, N, K, flags=8 | (4 if b is not None else 0),
+	                bias_id=b_id, bias_off=b_off,
+	                res_id=x.storage.ptr.buffer_id, res_off=x.storage.ptr.offset)
+	            return
+	            
 	    BM = 32
 	    BN = 64
 	    grid_x = (N + BN - 1) // BN
@@ -911,6 +925,27 @@ class MetalBackend(_ROOT_BACKEND.MetalBackend):
 
 		gu = scratch["gu"]
 		hidden = scratch["hidden"]
+
+		if not self._rollout_cache_dirty and out.grad is None and N <= 16 and self._rollout_cache is not None:
+			c_gu = self._rollout_cache.get(id(wgu))
+			c_dn = self._rollout_cache.get(id(wdown))
+			if c_gu is not None and c_dn is not None:
+				flags = 1 | (2 if norm_weight is not None else 0)
+				g_id = norm_weight.storage.ptr.buffer_id if norm_weight is not None else 0
+				g_off = norm_weight.storage.ptr.offset if norm_weight is not None else 0
+				self._dispatch_decode_linear(
+					x.storage.ptr.buffer_id, x.storage.ptr.offset,
+					c_gu[0], c_gu[1], c_gu[2], gu.ptr.buffer_id, gu.ptr.offset,
+					N, H2, C, flags=flags, eps_bits=f32_bits(out.op.op.eps), gamma_id=g_id, gamma_off=g_off)
+				self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+					[gu.ptr.offset, hidden.ptr.offset],
+					[N, H], N * ((H + 3) // 4), 1, 1, min(N * ((H + 3) // 4), 256))
+				self._dispatch_decode_linear(
+					hidden.ptr.buffer_id, hidden.ptr.offset,
+					c_dn[0], c_dn[1], c_dn[2], out.storage.ptr.buffer_id, out.storage.ptr.offset,
+					N, C, H)
+				return
 
 		if use_fp16_gemm:
 			h2_tile, c_tile = scratch.gemm_configs["mlp_fwd_shape"]

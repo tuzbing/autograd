@@ -136,6 +136,7 @@ public:
             @"fp16_quant_rowwise", @"fp16_quant_col_max",
             @"fp16_bits_to_scale", @"fp16_quant_colwise", @"fp16_quant_colwise_fused",
             @"fp16_quant_tensor_max", @"fp16_quant_tensor_cast",
+            @"fp16_quant_colwise_transposed", @"fp16_decode_linear",
             @"fp16_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
             @"fp32_gemm_splitk_nttt_bm32_bn32_bk16_wm2_wn2",
             @"fp32_gemm_splitk_nntt_bm32_bn32_bk16_wm2_wn2",

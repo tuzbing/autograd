@@ -15176,3 +15176,187 @@ kernel void gqa_rms_qkv(
         }
     }
 }
+
+kernel void fp16_quant_colwise_transposed(
+    device const float* w [[buffer(0)]],
+    device half* wq [[buffer(1)]],
+    device float* ws [[buffer(2)]],
+    device const float* b_in [[buffer(3)]],
+    device float* b_out [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    constant uint& dst_row [[buffer(7)]],
+    constant uint& flags [[buffer(8)]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]
+) {
+    uint n = tg.x * 4u + sg;
+    if (n >= N) return;
+
+    const bool transposed = (flags & 1u) != 0u;
+    float max_abs = 0.0f;
+    for (uint k = lane; k < K; k += 32u) {
+        ulong idx = transposed ? (ulong(k) * ulong(N) + ulong(n)) : (ulong(n) * ulong(K) + ulong(k));
+        max_abs = max(max_abs, fabs(w[idx]));
+    }
+    max_abs = simd_max(max_abs);
+
+    uint mb = as_type<uint>(max_abs) & 0x7fffffffu;
+    bool invalid = (mb >= 0x7f800000u);
+    float sc = (mb == 0u || invalid) ? 1.0f : max(as_type<float>(mb) / 65504.0f, 0x1.0p-126f);
+    float inv_sc = 1.0f / sc;
+
+    if (lane == 0u) {
+        ws[dst_row + n] = sc;
+        if ((flags & 2u) != 0u) {
+            b_out[dst_row + n] = b_in[n];
+        }
+    }
+
+    device half* out_row = wq + ulong(dst_row + n) * ulong(K);
+    for (uint k = lane; k < K; k += 32u) {
+        ulong idx = transposed ? (ulong(k) * ulong(N) + ulong(n)) : (ulong(n) * ulong(K) + ulong(k));
+        float v = w[idx];
+        uint v_mb = as_type<uint>(v) & 0x7fffffffu;
+        out_row[k] = (v_mb >= 0x7f800000u)
+            ? as_type<half>(ushort(0x7e00u))
+            : half(clamp(v * inv_sc, -65504.0f, 65504.0f));
+    }
+}
+
+// flags 位定义: 1=USE_RMSNORM, 2=HAS_GAMMA, 4=HAS_BIAS, 8=HAS_RESIDUAL, 16=SPLIT_QKV
+kernel void fp16_decode_linear(
+    device const float* x [[buffer(0)]],
+    device const half* wq [[buffer(1)]],
+    device const float* ws [[buffer(2)]],
+    device const float* gamma [[buffer(3)]],
+    device const float* bias [[buffer(4)]],
+    device const float* res [[buffer(5)]],
+    device float* out0 [[buffer(6)]],
+    device float* out1 [[buffer(7)]],
+    device float* out2 [[buffer(8)]],
+    constant uint& M [[buffer(9)]],
+    constant uint& N [[buffer(10)]],
+    constant uint& K [[buffer(11)]],
+    constant uint& flags [[buffer(12)]],
+    constant uint& eps_bits [[buffer(13)]],
+    constant uint& c_out [[buffer(14)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 tg [[threadgroup_position_in_grid]]
+) {
+    const uint m_base = tg.y * 8u;
+    if (m_base >= M) return;
+    const uint rows = min(8u, M - m_base);
+    const uint n_base = tg.x * 16u;
+
+    threadgroup float4 sx[8][32];
+    float inv_rms[8];
+
+    if ((flags & 1u) != 0u) {
+        const float eps = as_type<float>(eps_bits);
+        for (uint r = 0u; r < rows; ++r) {
+            device const float* x_row = x + ulong(m_base + r) * ulong(K);
+            float sq = 0.0f;
+            for (uint k = tid; k < K; k += 128u) {
+                float v = x_row[k];
+                sq += v * v;
+            }
+            sq = simd_sum(sq);
+            if (lane == 0u) {
+                (reinterpret_cast<threadgroup float*>(&sx[r][0]))[sg] = sq;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint r = 0u; r < rows; ++r) {
+            float4 s4 = sx[r][0];
+            inv_rms[r] = rsqrt((s4.x + s4.y + s4.z + s4.w) / float(K) + eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (uint r = 0u; r < rows; ++r) {
+            inv_rms[r] = 1.0f;
+        }
+    }
+
+    float acc[8][4];
+    for (uint r = 0u; r < 8u; ++r) {
+        acc[r][0] = 0.0f;
+        acc[r][1] = 0.0f;
+        acc[r][2] = 0.0f;
+        acc[r][3] = 0.0f;
+    }
+
+    const bool has_gamma = (flags & 2u) != 0u;
+    const bool k_vec4 = (K & 3u) == 0u;
+
+    for (uint k0 = 0u; k0 < K; k0 += 128u) {
+        const uint k = k0 + tid;
+        const float g = (has_gamma && k < K) ? gamma[k] : 1.0f;
+        for (uint r = 0u; r < rows; ++r) {
+            float v = (k < K) ? (x[ulong(m_base + r) * ulong(K) + ulong(k)] * inv_rms[r] * g) : 0.0f;
+            (reinterpret_cast<threadgroup float*>(sx[r]))[tid] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint gk = k0 + lane * 4u;
+        if (gk < K) {
+            float4 xv[8];
+            for (uint r = 0u; r < rows; ++r) {
+                xv[r] = sx[r][lane];
+            }
+            for (uint c = 0u; c < 4u; ++c) {
+                const uint n = n_base + sg * 4u + c;
+                if (n < N) {
+                    device const half* wp = wq + ulong(n) * ulong(K) + ulong(gk);
+                    float4 w4;
+                    if (k_vec4 && (gk + 3u < K)) {
+                        w4 = float4(*reinterpret_cast<device const half4*>(wp));
+                    } else {
+                        w4 = float4(
+                            float(wp[0]),
+                            (gk + 1u < K) ? float(wp[1]) : 0.0f,
+                            (gk + 2u < K) ? float(wp[2]) : 0.0f,
+                            (gk + 3u < K) ? float(wp[3]) : 0.0f
+                        );
+                    }
+                    for (uint r = 0u; r < rows; ++r) {
+                        acc[r][c] += dot(xv[r], w4);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const bool has_bias = (flags & 4u) != 0u;
+    const bool has_res = (flags & 8u) != 0u;
+    const bool split_qkv = (flags & 16u) != 0u;
+
+    for (uint c = 0u; c < 4u; ++c) {
+        const uint n = n_base + sg * 4u + c;
+        if (n >= N) continue;
+        const float sc = (lane == 0u) ? ws[n] : 0.0f;
+        const float b_val = (lane == 0u && has_bias) ? bias[n] : 0.0f;
+        for (uint r = 0u; r < rows; ++r) {
+            float sum = simd_sum(acc[r][c]);
+            if (lane == 0u) {
+                const uint m = m_base + r;
+                float val = sum * sc + b_val;
+                if (has_res) {
+                    val += res[ulong(m) * ulong(N) + ulong(n)];
+                }
+                if (split_qkv) {
+                    const uint part = n / c_out;
+                    const uint col = n - part * c_out;
+                    device float* dst = (part == 0u) ? out0 : ((part == 1u) ? out1 : out2);
+                    dst[ulong(m) * ulong(c_out) + ulong(col)] = val;
+                } else {
+                    out0[ulong(m) * ulong(N) + ulong(n)] = val;
+                }
+            }
+        }
+    }
+}

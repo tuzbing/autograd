@@ -810,6 +810,12 @@ class Runtime:
 		return ScratchViews(views, layout.gemm_configs)
 
 	def execute(self):
+		cache = getattr(self.backend, "_rollout_cache", None)
+		if (cache is not None and self.unified_arena is not None
+				and getattr(self.unified_arena.ptr, "buffer_id", None) == cache["_buf_id"]
+				and self.arena_bytes > cache["_base"]):
+			self.backend._rollout_cache_dirty = True
+			
 		if self.forward_only:
 			self.backend.begin_pass()
 			for node in self.topo:

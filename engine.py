@@ -10,6 +10,7 @@ import numpy as np
 
 from runtime import Runtime
 from runtime import build_decode_plan, build_prefill_plan
+from scratch import align_up
 from tensor import Tensor
 
 class KVCache:
@@ -208,6 +209,8 @@ class Engine:
         }
 
     def _prepare_rollout_policy_views(self):
+        self._init_rollout_weight_cache()
+
         backend = self.decode_plan.runtime.backend
         state = self.rollout_state
 
@@ -226,6 +229,106 @@ class Engine:
 
         self._decode_config = self._weight_view(backend, state.decode_config)
         self._policy_output_views = {id(self.decode_plan.output): self._weight_view(backend, self.decode_plan.output).reshape(-1)}
+
+    def _init_rollout_weight_cache(self):
+        backend = self.decode_plan.runtime.backend
+        self._rollout_cache_layout = None
+        if (not hasattr(backend, "ctx") or self.shared_arena is None
+                or not hasattr(self.model, "blocks") or not hasattr(self.model, "lm_head")):
+            return
+        arena_id = self.shared_arena.ptr.buffer_id
+        min_free = self.decode_plan.runtime.arena_bytes
+        entries = []
+        total = 0
+        for blk in self.model.blocks:
+            wq, wk, wv = blk.attn.q_proj.weight, blk.attn.k_proj.weight, blk.attn.v_proj.weight
+            bq = getattr(blk.attn.q_proj, "bias", None)
+            bk = getattr(blk.attn.k_proj, "bias", None)
+            bv = getattr(blk.attn.v_proj, "bias", None)
+            C = wq.shape[0]
+            qkv_q = align_up(3 * C * C * 2, 256)
+            qkv_s = align_up(3 * C * 4, 256)
+            qkv_b = align_up(3 * C * 4, 256) if bq is not None else 0
+            entries.append(("qkv", wq, wk, wv, bq, bk, bv, total, total + qkv_q,
+                            (total + qkv_q + qkv_s) if bq is not None else -1))
+            total += qkv_q + qkv_s + qkv_b
+            for w in (blk.attn.proj.weight, blk.mlp.fc1.weight, blk.mlp.fc2.weight):
+                K, N = w.shape
+                wq_sz = align_up(N * K * 2, 256)
+                ws_sz = align_up(N * 4, 256)
+                entries.append(("col", w, total, total + wq_sz))
+                total += wq_sz + ws_sz
+        w_lm = self.model.lm_head.weight
+        V, C_lm = w_lm.shape
+        lm_q = align_up(V * C_lm * 2, 256)
+        lm_s = align_up(V * 4, 256)
+        if self.shared_arena.nbytes - (total + lm_q + lm_s) >= min_free:
+            entries.append(("row", w_lm, total, total + lm_q))
+            total += lm_q + lm_s
+        elif self.shared_arena.nbytes - total < min_free:
+            return
+        base = (self.shared_arena.nbytes - total) & ~255
+        if base < min_free:
+            return
+        cache_map = {"_buf_id": arena_id, "_base": base, "_key": (id(self.model), arena_id, base, len(entries))}
+        ops = []
+        for item in entries:
+            if item[0] == "qkv":
+                _, wq, wk, wv, bq, bk, bv, q_rel, s_rel, b_rel = item
+                q_off, s_off = base + q_rel, base + s_rel
+                b_off = (base + b_rel) if b_rel >= 0 else -1
+                cache_map[id(wq)] = (arena_id, q_off, s_off, b_off)
+                ops.append(("qkv", wq, wk, wv, bq, bk, bv, q_off, s_off, b_off))
+            else:
+                kind, w, q_rel, s_rel = item
+                q_off, s_off = base + q_rel, base + s_rel
+                cache_map[id(w)] = (arena_id, q_off, s_off)
+                ops.append((kind, w, q_off, s_off))
+        self._rollout_cache_layout = (cache_map, ops)
+
+    def _refresh_rollout_weight_cache(self, required_arena_bytes=0):
+        if self._rollout_cache_layout is None:
+            return
+        cache_map, ops = self._rollout_cache_layout
+        if required_arena_bytes > cache_map["_base"]:
+            return
+        backend = self.decode_plan.runtime.backend
+        if (not backend._rollout_cache_dirty and backend._rollout_cache is not None
+                and backend._rollout_cache.get("_key") == cache_map["_key"]):
+            return
+        arena_id = cache_map["_buf_id"]
+        backend.begin_pass()
+        for item in ops:
+            if item[0] == "qkv":
+                _, wq, wk, wv, bq, bk, bv, q_off, s_off, b_off = item
+                C = wq.shape[0]
+                for idx, (w, b) in enumerate(((wq, bq), (wk, bk), (wv, bv))):
+                    has_b = b is not None and b_off >= 0
+                    b_id = b.storage.ptr.buffer_id if has_b else w.storage.ptr.buffer_id
+                    bo = b.storage.ptr.offset if has_b else 0
+                    backend.ctx.dispatch_with_args_3d(
+                        "fp16_quant_colwise_transposed",
+                        [w.storage.ptr.buffer_id, arena_id, arena_id, b_id, arena_id],
+                        [w.storage.ptr.offset, q_off, s_off, bo, max(0, b_off)],
+                        [C, C, idx * C, 1 | (2 if has_b else 0)],
+                        ((C + 3) // 4) * 128, 1, 1, 128)
+            else:
+                kind, w, q_off, s_off = item
+                if kind == "col":
+                    K, N = w.shape
+                    fl = 1
+                else:
+                    N, K = w.shape
+                    fl = 0
+                backend.ctx.dispatch_with_args_3d(
+                    "fp16_quant_colwise_transposed",
+                    [w.storage.ptr.buffer_id, arena_id, arena_id, w.storage.ptr.buffer_id, arena_id],
+                    [w.storage.ptr.offset, q_off, s_off, 0, s_off],
+                    [N, K, 0, fl],
+                    ((N + 3) // 4) * 128, 1, 1, 128)
+        backend.end_pass()
+        backend._rollout_cache = cache_map
+        backend._rollout_cache_dirty = False
 
     def _choose(self, prompt_len):
         for length in self.prefill_bucket_lens:
@@ -295,6 +398,7 @@ class Engine:
             cached_count = len(self.prefill_plans)
             t1 = time.perf_counter()
         plan = self._choose(prompt_len)
+        self._refresh_rollout_weight_cache(plan.runtime.arena_bytes)
         if self.enable_debug: 
             t2 = time.perf_counter()
             self.profile["prefill_plan"] += (t2 - t1)
@@ -333,6 +437,7 @@ class Engine:
     def _decode_rollout(self):
         if self.enable_debug:
             t1 = time.perf_counter()
+        self._refresh_rollout_weight_cache(self.decode_plan.runtime.arena_bytes)
         self.decode_plan.forward(feeds=None, return_value=False)
         if self.enable_debug:
             t2 = time.perf_counter()

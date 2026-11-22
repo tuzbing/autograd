@@ -2611,6 +2611,8 @@ class CPUBackend(Backend):
 class MetalBackend(Backend):
 	def __init__(self):
 		self.ctx = metal_ext.MetalContext()
+		self._rollout_cache = None
+		self._rollout_cache_dirty = True
 		self.numpy_view_funcs = {
 			np.dtype(np.float32): self.ctx.numpy_view_float32,
 			np.dtype(np.float16): self.ctx.numpy_view_float16,
@@ -3569,6 +3571,17 @@ class MetalBackend(Backend):
 		grid_size = (B * H * T * D) // 4
 		self.ctx.dispatch_with_args("attn_out_contiguous_backward_kernel", buffer_ids, offsets, [B, H, T, D], grid_size)
 
+	def _dispatch_decode_linear(self, x_id, x_off, q_id, wq_off, ws_off, out0_id, out0_off, M, N, K,
+		                        flags=0, eps_bits=0, gamma_id=0, gamma_off=0, bias_id=0, bias_off=0,
+		                        res_id=0, res_off=0, out1_id=0, out1_off=0, out2_id=0, out2_off=0, c_out=0):
+		self.ctx.dispatch_with_args_3d("fp16_decode_linear",
+			[x_id, q_id, q_id, gamma_id or x_id, bias_id or x_id, res_id or x_id,
+			 out0_id, out1_id or out0_id, out2_id or out0_id],
+			[x_off, wq_off, ws_off, gamma_off, bias_off, res_off,
+			 out0_off, out1_off, out2_off],
+			[M, N, K, flags, eps_bits, c_out],
+			((N + 15) // 16) * 128, (M + 7) // 8, 1, 128)
+
 	def metal_fused_rmsnorm_mlp_forward(self, inputs, outputs, scratch=None):
 		if len(inputs) == 3:
 			x, wgu, wdown = inputs
@@ -3588,6 +3601,27 @@ class MetalBackend(Backend):
 
 		gu = scratch["gu"]
 		hidden = scratch["hidden"]
+
+		if not self._rollout_cache_dirty and out.grad is None and N <= 16 and self._rollout_cache is not None:
+			c_gu = self._rollout_cache.get(id(wgu))
+			c_dn = self._rollout_cache.get(id(wdown))
+			if c_gu is not None and c_dn is not None:
+				flags = 1 | (2 if norm_weight is not None else 0)
+				g_id = norm_weight.storage.ptr.buffer_id if norm_weight is not None else 0
+				g_off = norm_weight.storage.ptr.offset if norm_weight is not None else 0
+				self._dispatch_decode_linear(
+					x.storage.ptr.buffer_id, x.storage.ptr.offset,
+					c_gu[0], c_gu[1], c_gu[2], gu.ptr.buffer_id, gu.ptr.offset,
+					N, H2, C, flags=flags, eps_bits=f32_bits(out.op.op.eps), gamma_id=g_id, gamma_off=g_off)
+				self.ctx.dispatch_with_args_3d("swiglu_forward_kernel",
+					[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+					[gu.ptr.offset, hidden.ptr.offset],
+					[N, H], N * ((H + 3) // 4), 1, 1, min(N * ((H + 3) // 4), 256))
+				self._dispatch_decode_linear(
+					hidden.ptr.buffer_id, hidden.ptr.offset,
+					c_dn[0], c_dn[1], c_dn[2], out.storage.ptr.buffer_id, out.storage.ptr.offset,
+					N, C, H)
+				return
 
 		if use_fp16_gemm:
 			h2_tile, c_tile = scratch.gemm_configs["mlp_fwd_shape"]
@@ -4696,6 +4730,20 @@ class MetalBackend(Backend):
 	    M = prod(x.shape[:-1])
 	    K = act.shape[-1]
 	    N = w.shape[-1]
+
+	    if not self._rollout_cache_dirty and out.grad is None and M <= 16 and self._rollout_cache is not None:
+	        c_w = self._rollout_cache.get(id(w))
+	        if c_w is not None:
+	            b_id = b.storage.ptr.buffer_id if b is not None else 0
+	            b_off = b.storage.ptr.offset if b is not None else 0
+	            self._dispatch_decode_linear(
+	                act.storage.ptr.buffer_id, act.storage.ptr.offset,
+	                c_w[0], c_w[1], c_w[2], out.storage.ptr.buffer_id, out.storage.ptr.offset,
+	                M, N, K, flags=8 | (4 if b is not None else 0),
+	                bias_id=b_id, bias_off=b_off,
+	                res_id=x.storage.ptr.buffer_id, res_off=x.storage.ptr.offset)
+	            return
+
 	    BM = 32
 	    BN = 64
 	    grid_x = (N + BN - 1) // BN
@@ -4809,14 +4857,26 @@ class MetalBackend(Backend):
 		eps_bits = struct.unpack("<i", struct.pack("<f", out.op.op.eps))[0]
 
 		# RMSNorm + QKV projection
-		self.ctx.dispatch_with_args_3d("fused_rms_fa_qkv",
-			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
-			wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
-			q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
-			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
-			wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
-			q.ptr.offset, k.ptr.offset, v.ptr.offset],
-			[B, T, C, H, eps_bits], 256, (B*T+15)//16, 1, 256)
+		c_qkv = (self._rollout_cache.get(id(wq)) if (not self._rollout_cache_dirty and T == 1 and B <= 16 and self._rollout_cache is not None)
+		         else None)
+		if c_qkv is not None:
+			self._dispatch_decode_linear(
+				x.storage.ptr.buffer_id, x.storage.ptr.offset,
+				c_qkv[0], c_qkv[1], c_qkv[2], q.ptr.buffer_id, q.ptr.offset,
+				B, 3 * C, C, flags=1 | (4 if c_qkv[3] >= 0 else 0) | 16,
+				eps_bits=f32_bits(out.op.op.eps),
+				bias_id=c_qkv[0] if c_qkv[3] >= 0 else 0, bias_off=max(0, c_qkv[3]),
+				out1_id=k.ptr.buffer_id, out1_off=k.ptr.offset,
+				out2_id=v.ptr.buffer_id, out2_off=v.ptr.offset, c_out=C)
+		else:
+			self.ctx.dispatch_with_args_3d("fused_rms_fa_qkv",
+				[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+				wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
+				q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
+				[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+				wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
+				q.ptr.offset, k.ptr.offset, v.ptr.offset],
+				[B, T, C, H, eps_bits], 256, (B*T+15)//16, 1, 256)
 
 		# Q/K RoPE
 		row_positions = out.op.op.mode == "decode" and position.shape != (1,)
@@ -4865,6 +4925,15 @@ class MetalBackend(Backend):
 		K = x.shape[-1]
 		N = weight.shape[0]
 
+		if not self._rollout_cache_dirty and out.grad is None and M <= 16 and self._rollout_cache is not None:
+			c_lm = self._rollout_cache.get(id(weight))
+			if c_lm is not None:
+				self._dispatch_decode_linear(
+					x.storage.ptr.buffer_id, x.storage.ptr.offset,
+					c_lm[0], c_lm[1], c_lm[2], out.storage.ptr.buffer_id, out.storage.ptr.offset,
+					M, N, K)
+				return
+
 		self.ctx.dispatch_gemm_mps([x.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
 			[x.storage.ptr.offset, weight.storage.ptr.offset, out.storage.ptr.offset],
 			[1, M, N, K, 0, 1, 0, 0], 1.0, 0.0)
@@ -4880,6 +4949,16 @@ class MetalBackend(Backend):
 
 		x_offset = x.storage.ptr.offset + row * C * 4
 		out_offset = out.storage.ptr.offset
+
+		if not self._rollout_cache_dirty and out.grad is None and self._rollout_cache is not None:
+			c_lm = self._rollout_cache.get(id(weight))
+			if c_lm is not None:
+				self._dispatch_decode_linear(
+					x.storage.ptr.buffer_id, x_offset,
+					c_lm[0], c_lm[1], c_lm[2], out.storage.ptr.buffer_id, out_offset,
+					1, V, C)
+				return
+
 		self.ctx.dispatch_gemm_mps([x.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
 			[x_offset, weight.storage.ptr.offset, out_offset],
 			[1, 1, V, C, 0, 1, 0, 0], 1.0, 0.0)
@@ -5110,6 +5189,9 @@ class MetalBackend(Backend):
 		return view_func(buffer_id, offset, tuple(tensor.shape))
 
 	def copy_from_host(self, tensor, host_np):
+		if tensor.requires_grad or (tensor.ndim >= 2 and np.dtype(tensor.dtype) == np.dtype(np.float32)):
+			self._rollout_cache_dirty = True
+
 		if np.dtype(tensor.storage.dtype) == np.dtype(np.uint16):
 			dst = self.ctx.numpy_view_uint8(tensor.storage.ptr.buffer_id, tensor.storage.ptr.offset, (prod(tensor.shape)*2,)).view(np.uint16).reshape(tuple(tensor.shape))
 			values = np.asarray(host_np, dtype=np.float32)
@@ -5142,7 +5224,9 @@ class MetalBackend(Backend):
 			[numel, int(grad_dtype == np.dtype(np.uint16))], n_groups*256, 1, 1, 256)
 
 	def adamw_step(self, p_storage, g_storage, m_storage, v_storage, tmp_storage,
-		lr, lr_t, b1, b2, eps, weight_decay, numel=None, decay_numel=None, grad_scale=1.0, lr_bc1=None, inv_sqrt_bc2=1.0):
+				   lr, lr_t, b1, b2, eps, weight_decay, numel=None, decay_numel=None, 
+				   grad_scale=1.0, lr_bc1=None, inv_sqrt_bc2=1.0):
+		self._rollout_cache_dirty = True
 		storages = [p_storage, g_storage, m_storage, v_storage]
 		buffer_ids = [s.ptr.buffer_id for s in storages]
 		offsets = [s.ptr.offset for s in storages]
@@ -5162,7 +5246,8 @@ class MetalBackend(Backend):
 			(numel + 3)// 4, 1, 1, min((numel+3)//4, 256))
 
 	def adamw8bit_step(self, p, g, qm, qv, absmax_m, absmax_v, qmap_m, qmap_v,
-			lr, lr_bc1, inv_sqrt_bc2, b1, b2, eps, weight_decay, numel, decay_numel, first_step, grad_scale=1.0):
+					   lr, lr_bc1, inv_sqrt_bc2, b1, b2, eps, weight_decay, numel, decay_numel, first_step, grad_scale=1.0):
+		self._rollout_cache_dirty = True
 		self.ctx.dispatch_with_args_3d("adamw8bit_step",
 			[p.ptr.buffer_id, g.ptr.buffer_id, qm.ptr.buffer_id, qv.ptr.buffer_id, absmax_m.ptr.buffer_id, absmax_v.ptr.buffer_id,
 				qmap_m.ptr.buffer_id, qmap_v.ptr.buffer_id],
@@ -5218,6 +5303,7 @@ class MetalBackend(Backend):
 	def adamw_mini8bit_step(self, p, g, m, meta, v, lr, lr_bc1, inv_sqrt_bc2, b1, eps, weight_decay, 
 			numel, decay_numel, block_elems, *, cols, head_cols, first_step, seed, stochastic_round, 
 			transpose_m, quantized, grad_scale=1.0):
+		self._rollout_cache_dirty = True
 		n_v = self._mini_v_group_count(numel, block_elems, cols, head_cols)
 		n_blocks = (numel + 255) // 256
 
