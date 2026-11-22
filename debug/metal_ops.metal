@@ -11485,10 +11485,10 @@ METAL_FUNC static void gqa_bwd_dkv_impl(
     constexpr uint kThreads = kSimdGroups * 32u;
     constexpr uint kBK = kSimdGroups * kFrag;
     constexpr uint kQStride = kDTile + 4u;
-    constexpr uint kMaxChunks = (kMaxD + kDTile - 1u) / kDTile;
+    constexpr uint kVecPerRow = kDTile / 4u;
     constexpr uint kDOutSub = kDOutChunks * kDSubPerTile;
     static_assert((kBQ % kFrag) == 0u, "kBQ must be a multiple of 8");
-    static_assert(kDOutChunks > 0u, "at least one output D tile is required");
+    static_assert(kDOutChunks == 1u, "single output D tile per threadgroup");
 
     if (threads_per_tg.x != kThreads || threads_per_tg.y != 1u ||
         threads_per_tg.z != 1u || simd_lane_count != 32u ||
@@ -11525,10 +11525,15 @@ METAL_FUNC static void gqa_bwd_dkv_impl(
 
     // Each float2 accumulator is one lane's portion of an 8x8 output fragment.
     // kDOutChunks=1 consumes 32 floats/thread for dK+dV; =2 consumes 64.
+    thread float2 k_out_frag[kDOutSub];
+    thread float2 v_out_frag[kDOutSub];
     thread float2 dk_accum[kDOutSub];
     thread float2 dv_accum[kDOutSub];
     #pragma unroll
     for (uint i = 0u; i < kDOutSub; ++i) {
+        const uint out_d = output_chunk_base * kDTile + i * kFrag;
+        k_out_frag[i] = load_device_frag_8x8(k_cache + kv_base, D, key_frag_base, out_d, T, D, ushort(lane));
+        v_out_frag[i] = load_device_frag_8x8(v_cache + kv_base, D, key_frag_base, out_d, T, D, ushort(lane));
         dk_accum[i] = float2(0.0f);
         dv_accum[i] = float2(0.0f);
     }
@@ -11569,45 +11574,56 @@ METAL_FUNC static void gqa_bwd_dkv_impl(
             dp_frag[q_sub] = float2(0.0f);
         }
 
-        // Pass 1: stream all 64-column D tiles to form complete score and dP.
-        for (uint d_chunk = 0u; d_chunk < kMaxChunks; ++d_chunk) {
-            if (d_chunk >= d_chunks) {
-                break;
-            }
-            if (d_chunk != 0u) {
+        // Pass 1 将 output_chunk_base 排在最后，Qs/dOs 改用 packed_float4 加载，末尾分片直接读寄存器 K/V
+        for (uint pass = 0u; pass < d_chunks; ++pass) {
+            const uint d_chunk = pass + (pass >= output_chunk_base ? 1u : 0u);
+            const bool is_out_chunk = (pass + 1u == d_chunks);
+            const uint scheduled_chunk = is_out_chunk ? output_chunk_base : d_chunk;
+            if (pass != 0u) {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            const uint d_base = d_chunk * kDTile;
-            for (uint local_q = sg; local_q < kBQ; local_q += kSimdGroups) {
+            const uint d_base = scheduled_chunk * kDTile;
+            for (uint vec_idx = thread_pos.x; vec_idx < kBQ * kVecPerRow; vec_idx += kThreads) {
+                const uint local_q = vec_idx / kVecPerRow;
+                const uint local_d = (vec_idx - local_q * kVecPerRow) << 2u;
                 const uint query = q_start + local_q;
-                const bool row_valid = query < T;
-                const uint q_row = q_tile_base + local_q * D;
-                const uint do_row = do_tile_base + local_q * C;
-                for (uint local_d = lane; local_d < kDTile; local_d += 32u) {
-                    const uint d = d_base + local_d;
-                    float q_value = 0.0f;
-                    float do_value = 0.0f;
-                    if (row_valid && d < D) {
-                        q_value = q_cache[q_row + d];
-                        do_value = dO[do_row + d];
+                const uint d = d_base + local_d;
+                float4 q_value = float4(0.0f);
+                float4 do_value = float4(0.0f);
+                if (query < T && d + 3u < D) {
+                    q_value = float4(*reinterpret_cast<device const packed_float4*>(
+                        q_cache + q_tile_base + local_q * D + d));
+                    do_value = float4(*reinterpret_cast<device const packed_float4*>(
+                        dO + do_tile_base + local_q * C + d));
+                } else if (query < T && d < D) {
+                    #pragma unroll
+                    for (uint c = 0u; c < 4u; ++c) {
+                        if (d + c < D) {
+                            q_value[c] = q_cache[q_tile_base + local_q * D + d + c];
+                            do_value[c] = dO[do_tile_base + local_q * C + d + c];
+                        }
                     }
-                    Qs[local_q * kQStride + local_d] = q_value;
-                    dOs[local_q * kQStride + local_d] = do_value;
                 }
+                *reinterpret_cast<threadgroup packed_float4*>(
+                    Qs + local_q * kQStride + local_d) = packed_float4(q_value);
+                *reinterpret_cast<threadgroup packed_float4*>(
+                    dOs + local_q * kQStride + local_d) = packed_float4(do_value);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Stream one K/V fragment at a time.  Keeping all eight fragments
-            // live would add 32 floats/thread and reduce occupancy for out=2.
             #pragma unroll
             for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
                 const uint global_d = d_base + d_index * kFrag;
-                const float2 k_frag = load_device_frag_8x8(
-                    k_cache + kv_base, D, key_frag_base, global_d,
-                    T, D, ushort(lane));
-                const float2 v_frag = load_device_frag_8x8(
-                    v_cache + kv_base, D, key_frag_base, global_d,
-                    T, D, ushort(lane));
+                const float2 k_frag = is_out_chunk
+                    ? k_out_frag[d_index]
+                    : load_device_frag_8x8(
+                        k_cache + kv_base, D, key_frag_base, global_d,
+                        T, D, ushort(lane));
+                const float2 v_frag = is_out_chunk
+                    ? v_out_frag[d_index]
+                    : load_device_frag_8x8(
+                        v_cache + kv_base, D, key_frag_base, global_d,
+                        T, D, ushort(lane));
                 #pragma unroll
                 for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
                     const ushort2 origin = ushort2(
@@ -11624,8 +11640,6 @@ METAL_FUNC static void gqa_bwd_dkv_impl(
             }
         }
 
-        // Reuse score/dP registers for P/dS so no additional fragment arrays
-        // become live alongside the output accumulators.
         #pragma unroll
         for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
             const uint q_local0 = q_sub * kFrag + uint(frag_offset.x);
@@ -11634,64 +11648,28 @@ METAL_FUNC static void gqa_bwd_dkv_impl(
             const uint query1 = q_start + q_local1;
             const bool valid0 = query0 < T && (!is_causal || query0 >= key_row);
             const bool valid1 = query1 < T && (!is_causal || query1 >= key_row);
-            const float p0 = valid0
-                ? exp2(score_frag[q_sub][0] * scale_log2e - lse_tile[q_local0])
-                : 0.0f;
-            const float p1 = valid1
-                ? exp2(score_frag[q_sub][1] * scale_log2e - lse_tile[q_local1])
-                : 0.0f;
+            const float p0 = valid0 ? exp2(score_frag[q_sub][0] * scale_log2e - lse_tile[q_local0]) : 0.0f;
+            const float p1 = valid1 ? exp2(score_frag[q_sub][1] * scale_log2e - lse_tile[q_local1]) : 0.0f;
             const float dp0 = dp_frag[q_sub][0];
             const float dp1 = dp_frag[q_sub][1];
             score_frag[q_sub] = float2(p0, p1);
-            dp_frag[q_sub] = float2(
-                scale * p0 * (dp0 - dval_tile[q_local0]),
-                scale * p1 * (dp1 - dval_tile[q_local1]));
+            dp_frag[q_sub] = float2(scale * p0 * (dp0 - dval_tile[q_local0]), scale * p1 * (dp1 - dval_tile[q_local1]));
         }
 
-        // Pass 2: reload only this threadgroup's output D tiles and accumulate.
         #pragma unroll
-        for (uint out_chunk = 0u; out_chunk < kDOutChunks; ++out_chunk) {
-            const uint d_chunk = output_chunk_base + out_chunk;
-            if (d_chunk >= d_chunks) {
-                break;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            const uint d_base = d_chunk * kDTile;
-            for (uint local_q = sg; local_q < kBQ; local_q += kSimdGroups) {
-                const uint query = q_start + local_q;
-                const bool row_valid = query < T;
-                const uint q_row = q_tile_base + local_q * D;
-                const uint do_row = do_tile_base + local_q * C;
-                for (uint local_d = lane; local_d < kDTile; local_d += 32u) {
-                    const uint d = d_base + local_d;
-                    float q_value = 0.0f;
-                    float do_value = 0.0f;
-                    if (row_valid && d < D) {
-                        q_value = q_cache[q_row + d];
-                        do_value = dO[do_row + d];
-                    }
-                    Qs[local_q * kQStride + local_d] = q_value;
-                    dOs[local_q * kQStride + local_d] = do_value;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
+        for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
             #pragma unroll
-            for (uint q_sub = 0u; q_sub < kQSub; ++q_sub) {
-                #pragma unroll
-                for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
-                    const ushort2 origin = ushort2(
-                        ushort(q_sub * kFrag), ushort(d_index * kFrag));
-                    const float2 q_value = lowreg_matrix::load_tg_8x8(
-                        Qs, kQStride, origin, ushort(lane));
-                    const float2 do_value = lowreg_matrix::load_tg_8x8(
-                        dOs, kQStride, origin, ushort(lane));
-                    const uint accum_index = out_chunk * kDSubPerTile + d_index;
-                    dk_accum[accum_index] = lowreg_matrix::mma_8x8(
-                        dp_frag[q_sub], q_value, dk_accum[accum_index]);
-                    dv_accum[accum_index] = lowreg_matrix::mma_8x8(
-                        score_frag[q_sub], do_value, dv_accum[accum_index]);
-                }
+            for (uint d_index = 0u; d_index < kDSubPerTile; ++d_index) {
+                const ushort2 origin = ushort2(
+                    ushort(q_sub * kFrag), ushort(d_index * kFrag));
+                const float2 q_value = lowreg_matrix::load_tg_8x8(
+                    Qs, kQStride, origin, ushort(lane));
+                const float2 do_value = lowreg_matrix::load_tg_8x8(
+                    dOs, kQStride, origin, ushort(lane));
+                dk_accum[d_index] = lowreg_matrix::mma_8x8(
+                    dp_frag[q_sub], q_value, dk_accum[d_index]);
+                dv_accum[d_index] = lowreg_matrix::mma_8x8(
+                    score_frag[q_sub], do_value, dv_accum[d_index]);
             }
         }
     }
@@ -11741,7 +11719,7 @@ kernel void gqa_bwd_dkv(
     uint3 nt [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]], uint sw [[threads_per_simdgroup]]) {
     threadgroup float Qs[24u*68u], dOs[24u*68u], lse_tile[24u], dval_tile[24u];
-    gqa_bwd_dkv_impl<128u,4u,24u,2u>(q,k,v,dO,dK,dV,lse,dval,B,H,T,C,causal,HKV,
+    gqa_bwd_dkv_impl<128u,4u,24u,1u>(q,k,v,dO,dK,dV,lse,dval,B,H,T,C,causal,HKV,
                                     tg,tp,nt,lane,sg,sw,Qs,dOs,lse_tile,dval_tile);
 }
 
@@ -13364,6 +13342,11 @@ struct BlockLoader {
             return;
         }
 
+        if (TROWS >= BROWS && src_tile_dim.x >= vec_size) {
+            *((threadgroup ReadVector*)(dst)) = *((const device ReadVector*)(src));
+            return;
+        }
+
         // Use fast thread memory for bound checks
         bool tmp_idx[vec_size];
         T tmp_val[vec_size];
@@ -13909,8 +13892,8 @@ void fp32_gemm(
     uint simd_group_id            [[simdgroup_index_in_threadgroup]],
     uint3 tid                     [[threadgroup_position_in_grid]]
 ) {
-    threadgroup float As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
-    threadgroup float Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
+    alignas(16) threadgroup float As[gemm_tgp_mem_size_a<float, a_transpose, BM, BK>()];
+    alignas(16) threadgroup float Bs[gemm_tgp_mem_size_b<float, b_transpose, BN, BK>()];
     gemm_core<float, false, a_transpose, b_transpose, BM, BN, BK, WM, WN, accum>(
         As, Bs, A, B, nullptr, nullptr, D,
         M, N, K, lda, ldb, ldd, tiles_m, tiles_n,

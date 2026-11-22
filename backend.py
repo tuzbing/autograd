@@ -4524,7 +4524,9 @@ class MetalBackend(Backend):
 		self.ctx.dispatch_with_args_3d('gqa_bwd_dkv',
 		    [q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dk.ptr.buffer_id, dv.ptr.buffer_id, lse.ptr.buffer_id, d_val.ptr.buffer_id],
 		    [q.ptr.offset, k.ptr.offset, v.ptr.offset, out.grad.storage.ptr.offset, dk.ptr.offset, dv.ptr.offset, lse.ptr.offset, d_val.ptr.offset],
-		    [B, H, T, C, int(op.is_causal), HKV], 128, (T+31)//32, B*HKV, 128)
+		    # [B, H, T, C, int(op.is_causal), HKV], 128, (T+31)//32, B*HKV, 128)
+		    [B, H, T, C, int(op.is_causal), HKV], 128*((D+63)//64), (T+31)//32, B*HKV, 128)
+		
 		negative_sin = int(op.rope_sign > 0)
 		self.ctx.dispatch_with_args_3d('gqa_rope_inplace',
 		    [dq.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],

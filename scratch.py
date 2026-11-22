@@ -264,7 +264,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				H = mlp_node.inputs[-2].shape[1] // 2
 				avail_bytes = align_up(N * 2 * H * 4, 64) + align_up(N * H * 4, 64) - 2 * align_up(N * 4, 64) - 512
 				raw_rows = max(1, min(512, avail_bytes // ((V + C + 1) * 4), N))
-				logits_rows = (raw_rows // 16) * 16 if raw_rows >= 16 else raw_rows
+				logits_rows = (1 << (raw_rows.bit_length() - 1)) if raw_rows >= 64 else ((raw_rows // 16) * 16 if raw_rows >= 16 else raw_rows)
 			else:
 				logits_budget_elements = max(V, 8*N*C)
 				logits_rows = max(1, min(512, logits_budget_elements//V, N))
