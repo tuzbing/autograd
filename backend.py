@@ -3847,47 +3847,65 @@ class MetalBackend(Backend):
 			x_offset = x.storage.ptr.offset
 			x_norm_storage = tmp_dx
 
-		# 5. X_norm = RMSNorm(x)
-		if norm_weight is None:			
-			self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-				[x_buffer_id, x_norm_storage.ptr.buffer_id],
-				[x_offset, x_norm_storage.ptr.offset],
-				[C, eps_bits], N * 256, 1, 1, 256)
-		else:
-			self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
-				[x_buffer_id, norm_weight.storage.ptr.buffer_id, x_norm_storage.ptr.buffer_id],
-				[x_offset, norm_weight.storage.ptr.offset, x_norm_storage.ptr.offset],
-				[C, eps_bits], N*256, 1, 1, 256)
-
-		# 6. GU = X_norm @ Wgu
 		if use_fp16_gemm:
-			self._dispatch_fp32_gemm(scratch.gemm_configs["gu"], False,
-					[x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-					[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset], N, H2, C)
-		else:
-			self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-				[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
-				[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
-
-		# 7. hidden = SiLU(gate)*up & 8. dWdown = HIDDEN.T @ dOUT
-		if use_fp16_gemm:
-			chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes = scratch.gemm_configs["mlp_shape"]
+			h2_tile, chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes = scratch.gemm_configs["mlp_shape"]
 			scale_len = max(chunk_rows, C)
 			sdgu_bytes = align_up(N * 4, 16)
 			if "gemm_quant" in scratch._views:
 				q_buf = scratch["gemm_quant"]
 				q_id = q_buf.ptr.buffer_id
 				sdgu_off = q_buf.ptr.offset
-				dout_q_off = sdgu_off + sdgu_bytes
-				p3_off = dout_q_off
+				xq_off = dout_q_off = p3_off = sdgu_off + sdgu_bytes
 			else:
 				q_id = hidden.ptr.buffer_id
 				sdgu_off = hidden.ptr.offset + ((N * H * 4) & ~15) - sdgu_bytes
+				xq_off = hidden.ptr.offset
 				dout_q_off = hidden.ptr.offset + head_bytes
 				p3_off = hidden.ptr.offset + xnorm_bytes
 			s_dout_off = dout_q_off + align_up(N * C * 2, 16)
 			wq_off = s_dout_off + align_up(scale_len * 4, 16)
 			sw_off = wq_off + align_up(h_tile * C * 2, 16)
+
+			# 5 & 6. X_norm(FP16) & GU = X_norm @ Wgu
+			self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [sdgu_off], 1.0, N)
+			if norm_weight is None:
+				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+					[x_buffer_id, q_id],
+					[x_offset, xq_off],
+					[C | 0x80000000, eps_bits], N * 256, 1, 1, 256)
+			else:
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+					[x_buffer_id, norm_weight.storage.ptr.buffer_id, q_id],
+					[x_offset, norm_weight.storage.ptr.offset, xq_off],
+					[C | 0x80000000, eps_bits], N * 32, 1, 1, 32)
+			wgu_q_off = xq_off + align_up(N * C * 2, 16)
+			swgu_off = wgu_q_off + align_up(C * h2_tile * 2, 16)
+			gu_cfgs = scratch.gemm_configs["gu"]
+			for j0 in range(0, H2, h2_tile):
+				h2_sub = min(h2_tile, H2 - j0)
+				self._quantize_fp16_colwise(wgu.storage.ptr.buffer_id, wgu.storage.ptr.offset + j0 * 4,
+					q_id, wgu_q_off, swgu_off, C, h2_sub, H2)
+				self._dispatch_fp16_gemm_raw(gu_cfgs[h2_sub], False,
+					[q_id, q_id, q_id, q_id, gu.ptr.buffer_id],
+					[xq_off, wgu_q_off, sdgu_off, swgu_off, gu.ptr.offset + j0 * 4],
+					N, h2_sub, C)
+		else:
+			# 5. X_norm = RMSNorm(x)
+			if norm_weight is None:
+				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
+					[x_buffer_id, x_norm_storage.ptr.buffer_id],
+					[x_offset, x_norm_storage.ptr.offset],
+					[C, eps_bits], N * 256, 1, 1, 256)
+			else:
+				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
+					[x_buffer_id, norm_weight.storage.ptr.buffer_id, x_norm_storage.ptr.buffer_id],
+					[x_offset, norm_weight.storage.ptr.offset, x_norm_storage.ptr.offset],
+					[C, eps_bits], N * 32, 1, 1, 32)
+
+			# 6. GU = X_norm @ Wgu
+			self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+				[x_norm_storage.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+				[1, N, H2, C, 0, 0, 0, 0], 1.0, 0.0)
 
 		if use_fp16_gemm:
 			self._quantize_fp16_tensor(out.grad.storage.ptr.buffer_id, out.grad.storage.ptr.offset,
@@ -3964,20 +3982,17 @@ class MetalBackend(Backend):
 				[gu.ptr.offset, hidden.ptr.offset, hidden.ptr.offset],
 				[N, H], N*H, 1, 1, 256)
 
-		if recompute_x:
+		if wgu.requires_grad and (recompute_x or use_fp16_gemm):
 			if norm_weight is None:
 				self.ctx.dispatch_with_args_3d("rmsnorm_forward",
-					[tmp_dx.ptr.buffer_id, hidden.ptr.buffer_id],
-					[tmp_dx.ptr.offset, hidden.ptr.offset],
-					[C, eps_bits], N*256, 1, 1, 256)
+					[x_buffer_id, x_norm_storage.ptr.buffer_id],
+					[x_offset, x_norm_storage.ptr.offset],
+					[C, eps_bits], N * 256, 1, 1, 256)
 			else:
 				self.ctx.dispatch_with_args_3d("rmsnorm_weighted_forward",
-					[tmp_dx.ptr.buffer_id, norm_weight.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-					[tmp_dx.ptr.offset, norm_weight.storage.ptr.offset, hidden.ptr.offset],
-					[C, eps_bits], N*256, 1, 1, 256)
-			x_norm_storage = hidden
-		else:
-			x_norm_storage = tmp_dx
+					[x_buffer_id, norm_weight.storage.ptr.buffer_id, x_norm_storage.ptr.buffer_id],
+					[x_offset, norm_weight.storage.ptr.offset, x_norm_storage.ptr.offset],
+					[C, eps_bits], N * 32, 1, 1, 32)
 
 		# 11. dWgu = X_norm.T @ dGU
 		if wgu.requires_grad:
@@ -3988,11 +4003,7 @@ class MetalBackend(Backend):
 				self._quantize_fp16_tensor(x_norm_storage.ptr.buffer_id, x_norm_storage.ptr.offset,
 					q_id, zq_off, sz_off, s1_off, N * C, C, q_id, sdgu_off, C)
 				self.ctx.fill_scalar("fill_scalar_kernel", [q_id], [s1_off], 1.0, H2)
-				dwgu_cfg = scratch.gemm_configs.get("dwgu")
-				if dwgu_cfg is None:
-					dwgu_cfg = get_fp16_gemm_config(M=C, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", ldb=2*H2)
-					scratch.gemm_configs["dwgu"] = dwgu_cfg
-				self._dispatch_fp16_gemm_raw(dwgu_cfg, bool(accumulate),
+				self._dispatch_fp16_gemm_raw(scratch.gemm_configs["dwgu"], bool(accumulate),
 					[q_id, gu.ptr.buffer_id, q_id, q_id, wgu.grad.storage.ptr.buffer_id],
 					[zq_off, gu.ptr.offset, sz_off, s1_off, wgu.grad.storage.ptr.offset],
 					C, H2, N, out_bf16=gu_bf16)
@@ -4010,9 +4021,9 @@ class MetalBackend(Backend):
 				main_rows = (N // 16) * 16
 				tail_rows = N - main_rows
 				if main_rows > 0:
-						self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
-							[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
-							[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
+					self.ctx.dispatch_gemm_mps([x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+						[x_norm_storage.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+						[1, C, H2, main_rows, 1, 0, 0, 0], 1.0, float(accumulate))
 				if tail_rows:
 					self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_tail",
 						[x_norm_storage.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
@@ -4702,20 +4713,13 @@ class MetalBackend(Backend):
 	    if out.grad is None:
 	        return
 	    B_dim = prod(x.shape[:-2]) if x.ndim > 2 else 1
-	    M_dim = x.shape[-2]
+	    M_total = prod(x.shape[:-1])
 	    K_dim = act.shape[-1]
 	    N_dim = w.shape[-1]
 	    accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
 
 	    dw_bf16 = w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
 	    db_bf16 = b.requires_grad and np.dtype(b.grad.storage.dtype) == np.dtype(np.uint16)
-	    if dw_bf16:
-	    	fa_k = scratch["fa_k"]
-	    	fa_v = scratch["fa_v"]
-	    	dw_buffer_id = fa_k.ptr.buffer_id
-	    	dw_offset = fa_k.ptr.offset
-	    	dw_capacity = (fa_v.ptr.offset + fa_v.nbytes - dw_offset) // 4
-	    	dw_tile_k = min(K_dim, dw_capacity // N_dim)
 
 	    if act.op is not None and act.op.op.op_name == "FusedRMSNormFlashAttention":
 	    	cached = getattr(self, "_recomputed_attention_cache", None)
@@ -4736,35 +4740,51 @@ class MetalBackend(Backend):
 	    else:
 	        act_buf = act.storage
 	    if w.requires_grad:
-	    	if dw_bf16:
-	    		for k0 in range(0, K_dim, dw_tile_k):
-	    			tile_k = min(dw_tile_k, K_dim - k0)
-	    			self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, dw_buffer_id],
-	    				[act_buf.ptr.offset + k0*4, out.grad.storage.ptr.offset, dw_offset],
-	    				[1, tile_k, N_dim, B_dim*M_dim, 1, 0, 0, 0, 0, K_dim*4], 1.0, 0.0)
-	    			self.ctx.dispatch_with_args_3d("fp32_to_bf16",
-	    				[dw_buffer_id, w.grad.storage.ptr.buffer_id],
-	    				[dw_offset, w.grad.storage.ptr.offset + k0*N_dim*2],
-	    				[accumulate], tile_k*N_dim, 1, 1, min(tile_k*N_dim, 256))
-	    	else:
-		        self.ctx.dispatch_gemm_mps([act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-		        	[act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
-		        	[1, K_dim, N_dim, B_dim*M_dim, 1, 0, 0, 0], 1.0, float(accumulate))
+	        dw_cfg = get_fp16_gemm_config(M=K_dim, N=N_dim, K=M_total, with_accum=bool(accumulate), a_transpose=True, b_transpose=False, dtype="fp32")
+	        if dw_bf16:
+	            if not dw_cfg["is_splitk"]:
+	                tg = dw_cfg["wm"] * dw_cfg["wn"] * 32
+	                dw_flags = accumulate | (dw_cfg["swizzle_log"] << 2) | (dw_cfg["bm"] << 8)
+	                self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+	                    [act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+	                    [act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+	                    [M_total, N_dim, K_dim, dw_flags], dw_cfg["grid_x"] * tg, dw_cfg["grid_y"], dw_cfg["grid_z"], tg)
+	            else:
+	                self.ctx.dispatch_with_args_3d("fused_rmsnorm_linear_ce_dw_bf16",
+	                    [act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+	                    [act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+	                    [M_total, N_dim, K_dim, accumulate], N_dim, K_dim, 1, min(N_dim, 256))
+	        else:
+	            self._dispatch_fp32_gemm(dw_cfg, bool(accumulate),
+	                [act_buf.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+	                [act_buf.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+	                K_dim, N_dim, M_total)
 	    if x.requires_grad:
-	        self.ctx.dispatch_strided(
-	            "strided_add_backward_kernel",
-	            out.grad.storage.ptr.buffer_id,
-	            out.grad.storage.ptr.offset,
-	            x.grad.storage.ptr.buffer_id,
-	            x.grad.storage.ptr.offset,
-	            list(x.shape),
-	            x.strides,
-	            prod(x.shape),
-	        )
+	        numel = prod(x.shape)
+	        og, xg = out.grad.storage, x.grad.storage
+	        if og.ptr.buffer_id != xg.ptr.buffer_id or og.ptr.offset != xg.ptr.offset:
+	            if x.is_contiguous:
+	                if numel % 4 == 0 and og.ptr.offset % 16 == 0 and xg.ptr.offset % 16 == 0:
+	                    self.ctx.dispatch_with_args_3d("add_residual_backward_vec4",
+	                        [og.ptr.buffer_id, xg.ptr.buffer_id, 0],
+	                        [og.ptr.offset, xg.ptr.offset, 0],
+	                        [], numel // 4, 1, 1, min(numel // 4, 256))
+	                else:
+	                    self.ctx.dispatch_with_args_3d("contiguous_backward_kernel",
+	                        [og.ptr.buffer_id, xg.ptr.buffer_id],
+	                        [og.ptr.offset, xg.ptr.offset],
+	                        [], numel, 1, 1, min(numel, 256))
+	            else:
+	                self.ctx.dispatch_strided("strided_add_backward_kernel",
+	                    og.ptr.buffer_id, og.ptr.offset,
+	                    xg.ptr.buffer_id, xg.ptr.offset,
+	                    list(x.shape), x.strides, numel)
 	    if act.requires_grad:
-	        self.ctx.dispatch_gemm_mps([out.grad.storage.ptr.buffer_id, w.storage.ptr.buffer_id, act.grad.storage.ptr.buffer_id],
-	        	[out.grad.storage.ptr.offset, w.storage.ptr.offset, act.grad.storage.ptr.offset],
-	        	[1, B_dim*M_dim, K_dim, N_dim, 0, 1, 0, 0], 1.0, 0.0)
+	        dact_cfg = get_fp16_gemm_config(M=M_total, N=K_dim, K=N_dim, with_accum=False, a_transpose=False, b_transpose=True, dtype="fp32")
+	        self._dispatch_fp32_gemm(dact_cfg, False,
+	            [out.grad.storage.ptr.buffer_id, w.storage.ptr.buffer_id, act.grad.storage.ptr.buffer_id],
+	            [out.grad.storage.ptr.offset, w.storage.ptr.offset, act.grad.storage.ptr.offset],
+	            M_total, K_dim, N_dim)
 
 	    if b.requires_grad:
 	        bias_kernel = "bias_grad_reduce_bf16" if db_bf16 else "bias_grad_reduce"

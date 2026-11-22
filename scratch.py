@@ -404,28 +404,24 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				xnorm_bytes = align_up(N * C * 4, 16)
 				avail_3 = cap_12 - xnorm_bytes
 				z_bytes = fp16_quant_bytes(N, C, C) + align_up(H2 * 4, 16)
-				if gu_bf16:
-					max_r = max(1, (avail_3 - z_bytes) // (H2 * 4))
-					gu_tile_r = min(C, (max_r // 64) * 64 if max_r >= 64 else max(1, (max_r // 8) * 8))
-					step11_bytes = z_bytes + align_up(gu_tile_r * H2 * 4, 16)
-				else:
-					gu_tile_r = C
-					step11_bytes = z_bytes if wgu.requires_grad else 0
+				gu_tile_r = C
+				step11_bytes = z_bytes if wgu.requires_grad else 0
 				max_c = max(1, (avail_3 - 32) // (H2 * 2 + 4))
 				c_tile = min(C, (max_c // 64) * 64 if max_c >= 64 else max(1, (max_c // 8) * 8))
 				wgu_bytes = fp16_quant_bytes(c_tile, H2, c_tile)
 
+				need_gu = xq_bytes + wgu_fwd_bytes + sdgu_bytes
 				need_a = head_bytes + dout_bytes + wdown_bytes + sdgu_bytes
 				need_b = xnorm_bytes + max(step11_bytes, wgu_bytes) + sdgu_bytes
-				if max(need_a, need_b) > hid_cap:
-					bwd_slots.append(('gemm_quant', (align_up(max(dout_bytes + wdown_bytes, step11_bytes, wgu_bytes) + sdgu_bytes, 64),), np.uint8))
+				if max(need_gu, need_a, need_b) > hid_cap:
+					bwd_slots.append(('gemm_quant', (align_up(max(xq_bytes + wgu_fwd_bytes, dout_bytes + wdown_bytes, step11_bytes, wgu_bytes) + sdgu_bytes, 64),), np.uint8))
 
 				r_sizes = sorted({min(chunk_rows, N - r0) for r0 in range(0, N, chunk_rows)})
 				h_sizes = sorted({min(h_tile, H - h0) for h0 in range(0, H, h_tile)})
 				c_sizes = sorted({min(c_tile, C - c0) for c0 in range(0, C, c_tile)})
 				bwd_configs = {
-					"gu": get_fp16_gemm_config(M=N, N=H2, K=C, with_accum=False, a_transpose=False, b_transpose=False, dtype="fp32"),
-					"mlp_shape": (chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes),
+					"gu": fwd.gemm_configs["gu"],
+					"mlp_shape": (h2_tile, chunk_rows, h_tile, c_tile, gu_tile_r, head_bytes, xnorm_bytes),
 					"dhidden": {
 						(r, h): get_fp16_gemm_config(M=r, N=h, K=C, a_transpose=False, b_transpose=True, dtype="fp16", ldd=H)
 						for r in r_sizes for h in h_sizes
@@ -438,14 +434,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				if wdown.requires_grad:
 					bwd_configs["dwdown"] = get_fp16_gemm_config(M=H, N=C, K=N, a_transpose=True, b_transpose=False, dtype="fp16")
 				if wgu.requires_grad:
-					if gu_bf16:
-						r_bf16_sizes = sorted({min(gu_tile_r, C - c0) for c0 in range(0, C, gu_tile_r)})
-						bwd_configs["dwgu_bf16"] = {
-							r: get_fp16_gemm_config(M=r, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", lda=C, ldb=2*H2)
-							for r in r_bf16_sizes
-						}
-					else:
-						bwd_configs["dwgu"] = get_fp16_gemm_config(M=C, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", ldb=2*H2)
+					bwd_configs["dwgu"] = get_fp16_gemm_config(M=C, N=H2, K=N, a_transpose=True, b_transpose=False, dtype="fp16", ldb=2*H2)
 				bwd = pack_slots(bwd_slots)
 				bwd.gemm_configs = bwd_configs
 			else:
