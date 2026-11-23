@@ -3,9 +3,28 @@ Reinforcement learning on GSM8K via GRPO.
 
 Run:
 
-    python chat_rl_autograd.py \
-        --model-in checkpoints/base_d6/model_000000.gguf \
-        --data-dir sft_data
+HF_HOME="$PWD/sft_data/huggingface" \
+HF_DATASETS_CACHE="$PWD/sft_data/huggingface/datasets" \
+HF_HUB_CACHE="$PWD/sft_data/huggingface/hub" \
+/Users/a58/Documents/code/nanochat/.venv/bin/python -u rl_autograd.py \
+  --model-in "$PWD/checkpoints/sft_d6/model_020493.gguf" \
+  --model-out "$PWD/checkpoints/rl_d6/model_{step:06d}.gguf" \
+  --data-dir "$PWD/sft_data" \
+  --device-type mps \
+  --num-epochs 1 \
+  --device-batch-size 8 \
+  --examples-per-step 16 \
+  --num-samples 16 \
+  --max-new-tokens 256 \
+  --temperature 1.0 \
+  --top-k 50 \
+  --matrix-lr 0.02 \
+  --init-lr-frac 0.05 \
+  --weight-decay 0.0 \
+  --eval-every 60 \
+  --eval-examples 400 \
+  --save-every 100
+
 """
 
 import argparse
@@ -518,6 +537,8 @@ for step in range(num_steps):
             row_scale_host = np.broadcast_to(np.asarray(advantages_pass, dtype=np.float32).reshape(B, 1), (B, T),).copy()
             row_scale_host[targets_pass < 0] = 0.0
             row_scale_host /= np.float32(denominator)
+            if not np.any(row_scale_host):
+                continue
 
             curr_train_plan.set_inputs(inputs_pass)
             curr_train_plan.set_targets(targets_pass)
