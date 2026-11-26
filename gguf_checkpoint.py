@@ -236,3 +236,166 @@ def load_gguf(path, model, backend, model_config=None, strict=True):
     backend.synchronize()
     metadata["autograd.loaded_tensor_count"] = loaded
     return metadata
+
+def read_gguf_metadata(path):
+    """Read metadata header only without allocating model tensors."""
+    with open(path, "rb") as file:
+        if _read_exact(file, 4) != MAGIC:
+            raise ValueError(f"not a GGUF file: {path}")
+        version, _, metadata_count = struct.unpack("<IQQ", _read_exact(file, 20))
+        if version not in (2, 3):
+            raise ValueError(f"unsupported GGUF version: {version}")
+
+        metadata = {}
+        for _ in range(metadata_count):
+            key = _read_string(file)
+            value_type = struct.unpack("<I", _read_exact(file, 4))[0]
+            metadata[key] = _read_value(file, value_type)
+
+    if metadata.get("general.architecture") != "autograd-gpt2":
+        raise ValueError("expected autograd-gpt2 GGUF checkpoint")
+    return metadata
+
+
+def storage_view(backend, storage):
+    if hasattr(storage.ptr, "buffer_id"):
+        tensor = Tensor(
+            storage.shape, storage.dtype, device="mps", requires_grad=False
+        )
+        tensor.storage = storage
+        return backend.numpy_view(tensor)
+    return storage.data.reshape(storage.shape)
+
+
+def optimizer_storages(optimizer):
+    if not isinstance(optimizer.dispatches, tuple):
+        raise TypeError("Optimizer checkpoint requires Metal tuple dispatches")
+
+    result = {}
+    for i, storage in enumerate(optimizer.m):
+        result[f"m_{i}"] = storage
+    for i, storage in enumerate(optimizer.v):
+        result[f"v_{i}"] = storage
+
+    if optimizer.state_mode != "fp32":
+        for i, item in enumerate(optimizer.dispatches):
+            kind = item[0]
+            if kind == "mini8bit":
+                # item[13] 为 quantized；n 小于 4096 时 meta 的 dtype 为 None，无需保存
+                if bool(item[13]):
+                    result[f"absmax_m_{i}"] = item[4]
+            elif kind == "q8":
+                result[f"absmax_m_{i}"] = item[5]
+                result[f"absmax_v_{i}"] = item[6]
+            elif kind != "fp32":
+                raise ValueError(f"Unsupported optimizer dispatch: {kind!r}")
+
+    if optimizer.qmap_m is not None:
+        result["qmap_m"] = optimizer.qmap_m
+    if optimizer.qmap_v is not None:
+        result["qmap_v"] = optimizer.qmap_v
+
+    return result
+
+
+def optimizer_signature(optimizer, model):
+    if not isinstance(optimizer.dispatches, tuple):
+        raise TypeError("Optimizer checkpoint requires Metal tuple dispatches")
+
+    dispatches = []
+    for item in optimizer.dispatches:
+        if optimizer.state_mode == "fp32":
+            if len(item) != 6:
+                raise ValueError("Unexpected fp32 dispatch layout")
+            dispatches.append(["fp32_group", int(item[4]), int(item[5])])
+            continue
+
+        kind = item[0]
+        if kind == "mini8bit":
+            if len(item) != 14:
+                raise ValueError("Unexpected mini8bit dispatch layout")
+            dispatches.append([kind, *map(int, item[6:])])
+        elif kind == "q8":
+            if len(item) != 9:
+                raise ValueError("Unexpected q8 dispatch layout")
+            dispatches.append([kind, int(item[7]), int(item[8])])
+        elif kind == "fp32":
+            if len(item) != 7:
+                raise ValueError("Unexpected fp32 dispatch layout")
+            dispatches.append([kind, int(item[5]), int(item[6])])
+        else:
+            raise ValueError(f"Unsupported optimizer dispatch: {kind!r}")
+
+    return {
+        "state_mode": optimizer.state_mode,
+        "parameters": [
+            [name, list(tensor.shape)] for name, tensor in named_parameters(model)
+        ],
+        "dispatches": dispatches,
+    }
+
+
+def save_optimizer(path, optimizer, model, backend, extra_meta=None):
+    """Atomically save AdamW state (fp32 / 8bit / mini) to .optim.npz."""
+    backend.synchronize()
+    metadata = optimizer_signature(optimizer, model)
+    metadata.update({
+        "t": int(optimizer.t),
+        "betas": list(optimizer.betas),
+        "eps": float(optimizer.eps),
+    })
+    if extra_meta:
+        metadata.update(extra_meta)
+
+    arrays = {
+        name: storage_view(backend, storage).copy()
+        for name, storage in optimizer_storages(optimizer).items()
+    }
+
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(prefix=".optim-", suffix=".npz", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            np.savez(file, metadata=np.array(json.dumps(metadata)), **arrays)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def load_optimizer(path, optimizer, model, backend):
+    """Load AdamW state from .optim.npz if present; return saved metadata dict."""
+    if not os.path.isfile(path):
+        print(f"Optimizer checkpoint not found; starting fresh AdamW ({optimizer.state_mode})")
+        return {}
+
+    backend.synchronize()
+    storages = optimizer_storages(optimizer)
+    with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata"].item()))
+        expected = optimizer_signature(optimizer, model)
+        for key, value in expected.items():
+            if metadata.get(key) != value:
+                raise ValueError(f"Incompatible optimizer state: {key}")
+        if set(data.files) != set(storages) | {"metadata"}:
+            raise ValueError("Optimizer buffer names do not match")
+
+        for name, storage in storages.items():
+            array = data[name]
+            if array.shape != storage.shape or array.dtype != np.dtype(storage.dtype):
+                raise ValueError(f"Optimizer buffer mismatch: {name}")
+
+        for name, storage in storages.items():
+            storage_view(backend, storage)[:] = data[name]
+
+    optimizer.t = int(metadata["t"])
+    optimizer.betas = tuple(metadata["betas"])
+    optimizer.eps = float(metadata["eps"])
+    print(f"Loaded AdamW ({optimizer.state_mode}) state at optimizer step {optimizer.t}")
+    return metadata

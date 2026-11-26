@@ -2,7 +2,30 @@
 Train GPT2 using the custom autograd/Metal framework while matching the
 nanochat d6 training configuration and data pipeline.
 
-Run from /Users/a58/Documents/code/autograd.
+NANOCHAT_BASE_DIR="$HOME/.cache/nanochat" \                           
+/Users/a58/Documents/code/nanochat/.venv/bin/python train_autograd.py \
+  --device-type=mps \
+  --depth=6 \
+  --aspect-ratio=64 \
+  --head-dim=64 \
+  --window-pattern=L \
+  --max-seq-len=512 \
+  --device-batch-size=32 \
+  --total-batch-size=16384 \
+  --matrix-lr=0.02 \
+  --weight-decay=0.234903 \
+  --warmup-steps=40 \
+  --warmdown-ratio=0.65 \
+  --final-lr-frac=0.05 \
+  --eval-every=100 \
+  --eval-tokens=524288 \
+  --core-metric-every=-1 \
+  --sample-every=-1 \
+  --num-iterations=5000 \
+  --save-every=1000 \
+  --model-out='/Users/a58/Documents/code/autograd/checkpoints/base_d6/fp32_model_{step:06d}.gguf' \
+  --run=dummy
+
 """
 
 import os
