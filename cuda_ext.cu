@@ -40,14 +40,21 @@ class CudaContext {
 			CUDA_CHECK(cudaStreamCreate(&stream_));
 
 			kernels_ = {
-	            {"fill_scalar_kernel2",           (const void*)&fill_scalar_kernel2},
-	            {"gather_forward_kernel",         (const void*)&gather_forward_kernel},
-	            {"gather_backward_kernel",        (const void*)&gather_backward_kernel},
+	            {"fill_scalar_kernel2",             (const void*)&fill_scalar_kernel2},
+	            {"gather_forward_kernel",           (const void*)&gather_forward_kernel},
+	            {"gather_backward_kernel",          (const void*)&gather_backward_kernel},
 	            {"fused_linear_add_forward_kernel", (const void*)&fused_linear_add_forward_kernel},
 	            {"cuda_sgemm_tn_kernel",            (const void*)&cuda_sgemm_tn_kernel},
 	            {"cuda_sgemm_nt_kernel",            (const void*)&cuda_sgemm_nt_kernel},
 	            {"linear_add_dx_backward_kernel",   (const void*)&linear_add_dx_backward_kernel},
 	            {"bias_grad_reduce_kernel",         (const void*)&bias_grad_reduce_kernel},
+	            {"cuda_sgemm_nn_kernel",            (const void*)&cuda_sgemm_nn_kernel},
+	            {"rmsnorm_forward_kernel",          (const void*)&rmsnorm_forward_kernel},
+	            {"fused_wgu_swiglu_forward_kernel", (const void*)&fused_wgu_swiglu_forward_kernel},
+	            {"swiglu_forward_kernel",           (const void*)&swiglu_forward_kernel},
+	            {"swiglu_backward_inplace_kernel",  (const void*)&swiglu_backward_inplace_kernel},
+	            {"rmsnorm_backward_kernel",         (const void*)&rmsnorm_backward_kernel},
+	            {"rmsnorm_dgamma_kernel",           (const void*)&rmsnorm_dgamma_kernel},
 	        };
 	    }
 

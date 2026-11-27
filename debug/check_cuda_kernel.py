@@ -43,8 +43,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import runtime  # noqa: E402
 from module import GPT2  # noqa: E402
-from op import FusedLinearAddOp  # noqa: E402
+from op import FusedLinearAddOp, FusedRMSNormMLPOp  # noqa: E402
 from tensor import Tensor  # noqa: E402
+from utils import f32_bits
 
 Runtime = runtime.Runtime
 
@@ -354,6 +355,7 @@ def run_staged_cpu_graph(state):
     for node in reversed(rt.topo):
         label = state.labels_by_node[id(node)]
         output_grads = [None if out.grad is None else copy_to_host(rt, out.grad) for out in node.outputs]
+        input_grads_before = [None if tensor.grad is None else copy_to_host(rt, tensor.grad) for tensor in node.inputs]
         node.backward(node.inputs, node.outputs)
         rt.backend.end_pass()
         rt.backend.synchronize()
@@ -367,7 +369,9 @@ def run_staged_cpu_graph(state):
                 "parameter": state.param_name_by_id.get(id(tensor)),
                 "grad": copy_to_host(rt, tensor.grad),
             })
-        backward[label] = {"output_grads": output_grads, "inputs": inputs}
+        backward[label] = {"output_grads": output_grads, 
+                           "input_grads_before": input_grads_before,
+                           "inputs": inputs}
         rt.backend.begin_pass()
     rt.backend.end_pass()
     return {"forward": forward, "forward_inputs": forward_inputs, "backward": backward}
@@ -393,6 +397,9 @@ def _run_op_graph(device, build_fn, upstream_np, grad_dtype=np.float32, accum_st
             if "act" in tracked:
                 new_act = (rng.standard_normal(tracked["act"].shape).astype(np.float32) * 0.02).copy()
                 rt.backend.copy_from_host(tracked["act"], new_act)
+            if "mlp_x" in tracked:
+                new_x = (rng.standard_normal(tracked["mlp_x"].shape).astype(np.float32) * 0.02).copy()
+                rt.backend.copy_from_host(tracked["mlp_x"], new_x)
 
         rt.accumulate_parameter_grads = step > 0
         rt.backend.accumulate_parameter_grads = step > 0
@@ -571,6 +578,281 @@ def probe_linear_add_internal(cfg, x_np, act_np, arrays, block, upstream, grad_d
     )
     check_parameter_gradient("bias_grad_reduce_kernel/proj_b.grad", copy_to_host(rt, proj_b.grad), expected_db, grad_dtype)
 
+def read_storage_f32(rt, storage, shape=None):
+    shape = tuple(shape if shape is not None else storage.shape)
+    raw = rt.backend.ctx.copy_bytes_to_host(storage.ptr.buffer_id, storage.ptr.offset, int(np.prod(shape)) * 4)
+    return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
+
+
+def rmsnorm_values(x, eps=1e-6):
+    x = np.asarray(x, dtype=np.float32)
+    mean_square = np.mean(x * x, axis=-1, keepdims=True).astype(np.float32)
+    inv_rms = (np.float32(1.0) / np.sqrt(mean_square + np.float32(eps))).astype(np.float32)
+    x_norm = (x * inv_rms).astype(np.float32)
+    return mean_square, inv_rms, x_norm
+
+
+def mlp_oracle(x, wgu, wdown, upstream, residual_grad, eps=1e-6):
+    x = np.asarray(x, dtype=np.float32)
+    wgu = np.asarray(wgu, dtype=np.float32)
+    wdown = np.asarray(wdown, dtype=np.float32)
+    upstream = np.asarray(upstream, dtype=np.float32)
+    residual_grad = np.asarray(residual_grad, dtype=np.float32)
+
+    B, T, C = x.shape
+    N = B * T
+    H = wgu.shape[1] // 2
+
+    _, inv_rms, x_norm = rmsnorm_values(x, eps)
+    XN = x_norm.reshape(N, C)
+    GU = XN @ wgu
+    G, U = GU[:, :H], GU[:, H:]
+    sigmoid_g = 1.0 / (1.0 + np.exp(-G))
+    silu_g = G * sigmoid_g
+    HIDDEN = silu_g * U
+    out = (HIDDEN @ wdown).reshape(B, T, C).astype(np.float32)
+
+    DOUT = upstream.reshape(N, C)
+    dwdown = (HIDDEN.T @ DOUT).astype(np.float32)
+    d_hidden = DOUT @ wdown.T
+    dsilu_dg = sigmoid_g * (1.0 + G * (1.0 - sigmoid_g))
+    d_gate = d_hidden * U * dsilu_dg
+    d_up = d_hidden * silu_g
+    dGU = np.concatenate((d_gate, d_up), axis=-1).astype(np.float32)
+    dwgu = (XN.T @ dGU).astype(np.float32)
+    dx_norm = (dGU @ wgu.T).reshape(B, T, C).astype(np.float32)
+
+    mean_dy_xnorm = np.mean(dx_norm * x_norm, axis=-1, keepdims=True)
+    dx_local = (inv_rms * (dx_norm - x_norm * mean_dy_xnorm)).astype(np.float32)
+    dx = (dx_local + residual_grad).astype(np.float32)
+
+    return {
+        "x_norm": x_norm,
+        "out": out,
+        "dx": dx,
+        "dx_local": dx_local,
+        "dw1": dwgu,
+        "dw2": dwdown,
+        "gu": GU.reshape(B, T, 2 * H).astype(np.float32),
+        "hidden": HIDDEN.reshape(B, T, H).astype(np.float32),
+        "dgu": dGU.reshape(B, T, 2 * H).astype(np.float32),
+        "dhidden": d_hidden.reshape(B, T, H).astype(np.float32),
+        "dx_norm": dx_norm,
+    }
+
+
+def probe_mlp_internal(cfg, x_np, act_np, arrays, block, upstream, residual_grad, grad_dtype=np.float32):
+    """对齐 check_tiny_gpt2_kernel.py 的 probe_mlp_internal，并增加内部 CUDA 内核逐级验证。"""
+    print("\n=== FusedRMSNormMLP SwiGLU validation ===")
+    p = f"blocks[{block}]"
+    upstream = np.asarray(upstream, dtype=np.float32).copy()
+    residual_grad = np.asarray(residual_grad, dtype=np.float32).copy()
+
+    proj_w_np = arrays[f"{p}.attn.proj.weight"]
+    proj_b_np = arrays[f"{p}.attn.proj.bias"]
+    wgu_np = arrays[f"{p}.mlp.fc1.weight"]
+    wdown_np = arrays[f"{p}.mlp.fc2.weight"]
+
+    x_after_ref = (
+        np.asarray(x_np, dtype=np.float32).reshape(-1, cfg.C)
+        + np.asarray(act_np, dtype=np.float32).reshape(-1, cfg.C) @ proj_w_np
+        + proj_b_np
+    ).reshape(x_np.shape).astype(np.float32)
+
+    oracle = mlp_oracle(x_after_ref, wgu_np, wdown_np, upstream, residual_grad, eps=1e-6)
+    results = {}
+
+    for device in ("cpu", "cuda"):
+        print(f"\n=== FusedRMSNormMLP SwiGLU {device.upper()} validation ===")
+        rt = reset_runtime(device)
+        gdtype = grad_dtype if device == "cuda" else np.float32
+
+        x = make_tensor(x_np.shape, np.float32, device, True, x_np)
+        attn = make_tensor(act_np.shape, np.float32, device, True, act_np)
+        proj_w = make_tensor(proj_w_np.shape, np.float32, device, True, proj_w_np, grad_dtype=gdtype)
+        proj_b = make_tensor(proj_b_np.shape, np.float32, device, True, proj_b_np, grad_dtype=gdtype)
+        x_after = FusedLinearAddOp()(x, attn, proj_w, proj_b)
+
+        wgu = make_tensor(wgu_np.shape, np.float32, device, True, wgu_np, grad_dtype=gdtype)
+        wdown = make_tensor(wdown_np.shape, np.float32, device, True, wdown_np, grad_dtype=gdtype)
+        mlp = FusedRMSNormMLPOp(eps=1e-6)(x_after, wgu, wdown)
+
+        rt.loss = mlp
+        rt.build_topo(mlp)
+        rt.bind_memory()
+        if device == "cpu":
+            isolate_cpu_reference_memory(rt)
+
+        node = next(n for n in rt.topo if op_name(n) == "FusedRMSNormMLP")
+        if device == "cuda":
+            N = cfg.B * cfg.T
+            max_scratch_bytes = 8 * N * cfg.C * 4 + 128
+            fwd_bytes = node.scratch_fwd_layout.nbytes if node.scratch_fwd_layout is not None else 0
+            bwd_bytes = node.scratch_bwd_layout.nbytes if node.scratch_bwd_layout is not None else 0
+            if max(fwd_bytes, bwd_bytes) > max_scratch_bytes:
+                raise AssertionError(
+                    f"CUDA SwiGLU scratch memory increased: new={max(fwd_bytes, bwd_bytes)}, max={max_scratch_bytes}"
+                )
+
+        rt.forward()
+        rt.backend.synchronize()
+        check(f"{device}/FusedLinearAdd/x_after_vs_oracle", copy_to_host(rt, x_after), x_after_ref, fail_fast=True)
+        got_out = copy_to_host(rt, mlp)
+        check(f"{device}/FusedRMSNormMLP/forward_vs_oracle", got_out, oracle["out"], fail_fast=True)
+
+        for tensor in (x, attn, proj_w, proj_b, x_after, wgu, wdown, mlp):
+            if tensor.grad is not None:
+                rt.backend.fill(tensor.grad, 0.0)
+
+        rt.backend.copy_from_host(mlp.grad, upstream)
+        rt.backend.copy_from_host(x_after.grad, residual_grad)
+        _dispatch(rt, lambda: node.backward(node.inputs, node.outputs))
+
+        got_dx = copy_to_host(rt, x_after.grad)
+        got_dwgu = copy_to_host(rt, wgu.grad)
+        got_dwdown = copy_to_host(rt, wdown.grad)
+
+        check(f"{device}/FusedRMSNormMLP/backward/x.grad_vs_oracle", got_dx, oracle["dx"], fail_fast=True)
+        check_parameter_gradient(
+            f"{device}/FusedRMSNormMLP/backward/wgu.grad_vs_oracle",
+            got_dwgu, oracle["dw1"], gdtype, fail_fast=True,
+        )
+        check_parameter_gradient(
+            f"{device}/FusedRMSNormMLP/backward/wdown.grad_vs_oracle",
+            got_dwdown, oracle["dw2"], gdtype, fail_fast=True,
+        )
+        results[device] = {"out": got_out, "dx": got_dx, "dwgu": got_dwgu, "dwdown": got_dwdown}
+
+    check("FusedRMSNormMLP/CPU_vs_CUDA/forward", results["cuda"]["out"], results["cpu"]["out"], fail_fast=True)
+    check("FusedRMSNormMLP/CPU_vs_CUDA/x.grad", results["cuda"]["dx"], results["cpu"]["dx"], fail_fast=True)
+    check_parameter_gradient("FusedRMSNormMLP/CPU_vs_CUDA/wgu.grad", results["cuda"]["dwgu"], results["cpu"]["dwgu"], grad_dtype, fail_fast=True)
+    check_parameter_gradient("FusedRMSNormMLP/CPU_vs_CUDA/wdown.grad", results["cuda"]["dwdown"], results["cpu"]["dwdown"], grad_dtype, fail_fast=True)
+
+    print("\n=== Internal kernels: FusedRMSNormMLP ===")
+    rt = reset_runtime("cuda")
+    x_t = make_tensor(x_after_ref.shape, np.float32, "cuda", True, x_after_ref)
+    wgu_t = make_tensor(wgu_np.shape, np.float32, "cuda", True, wgu_np, grad_dtype=grad_dtype)
+    wdown_t = make_tensor(wdown_np.shape, np.float32, "cuda", True, wdown_np, grad_dtype=grad_dtype)
+    out_t = FusedRMSNormMLPOp(eps=1e-6)(x_t, wgu_t, wdown_t)
+    rt.loss = out_t
+    rt.build_topo(out_t)
+    rt.bind_memory()
+
+    node = rt.topo[-1]
+    sf = node.forward.keywords["scratch"]
+    sb = node.backward.keywords["scratch"]
+    N = cfg.B * cfg.T
+    H2 = wgu_np.shape[1]
+    H = H2 // 2
+    eps_bits = f32_bits(1e-6)
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_forward_kernel",
+        [x_t.storage.ptr.buffer_id, 0, out_t.storage.ptr.buffer_id],
+        [x_t.storage.ptr.offset, 0, out_t.storage.ptr.offset],
+        [N, cfg.C, eps_bits], (N + 3) // 4, 1, 1, 128,
+    ))
+    check("rmsnorm_forward_kernel/x_norm", copy_to_host(rt, out_t), oracle["x_norm"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "fused_wgu_swiglu_forward_kernel",
+        [out_t.storage.ptr.buffer_id, wgu_t.storage.ptr.buffer_id, sf["hidden"].ptr.buffer_id],
+        [out_t.storage.ptr.offset, wgu_t.storage.ptr.offset, sf["hidden"].ptr.offset],
+        [N, H, cfg.C], (H + 31) // 32, (N + 63) // 64, 1, 256,
+    ))
+    check("fused_wgu_swiglu_forward_kernel/hidden", read_storage_f32(rt, sf["hidden"], (cfg.B, cfg.T, H)), oracle["hidden"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_nn_kernel",
+        [sf["hidden"].ptr.buffer_id, wdown_t.storage.ptr.buffer_id, out_t.storage.ptr.buffer_id],
+        [sf["hidden"].ptr.offset, wdown_t.storage.ptr.offset, out_t.storage.ptr.offset],
+        [N, cfg.C, H, 0], (cfg.C + 63) // 64, (N + 63) // 64, 1, 256,
+    ))
+    check("cuda_sgemm_nn_kernel/output", copy_to_host(rt, out_t), oracle["out"])
+
+    for tensor in (x_t, wgu_t, wdown_t, out_t):
+        if tensor.grad is not None:
+            rt.backend.fill(tensor.grad, 0.0)
+    rt.backend.copy_from_host(out_t.grad, upstream)
+    rt.backend.copy_from_host(x_t.grad, residual_grad)
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_forward_kernel",
+        [x_t.storage.ptr.buffer_id, 0, sb["hidden"].ptr.buffer_id],
+        [x_t.storage.ptr.offset, 0, sb["hidden"].ptr.offset],
+        [N, cfg.C, eps_bits], (N + 3) // 4, 1, 1, 128,
+    ))
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_nn_kernel",
+        [sb["hidden"].ptr.buffer_id, wgu_t.storage.ptr.buffer_id, sb["gu"].ptr.buffer_id],
+        [sb["hidden"].ptr.offset, wgu_t.storage.ptr.offset, sb["gu"].ptr.offset],
+        [N, H2, cfg.C, 0], (H2 + 63) // 64, (N + 63) // 64, 1, 256,
+    ))
+    check("backward/cuda_sgemm_nn_kernel/gu", read_storage_f32(rt, sb["gu"], (cfg.B, cfg.T, H2)), oracle["gu"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "swiglu_forward_kernel",
+        [sb["gu"].ptr.buffer_id, sb["hidden"].ptr.buffer_id],
+        [sb["gu"].ptr.offset, sb["hidden"].ptr.offset],
+        [N, H], (H + 255) // 256, min(N, 65535), 1, 256,
+    ))
+    check("swiglu_forward_kernel/hidden", read_storage_f32(rt, sb["hidden"], (cfg.B, cfg.T, H)), oracle["hidden"])
+
+    dwdown_bf16 = int(np.dtype(wdown_t.grad.storage.dtype) == np.dtype(np.uint16))
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_tn_kernel",
+        [sb["hidden"].ptr.buffer_id, out_t.grad.storage.ptr.buffer_id, wdown_t.grad.storage.ptr.buffer_id],
+        [sb["hidden"].ptr.offset, out_t.grad.storage.ptr.offset, wdown_t.grad.storage.ptr.offset],
+        [H, cfg.C, N, 0, dwdown_bf16], (cfg.C + 63) // 64, (H + 63) // 64, 1, 256,
+    ))
+    check_parameter_gradient("cuda_sgemm_tn_kernel/wdown.grad", copy_to_host(rt, wdown_t.grad), oracle["dw2"], grad_dtype)
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_nt_kernel",
+        [out_t.grad.storage.ptr.buffer_id, wdown_t.storage.ptr.buffer_id, sb["hidden"].ptr.buffer_id],
+        [out_t.grad.storage.ptr.offset, wdown_t.storage.ptr.offset, sb["hidden"].ptr.offset],
+        [N, H, cfg.C, 0], (H + 63) // 64, (N + 63) // 64, 1, 256,
+    ))
+    check("cuda_sgemm_nt_kernel/dhidden", read_storage_f32(rt, sb["hidden"], (cfg.B, cfg.T, H)), oracle["dhidden"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "swiglu_backward_inplace_kernel",
+        [sb["gu"].ptr.buffer_id, sb["hidden"].ptr.buffer_id],
+        [sb["gu"].ptr.offset, sb["hidden"].ptr.offset],
+        [N, H], (H + 255) // 256, min(N, 65535), 1, 256,
+    ))
+    check("swiglu_backward_inplace_kernel/dgu", read_storage_f32(rt, sb["gu"], (cfg.B, cfg.T, H2)), oracle["dgu"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_forward_kernel",
+        [x_t.storage.ptr.buffer_id, 0, sb["hidden"].ptr.buffer_id],
+        [x_t.storage.ptr.offset, 0, sb["hidden"].ptr.offset],
+        [N, cfg.C, eps_bits], (N + 3) // 4, 1, 1, 128,
+    ))
+    dwgu_bf16 = int(np.dtype(wgu_t.grad.storage.dtype) == np.dtype(np.uint16))
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_tn_kernel",
+        [sb["hidden"].ptr.buffer_id, sb["gu"].ptr.buffer_id, wgu_t.grad.storage.ptr.buffer_id],
+        [sb["hidden"].ptr.offset, sb["gu"].ptr.offset, wgu_t.grad.storage.ptr.offset],
+        [cfg.C, H2, N, 0, dwgu_bf16], (H2 + 63) // 64, (cfg.C + 63) // 64, 1, 256,
+    ))
+    check_parameter_gradient("cuda_sgemm_tn_kernel/wgu.grad", copy_to_host(rt, wgu_t.grad), oracle["dw1"], grad_dtype)
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "cuda_sgemm_nt_kernel",
+        [sb["gu"].ptr.buffer_id, wgu_t.storage.ptr.buffer_id, sb["hidden"].ptr.buffer_id],
+        [sb["gu"].ptr.offset, wgu_t.storage.ptr.offset, sb["hidden"].ptr.offset],
+        [N, cfg.C, H2, 0], (cfg.C + 63) // 64, (N + 63) // 64, 1, 256,
+    ))
+    check("cuda_sgemm_nt_kernel/dx_norm", read_storage_f32(rt, sb["hidden"], (cfg.B, cfg.T, cfg.C)), oracle["dx_norm"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_backward_kernel",
+        [x_t.storage.ptr.buffer_id, sb["hidden"].ptr.buffer_id, 0, x_t.grad.storage.ptr.buffer_id, 0],
+        [x_t.storage.ptr.offset, sb["hidden"].ptr.offset, 0, x_t.grad.storage.ptr.offset, 0],
+        [N, cfg.C, eps_bits, 1], (N + 3) // 4, 1, 1, 128,
+    ))
+    check("rmsnorm_backward_kernel/x.grad", copy_to_host(rt, x_t.grad), oracle["dx"])
 
 def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.float32, check_accum=True):
     act_atol, act_rtol = tolerances_for_grad_dtype(grad_dtype, "activation")
@@ -611,6 +893,25 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
     check_parameter_gradient(f"{fla_label}/backward/{p}.attn.proj.weight.grad", cuda_fla["grads"][f"{p}.attn.proj.weight"], cpu_fla_bwd[2], grad_dtype)
     check_parameter_gradient(f"{fla_label}/backward/{p}.attn.proj.bias.grad", cuda_fla["grads"][f"{p}.attn.proj.bias"], cpu_fla_bwd[3], grad_dtype)
 
+    mlp_label = f"FusedRMSNormMLP[{block}]"
+    mlp_x_np, fc1_w_np, fc2_w_np = cpu_trace["forward_inputs"][mlp_label]
+    mlp_upstream = cpu_trace["backward"][mlp_label]["output_grads"][0]
+    mlp_residual = cpu_trace["backward"][mlp_label]["input_grads_before"][0]
+    cpu_mlp_bwd = {item["index"]: item["grad"] for item in cpu_trace["backward"][mlp_label]["inputs"]}
+
+    def build_mlp(dev, gdtype):
+        mx = make_tensor(mlp_x_np.shape, np.float32, dev, True, mlp_x_np)
+        w1 = make_tensor(fc1_w_np.shape, np.float32, dev, True, fc1_w_np, grad_dtype=gdtype)
+        w2 = make_tensor(fc2_w_np.shape, np.float32, dev, True, fc2_w_np, grad_dtype=gdtype)
+        out = FusedRMSNormMLPOp(eps=1e-6)(mx, w1, w2)
+        return out, {"mlp_x": mx, f"{p}.mlp.fc1.weight": w1, f"{p}.mlp.fc2.weight": w2}
+
+    cuda_mlp = _run_op_graph("cuda", build_mlp, mlp_upstream, grad_dtype=grad_dtype)
+    check(f"{mlp_label}/forward/output[0]", cuda_mlp["out"], cpu_trace["forward"][mlp_label][0], atol=act_atol, rtol=act_rtol)
+    check(f"{mlp_label}/backward/input[0].grad", cuda_mlp["grads"]["mlp_x"], cpu_mlp_bwd[0] - mlp_residual, atol=act_grad_atol, rtol=act_grad_rtol)
+    check_parameter_gradient(f"{mlp_label}/backward/{p}.mlp.fc1.weight.grad", cuda_mlp["grads"][f"{p}.mlp.fc1.weight"], cpu_mlp_bwd[1], grad_dtype)
+    check_parameter_gradient(f"{mlp_label}/backward/{p}.mlp.fc2.weight.grad", cuda_mlp["grads"][f"{p}.mlp.fc2.weight"], cpu_mlp_bwd[2], grad_dtype)
+
     if check_accum:
         print("\n=== No-extra-buffer parameter gradient accumulation ===")
         for k_steps in (1, 2, 4):
@@ -627,6 +928,10 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
             for pname in (f"{p}.attn.proj.weight", f"{p}.attn.proj.bias"):
                 check(f"grad_accum[{k_steps}]/{pname}.grad", cuda_fla_acc["grads"][pname], cpu_fla_acc["grads"][pname], atol=atol_g, rtol=rtol_g)
 
+            cpu_mlp_acc = _run_op_graph("cpu", build_mlp, mlp_upstream, accum_steps=k_steps, seed=seed + 700 + k_steps)
+            cuda_mlp_acc = _run_op_graph("cuda", build_mlp, mlp_upstream, grad_dtype=grad_dtype, accum_steps=k_steps, seed=seed + 700 + k_steps)
+            for pname in (f"{p}.mlp.fc1.weight", f"{p}.mlp.fc2.weight"):
+                check(f"grad_accum[{k_steps}]/{pname}.grad", cuda_mlp_acc["grads"][pname], cpu_mlp_acc["grads"][pname], atol=atol_g, rtol=rtol_g)
 
 def main():
     global PRINT_PASSES
@@ -667,6 +972,19 @@ def main():
         x_np, act_np, _, _ = cpu_trace["forward_inputs"][fla_label]
         fla_upstream = cpu_trace["backward"][fla_label]["output_grads"][0]
         probe_linear_add_internal(cfg, x_np, act_np, arrays, args.kernel_block, fla_upstream, grad_dtype=grad_dtype)
+
+        mlp_label = f"FusedRMSNormMLP[{args.kernel_block}]"
+        mlp_bwd = cpu_trace["backward"][mlp_label]
+        probe_mlp_internal(
+            cfg,
+            x_np,
+            act_np,
+            arrays,
+            args.kernel_block,
+            mlp_bwd["output_grads"][0],
+            mlp_bwd["input_grads_before"][0],
+            grad_dtype=grad_dtype,
+        )
 
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")

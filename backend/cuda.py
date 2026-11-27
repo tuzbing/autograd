@@ -3,7 +3,7 @@ import numpy as np
 from math import prod
 from .base import Backend
 from op import (
-	GatherOp, FusedLinearAddOp
+	GatherOp, FusedLinearAddOp, FusedRMSNormMLPOp
 )
 from utils import f32_bits, bf16_bits
 
@@ -18,10 +18,12 @@ class CudaBackend(Backend):
 		self.forward_kernels = {
 			GatherOp: self.cuda_gather_forward,
 			FusedLinearAddOp: self.cuda_fused_linear_add_forward,
+			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_forward,
 		}
 		self.backward_kernels = {
 			GatherOp: self.cuda_gather_backward,
 			FusedLinearAddOp: self.cuda_fused_linear_add_backward,
+			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_backward,
 		}
 
 	def copy_from_host(self, tensor, host_np):
@@ -182,3 +184,142 @@ class CudaBackend(Backend):
 				[out.grad.storage.ptr.buffer_id, b.grad.storage.ptr.buffer_id],
 				[out.grad.storage.ptr.offset, b.grad.storage.ptr.offset],
 				[M, N, accum_b, db_bf16], (N + 7) // 8, 1, 1, 256)
+
+	def cuda_fused_rmsnorm_mlp_forward(self, inputs, outputs, scratch=None):
+		if len(inputs) == 3:
+			x, wgu, wdown = inputs
+			norm_weight = None
+		elif len(inputs) == 4:
+			x, norm_weight, wgu, wdown = inputs
+		out = outputs[0]
+
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		H = wgu.shape[-1] // 2
+		eps_bits = f32_bits(out.op.op.eps)
+		hidden = scratch["hidden"]
+
+		gamma_id = norm_weight.storage.ptr.buffer_id if norm_weight is not None else 0
+		gamma_off = norm_weight.storage.ptr.offset if norm_weight is not None else 0
+
+		# 1. X_norm = RMSNorm(x) -> out.storage
+		self.ctx.dispatch("rmsnorm_forward_kernel",
+			[x.storage.ptr.buffer_id, gamma_id, out.storage.ptr.buffer_id],
+			[x.storage.ptr.offset, gamma_off, out.storage.ptr.offset],
+			[N, C, eps_bits], (N+3)//4, 1, 1, 128)
+
+		# 2. HIDDEN = SiLU(X_norm @ W_gate) * (X_norm @ W_up) -> hidden
+		self.ctx.dispatch("fused_wgu_swiglu_forward_kernel",
+			[out.storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+			[out.storage.ptr.offset, wgu.storage.ptr.offset, hidden.ptr.offset],
+			[N, H, C], (H + 31) // 32, (N + 63) // 64, 1, 256)
+
+		# 3. OUT = HIDDEN @ Wdown -> out.storage
+		self.ctx.dispatch("cuda_sgemm_nn_kernel",
+			[hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+			[hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
+			[N, C, H, 0], (C + 63) // 64, (N + 63) // 64, 1, 256)
+
+	def cuda_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
+		if len(inputs) == 3:
+			x, wgu, wdown = inputs
+			norm_weight = None
+		elif len(inputs) == 4:
+			x, norm_weight, wgu, wdown = inputs
+		out = outputs[0]
+		if out.grad is None:
+			return
+		need_dgamma = norm_weight is not None and norm_weight.requires_grad
+		if not (x.requires_grad or wgu.requires_grad or wdown.requires_grad or need_dgamma):
+			return
+
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		H2 = wgu.shape[-1]
+		H = H2 // 2
+		eps_bits = f32_bits(out.op.op.eps)
+		accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
+
+		gu = scratch["gu"]
+		hidden = scratch["hidden"]
+		gamma_id = norm_weight.storage.ptr.buffer_id if norm_weight is not None else 0
+		gamma_off = norm_weight.storage.ptr.offset if norm_weight is not None else 0
+
+		# 1. 重算 X_norm -> hidden [N, C]（不借用 x.grad，保护残差梯度）
+		self.ctx.dispatch("rmsnorm_forward_kernel",
+			[x.storage.ptr.buffer_id, gamma_id, hidden.ptr.buffer_id],
+			[x.storage.ptr.offset, gamma_off, hidden.ptr.offset],
+			[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
+
+		# 2. 重算 GU = X_norm @ Wgu -> gu [N, 2H]
+		self.ctx.dispatch("cuda_sgemm_nn_kernel",
+			[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+			[hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+			[N, H2, C, 0], (H2 + 63) // 64, (N + 63) // 64, 1, 256)
+
+		# 3. dWdown = HIDDEN^T @ dOUT（支持 FP32/BF16 直接累加写出）
+		if wdown.requires_grad:
+			self.ctx.dispatch("swiglu_forward_kernel",
+				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+				[gu.ptr.offset, hidden.ptr.offset],
+				[N, H], (H + 255) // 256, min(N, 65535), 1, 256)
+			dwdown_bf16 = int(np.dtype(wdown.grad.storage.dtype) == np.dtype(np.uint16))
+			self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				[hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
+				[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
+				[H, C, N, accumulate, dwdown_bf16],
+				(C + 63) // 64, (H + 63) // 64, 1, 256)
+
+		if not (wgu.requires_grad or x.requires_grad or need_dgamma):
+			return
+
+		# 4. dHidden = dOUT @ Wdown^T -> hidden [N, H]
+		self.ctx.dispatch("cuda_sgemm_nt_kernel",
+			[out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+			[out.grad.storage.ptr.offset, wdown.storage.ptr.offset, hidden.ptr.offset],
+			[N, H, C, 0], (H + 63) // 64, (N + 63) // 64, 1, 256)
+
+		# 5. 原地计算 dGU = [dGate, dUp] -> gu [N, 2H]
+		self.ctx.dispatch("swiglu_backward_inplace_kernel",
+			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
+			[gu.ptr.offset, hidden.ptr.offset],
+			[N, H], (H + 255) // 256, min(N, 65535), 1, 256)
+
+		# 6. dWgu = X_norm^T @ dGU（复用释放后的 hidden 重算 X_norm）
+		if wgu.requires_grad:
+			self.ctx.dispatch("rmsnorm_forward_kernel",
+				[x.storage.ptr.buffer_id, gamma_id, hidden.ptr.buffer_id],
+				[x.storage.ptr.offset, gamma_off, hidden.ptr.offset],
+				[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
+			dwgu_bf16 = int(np.dtype(wgu.grad.storage.dtype) == np.dtype(np.uint16))
+			self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				[hidden.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+				[hidden.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+				[C, H2, N, accumulate, dwgu_bf16],
+				(H2 + 63) // 64, (C + 63) // 64, 1, 256)
+
+		# 7. dX_norm = dGU @ Wgu^T -> hidden [N, C]，随后执行 RMSNorm 反向累加至 x.grad
+		if x.requires_grad or need_dgamma:
+			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				[gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, hidden.ptr.buffer_id],
+				[gu.ptr.offset, wgu.storage.ptr.offset, hidden.ptr.offset],
+				[N, C, H2, 0], (C + 63) // 64, (N + 63) // 64, 1, 256)
+
+			dx_id = x.grad.storage.ptr.buffer_id if x.requires_grad else 0
+			dx_off = x.grad.storage.ptr.offset if x.requires_grad else 0
+			inv_id = gu.ptr.buffer_id if need_dgamma else 0
+			inv_off = gu.ptr.offset if need_dgamma else 0
+			accum_x = int(x.op is not None or bool(accumulate))
+			self.ctx.dispatch("rmsnorm_backward_kernel",
+				[x.storage.ptr.buffer_id, hidden.ptr.buffer_id, gamma_id, dx_id, inv_id],
+				[x.storage.ptr.offset, hidden.ptr.offset, gamma_off, dx_off, inv_off],
+				[N, C, eps_bits, accum_x], (N + 3) // 4, 1, 1, 128)
+
+			if need_dgamma:
+				accum_g = int(norm_weight.op is None and bool(accumulate))
+				dg_bf16 = int(np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16))
+				self.ctx.dispatch("rmsnorm_dgamma_kernel",
+					[x.storage.ptr.buffer_id, hidden.ptr.buffer_id, gu.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+					[x.storage.ptr.offset, hidden.ptr.offset, gu.ptr.offset, norm_weight.grad.storage.ptr.offset],
+					[N, C, accum_g, dg_bf16], (C + 7) // 8, 1, 1, 256)
+
