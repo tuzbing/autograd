@@ -137,7 +137,7 @@ class CudaBackend(Backend):
 						[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
 						[grid_size], (grid_size + 255) // 256, 1, 1, 256)
 			return _fwd
-		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == -1:
+		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == 1:
 			c_val = out.shape[-1]
 			def _fwd(inputs, outputs, scratch=None):
 				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
