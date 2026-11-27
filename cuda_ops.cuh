@@ -697,3 +697,501 @@ __global__ void rmsnorm_dgamma_kernel(
         }
     }
 }
+
+__global__ void fused_rms_fa_qkv_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wq, const float* __restrict__ bq,
+    const float* __restrict__ wk, const float* __restrict__ bk,
+    const float* __restrict__ wv, const float* __restrict__ bv,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    uint32_t B, uint32_t T, uint32_t C, uint32_t H,
+    uint32_t eps_bits, uint32_t q_bthd
+) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tx = tid & 15u;
+    const uint32_t ty = tid >> 4;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t block_n = blockIdx.x * 64u;
+    const uint32_t block_m = blockIdx.y * 64u;
+    const uint32_t proj_id = blockIdx.z;
+    const uint32_t N = B * T;
+    if (block_m >= N || block_n >= C || proj_id >= 3u || H == 0u || (C % H) != 0u) return;
+
+    const uint32_t D = C / H;
+    const float eps = __uint_as_float(eps_bits);
+    const float* W = (proj_id == 0u) ? wq : ((proj_id == 1u) ? wk : wv);
+    const float* bias = (proj_id == 0u) ? bq : ((proj_id == 1u) ? bk : bv);
+    float* dst = (proj_id == 0u) ? q_out : ((proj_id == 1u) ? k_out : v_out);
+    const bool write_bhtd = (proj_id != 0u) || (q_bthd == 0u);
+
+    __shared__ float As[16][66];
+    __shared__ float Bs[16][66];
+    __shared__ float inv_rms_s[64];
+
+    for (uint32_t r = warp_id; r < 64u; r += 8u) {
+        uint32_t g_m = block_m + r;
+        float sum_sq = 0.0f;
+        if (g_m < N) {
+            const float* x_row = x + size_t(g_m) * C;
+            for (uint32_t c = lane; c < C; c += 32u) {
+                float v = x_row[c];
+                sum_sq = fmaf(v, v, sum_sq);
+            }
+            sum_sq = warp_allreduce_sum(sum_sq);
+        }
+        if (lane == 0u) {
+            inv_rms_s[r] = (g_m < N) ? rsqrtf(sum_sq / float(C) + eps) : 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float acc[4][4] = {0.0f};
+    for (uint32_t k0 = 0u; k0 < C; k0 += 16u) {
+        uint32_t k_sub_a = tid & 15u;
+        uint32_t g_k_a = k0 + k_sub_a;
+        #pragma unroll
+        for (uint32_t m = (tid >> 4); m < 64u; m += 16u) {
+            uint32_t g_m = block_m + m;
+            As[k_sub_a][m] = (g_m < N && g_k_a < C) ? (x[size_t(g_m) * C + g_k_a] * inv_rms_s[m]) : 0.0f;
+        }
+
+        uint32_t n = tid & 63u;
+        uint32_t g_n = block_n + n;
+        #pragma unroll
+        for (uint32_t k_sub_b = (tid >> 6); k_sub_b < 16u; k_sub_b += 4u) {
+            uint32_t g_k_b = k0 + k_sub_b;
+            Bs[k_sub_b][n] = (g_k_b < C && g_n < C) ? W[size_t(g_k_b) * C + g_n] : 0.0f;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kk = 0; kk < 16; ++kk) {
+            float a_reg[4], b_reg[4];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) a_reg[i] = As[kk][i * 16 + ty];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) b_reg[j] = Bs[kk][j * 16 + tx];
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    float bias_reg[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        uint32_t col = block_n + uint32_t(j * 16) + tx;
+        bias_reg[j] = (bias && col < C) ? __ldg(&bias[col]) : 0.0f;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        uint32_t row = block_m + uint32_t(i * 16) + ty;
+        if (row >= N) continue;
+        uint32_t b_idx = row / T;
+        uint32_t t_idx = row - b_idx * T;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t col = block_n + uint32_t(j * 16) + tx;
+            if (col >= C) continue;
+            float val = acc[i][j] + bias_reg[j];
+            if (write_bhtd) {
+                uint32_t h_idx = col / D;
+                uint32_t d_idx = col - h_idx * D;
+                dst[((size_t(b_idx) * H + h_idx) * T + t_idx) * D + d_idx] = val;
+            } else {
+                dst[size_t(row) * C + col] = val;
+            }
+        }
+    }
+}
+
+__global__ void rope_qk_inplace_kernel(
+    float* __restrict__ q,
+    float* __restrict__ k,
+    const float* __restrict__ cos_table,
+    const float* __restrict__ sin_table,
+    uint32_t B, uint32_t H, uint32_t T, uint32_t D, uint32_t mode
+) {
+    uint32_t half_D = D >> 1;
+    uint32_t total = B * H * T * half_D;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (half_D == 0u || idx >= total) return;
+
+    uint32_t j = idx % half_D;
+    uint32_t slice = idx / half_D;
+    uint32_t b, h, t;
+    if (mode == 1u) {
+        uint32_t bt = slice / H;
+        h = slice - bt * H;
+        b = bt / T;
+        t = bt - b * T;
+    } else {
+        uint32_t bh = slice / T;
+        t = slice - bh * T;
+        b = bh / H;
+        h = bh - b * H;
+    }
+
+    size_t bhtd_base = ((size_t(b) * H + h) * T + t) * D;
+    size_t bthd_base = ((size_t(b) * T + t) * H + h) * D;
+    size_t q_base = (mode == 0u) ? bhtd_base : bthd_base;
+    size_t k_base = (mode == 1u) ? bthd_base : bhtd_base;
+
+    size_t rope_idx = size_t(t) * half_D + j;
+    float c = __ldg(&cos_table[rope_idx]);
+    float s = (mode == 1u) ? -__ldg(&sin_table[rope_idx]) : __ldg(&sin_table[rope_idx]);
+
+    float q0 = q[q_base + j], q1 = q[q_base + half_D + j];
+    float k0 = k[k_base + j], k1 = k[k_base + half_D + j];
+    q[q_base + j]          = fmaf(q0, c, q1 * s);
+    q[q_base + half_D + j] = fmaf(-q0, s, q1 * c);
+    k[k_base + j]          = fmaf(k0, c, k1 * s);
+    k[k_base + half_D + j] = fmaf(-k0, s, k1 * c);
+}
+
+__global__ void flash_attn_fwd_kernel(
+    const float* q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    float* out,
+    float* __restrict__ lse_out,
+    uint32_t B, uint32_t H, uint32_t T, uint32_t C,
+    uint32_t is_causal, uint32_t write_lse, uint32_t q_bthd
+) {
+    if (B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) return;
+    const uint32_t D = C / H;
+    if (D == 0u || D > 128u) return;
+
+    const uint32_t query_base = blockIdx.x * 32u;
+    const uint32_t bh = blockIdx.y;
+    if (query_base >= T || bh >= B * H) return;
+
+    const uint32_t b = bh / H;
+    const uint32_t h = bh - b * H;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t load_row = tid >> 3;
+    const uint32_t load_col = tid & 7u;
+    const uint32_t s_ty = tid >> 4;
+    const uint32_t s_tx = tid & 15u;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+
+    constexpr uint32_t kStride = 129u;
+    __shared__ float Qs[32][kStride];
+    __shared__ float KVs[32][kStride];
+    __shared__ float Ps[32][33];
+    __shared__ float m_s[32];
+    __shared__ float l_s[32];
+    __shared__ float alpha_s[32];
+
+    if (tid < 32u) {
+        m_s[tid] = -INFINITY;
+        l_s[tid] = 0.0f;
+        alpha_s[tid] = 0.0f;
+    }
+
+    const uint32_t q_load_tok = query_base + load_row;
+    for (uint32_t d = load_col; d < D; d += 8u) {
+        if (q_load_tok < T) {
+            size_t q_off = q_bthd
+                ? (((size_t(b) * T + q_load_tok) * H + h) * D + d)
+                : ((size_t(bh) * T + q_load_tok) * D + d);
+            Qs[load_row][d] = q[q_off];
+        } else {
+            Qs[load_row][d] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float o_acc[16] = {0.0f};
+    const float scale = rsqrtf(float(D));
+    const uint32_t key_limit = is_causal ? min(T, query_base + 32u) : T;
+
+    for (uint32_t key_base = 0u; key_base < key_limit; key_base += 32u) {
+        uint32_t kv_tok = key_base + load_row;
+        for (uint32_t d = load_col; d < D; d += 8u) {
+            KVs[load_row][d] = (kv_tok < T) ? k[(size_t(bh) * T + kv_tok) * D + d] : 0.0f;
+        }
+        __syncthreads();
+
+        float s00 = 0.0f, s01 = 0.0f, s10 = 0.0f, s11 = 0.0f;
+        uint32_t q0 = s_ty, q1 = s_ty + 16u;
+        uint32_t k0 = s_tx, k1 = s_tx + 16u;
+        for (uint32_t d = 0u; d < D; ++d) {
+            float qv0 = Qs[q0][d], qv1 = Qs[q1][d];
+            float kv0 = KVs[k0][d], kv1 = KVs[k1][d];
+            s00 = fmaf(qv0, kv0, s00);
+            s01 = fmaf(qv0, kv1, s01);
+            s10 = fmaf(qv1, kv0, s10);
+            s11 = fmaf(qv1, kv1, s11);
+        }
+        uint32_t gq0 = query_base + q0, gq1 = query_base + q1;
+        uint32_t gk0 = key_base + k0,   gk1 = key_base + k1;
+        Ps[q0][k0] = (gq0 < T && gk0 < T && (!is_causal || gk0 <= gq0)) ? (s00 * scale) : -INFINITY;
+        Ps[q0][k1] = (gq0 < T && gk1 < T && (!is_causal || gk1 <= gq0)) ? (s01 * scale) : -INFINITY;
+        Ps[q1][k0] = (gq1 < T && gk0 < T && (!is_causal || gk0 <= gq1)) ? (s10 * scale) : -INFINITY;
+        Ps[q1][k1] = (gq1 < T && gk1 < T && (!is_causal || gk1 <= gq1)) ? (s11 * scale) : -INFINITY;
+        __syncthreads();
+
+        #pragma unroll
+        for (uint32_t r_off = 0u; r_off < 32u; r_off += 8u) {
+            uint32_t r = warp_id + r_off;
+            float score = Ps[r][lane];
+            float tmax = score;
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1) {
+                tmax = fmaxf(tmax, __shfl_xor_sync(0xffffffffu, tmax, mask));
+            }
+            float old_max = m_s[r];
+            float new_max = fmaxf(old_max, tmax);
+            float alpha = isfinite(old_max) ? expf(old_max - new_max) : 0.0f;
+            float p = isfinite(score) ? expf(score - new_max) : 0.0f;
+            float tsum = warp_allreduce_sum(p);
+            Ps[r][lane] = p;
+            if (lane == 0u) {
+                m_s[r] = new_max;
+                l_s[r] = l_s[r] * alpha + tsum;
+                alpha_s[r] = alpha;
+            }
+        }
+        for (uint32_t d = load_col; d < D; d += 8u) {
+            KVs[load_row][d] = (kv_tok < T) ? v[(size_t(bh) * T + kv_tok) * D + d] : 0.0f;
+        }
+        __syncthreads();
+
+        float alpha = alpha_s[load_row];
+        #pragma unroll
+        for (int m = 0; m < 16; ++m) o_acc[m] *= alpha;
+
+        #pragma unroll
+        for (uint32_t kk = 0u; kk < 32u; ++kk) {
+            float p = Ps[load_row][kk];
+            #pragma unroll
+            for (int m = 0; m < 16; ++m) {
+                uint32_t d = uint32_t(m * 8) + load_col;
+                if (d < D) o_acc[m] = fmaf(p, KVs[kk][d], o_acc[m]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (q_load_tok < T) {
+        float denom = l_s[load_row];
+        float inv_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+        if (write_lse && load_col == 0u) {
+            lse_out[size_t(bh) * T + q_load_tok] = (denom > 0.0f) ? (m_s[load_row] + logf(denom)) : 0.0f;
+        }
+        size_t out_base = ((size_t(b) * T + q_load_tok) * H + h) * D;
+        #pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            uint32_t d = uint32_t(m * 8) + load_col;
+            if (d < D) out[out_base + d] = o_acc[m] * inv_sum;
+        }
+    }
+}
+
+__global__ void flash_attn_bwd_prepare_kernel(
+    const float* __restrict__ o_btc,
+    const float* __restrict__ do_btc,
+    float* __restrict__ d_val,
+    uint32_t B, uint32_t H, uint32_t T, uint32_t C
+) {
+    if (B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) return;
+    const uint32_t D = C / H;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t idx = blockIdx.x * 4u + warp_id;
+    if (idx >= B * H * T) return;
+
+    const uint32_t bh = idx / T;
+    const uint32_t t = idx - bh * T;
+    const uint32_t b = bh / H;
+    const uint32_t h = bh - b * H;
+    const size_t base = ((size_t(b) * T + t) * H + h) * D;
+
+    float sum = 0.0f;
+    for (uint32_t d = lane; d < D; d += 32u) {
+        sum = fmaf(o_btc[base + d], do_btc[base + d], sum);
+    }
+    sum = warp_allreduce_sum(sum);
+    if (lane == 0u) d_val[idx] = sum;
+}
+
+__global__ void flash_attn_bwd_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ dO,
+    float* __restrict__ dQ,
+    float* __restrict__ dK,
+    float* __restrict__ dV,
+    const float* __restrict__ lse,
+    const float* __restrict__ d_val,
+    uint32_t B, uint32_t H, uint32_t T, uint32_t C, uint32_t is_causal
+) {
+    if (B == 0u || H == 0u || T == 0u || C == 0u || (C % H) != 0u) return;
+    const uint32_t D = C / H;
+    if (D == 0u || D > 128u) return;
+
+    const uint32_t block_tok = blockIdx.x * 16u;
+    const uint32_t bh = blockIdx.y;
+    const bool mode_dkv = (blockIdx.z != 0u);
+    if (block_tok >= T || bh >= B * H) return;
+
+    const uint32_t b = bh / H;
+    const uint32_t h = bh - b * H;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row16 = tid >> 4;
+    const uint32_t col16 = tid & 15u;
+    const float scale = rsqrtf(float(D));
+
+    constexpr uint32_t kStride = 129u;
+    __shared__ float Qs[16][kStride];
+    __shared__ float dOs[16][kStride];
+    __shared__ float Ks[16][kStride];
+    __shared__ float Vs[16][kStride];
+    __shared__ float Ps[16][17];
+    __shared__ float dSs[16][17];
+    __shared__ float lse_s[16];
+    __shared__ float dval_s[16];
+
+    float acc0[8] = {0.0f};
+    float acc1[8] = {0.0f};
+
+    if (!mode_dkv) {
+        uint32_t q_tok_init = block_tok + row16;
+        for (uint32_t d = col16; d < D; d += 16u) {
+            if (q_tok_init < T) {
+                Qs[row16][d]  = q[(size_t(bh) * T + q_tok_init) * D + d];
+                dOs[row16][d] = dO[((size_t(b) * T + q_tok_init) * H + h) * D + d];
+            } else {
+                Qs[row16][d]  = 0.0f;
+                dOs[row16][d] = 0.0f;
+            }
+        }
+        if (tid < 16u) {
+            uint32_t qt = block_tok + tid;
+            lse_s[tid]  = (qt < T) ? lse[size_t(bh) * T + qt] : 0.0f;
+            dval_s[tid] = (qt < T) ? d_val[size_t(bh) * T + qt] : 0.0f;
+        }
+        __syncthreads();
+
+        uint32_t k_limit = is_causal ? min(T, block_tok + 16u) : T;
+        for (uint32_t k_base = 0u; k_base < k_limit; k_base += 16u) {
+            uint32_t k_tok_load = k_base + row16;
+            for (uint32_t d = col16; d < D; d += 16u) {
+                Ks[row16][d] = (k_tok_load < T) ? k[(size_t(bh) * T + k_tok_load) * D + d] : 0.0f;
+                Vs[row16][d] = (k_tok_load < T) ? v[(size_t(bh) * T + k_tok_load) * D + d] : 0.0f;
+            }
+            __syncthreads();
+
+            uint32_t q_tok = block_tok + row16;
+            uint32_t k_tok = k_base + col16;
+            float score = 0.0f, dp = 0.0f;
+            for (uint32_t d = 0u; d < D; ++d) {
+                score = fmaf(Qs[row16][d], Ks[col16][d], score);
+                dp    = fmaf(dOs[row16][d], Vs[col16][d], dp);
+            }
+            bool valid = (q_tok < T) && (k_tok < T) && (!is_causal || k_tok <= q_tok);
+            float p = valid ? expf(score * scale - lse_s[row16]) : 0.0f;
+            dSs[row16][col16] = valid ? (scale * p * (dp - dval_s[row16])) : 0.0f;
+            __syncthreads();
+
+            #pragma unroll
+            for (uint32_t kk = 0u; kk < 16u; ++kk) {
+                float ds = dSs[row16][kk];
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    uint32_t d = uint32_t(m * 16) + col16;
+                    if (d < D) acc0[m] = fmaf(ds, Ks[kk][d], acc0[m]);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (q_tok_init < T) {
+            size_t out_base = ((size_t(b) * T + q_tok_init) * H + h) * D;
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                uint32_t d = uint32_t(m * 16) + col16;
+                if (d < D) dQ[out_base + d] = acc0[m];
+            }
+        }
+    } else {
+        uint32_t k_tok_init = block_tok + row16;
+        for (uint32_t d = col16; d < D; d += 16u) {
+            Ks[row16][d] = (k_tok_init < T) ? k[(size_t(bh) * T + k_tok_init) * D + d] : 0.0f;
+            Vs[row16][d] = (k_tok_init < T) ? v[(size_t(bh) * T + k_tok_init) * D + d] : 0.0f;
+        }
+        __syncthreads();
+
+        uint32_t q_start = is_causal ? block_tok : 0u;
+        for (uint32_t q_base = q_start; q_base < T; q_base += 16u) {
+            uint32_t q_tok_load = q_base + row16;
+            for (uint32_t d = col16; d < D; d += 16u) {
+                if (q_tok_load < T) {
+                    Qs[row16][d]  = q[(size_t(bh) * T + q_tok_load) * D + d];
+                    dOs[row16][d] = dO[((size_t(b) * T + q_tok_load) * H + h) * D + d];
+                } else {
+                    Qs[row16][d]  = 0.0f;
+                    dOs[row16][d] = 0.0f;
+                }
+            }
+            if (tid < 16u) {
+                uint32_t qt = q_base + tid;
+                lse_s[tid]  = (qt < T) ? lse[size_t(bh) * T + qt] : 0.0f;
+                dval_s[tid] = (qt < T) ? d_val[size_t(bh) * T + qt] : 0.0f;
+            }
+            __syncthreads();
+
+            uint32_t q_tok = q_base + row16;
+            uint32_t k_tok = block_tok + col16;
+            float score = 0.0f, dp = 0.0f;
+            for (uint32_t d = 0u; d < D; ++d) {
+                score = fmaf(Qs[row16][d], Ks[col16][d], score);
+                dp    = fmaf(dOs[row16][d], Vs[col16][d], dp);
+            }
+            bool valid = (q_tok < T) && (k_tok < T) && (!is_causal || k_tok <= q_tok);
+            float p = valid ? expf(score * scale - lse_s[row16]) : 0.0f;
+            Ps[col16][row16]  = p;
+            dSs[col16][row16] = valid ? (scale * p * (dp - dval_s[row16])) : 0.0f;
+            __syncthreads();
+
+            #pragma unroll
+            for (uint32_t qq = 0u; qq < 16u; ++qq) {
+                float ds = dSs[row16][qq];
+                float p  = Ps[row16][qq];
+                #pragma unroll
+                for (int m = 0; m < 8; ++m) {
+                    uint32_t d = uint32_t(m * 16) + col16;
+                    if (d < D) {
+                        acc0[m] = fmaf(ds, Qs[qq][d], acc0[m]);
+                        acc1[m] = fmaf(p, dOs[qq][d], acc1[m]);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (k_tok_init < T) {
+            size_t out_base = ((size_t(b) * T + k_tok_init) * H + h) * D;
+            #pragma unroll
+            for (int m = 0; m < 8; ++m) {
+                uint32_t d = uint32_t(m * 16) + col16;
+                if (d < D) {
+                    dK[out_base + d] = acc0[m];
+                    dV[out_base + d] = acc1[m];
+                }
+            }
+        }
+    }
+}

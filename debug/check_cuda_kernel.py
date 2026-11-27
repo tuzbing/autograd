@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Correctness checker for GatherOp and FusedLinearAddOp on CUDA against the FP32 CPU GPT2 oracle."""
 
+import math
 import argparse
 import functools
 import gc
@@ -43,7 +44,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import runtime  # noqa: E402
 from module import GPT2  # noqa: E402
-from op import FusedLinearAddOp, FusedRMSNormMLPOp  # noqa: E402
+from op import FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp  # noqa: E402
 from tensor import Tensor  # noqa: E402
 from utils import f32_bits
 
@@ -400,6 +401,9 @@ def _run_op_graph(device, build_fn, upstream_np, grad_dtype=np.float32, accum_st
             if "mlp_x" in tracked:
                 new_x = (rng.standard_normal(tracked["mlp_x"].shape).astype(np.float32) * 0.02).copy()
                 rt.backend.copy_from_host(tracked["mlp_x"], new_x)
+            if "fa_x" in tracked:
+                new_fa_x = (rng.standard_normal(tracked["fa_x"].shape).astype(np.float32) * 0.02).copy()
+                rt.backend.copy_from_host(tracked["fa_x"], new_fa_x)
 
         rt.accumulate_parameter_grads = step > 0
         rt.backend.accumulate_parameter_grads = step > 0
@@ -485,21 +489,36 @@ def probe_linear_add_internal(cfg, x_np, act_np, arrays, block, upstream, grad_d
     """严格对齐 check_tiny_gpt2_kernel.py 的 probe_linear_add_internal, 替换为对应的 CUDA 内核。"""
     print("\n=== Internal kernels: FusedLinearAdd ===")
     p = f"blocks[{block}]"
+    fa_params = {
+        "wq": arrays[f"{p}.attn.q_proj.weight"],
+        "bq": arrays[f"{p}.attn.q_proj.bias"],
+        "wk": arrays[f"{p}.attn.k_proj.weight"],
+        "bk": arrays[f"{p}.attn.k_proj.bias"],
+        "wv": arrays[f"{p}.attn.v_proj.weight"],
+        "bv": arrays[f"{p}.attn.v_proj.bias"],
+    }
+    fa_ref = attention_oracle(x_np, fa_params, np.zeros_like(x_np), cfg.H)
     proj_w_np = arrays[f"{p}.attn.proj.weight"]
     proj_b_np = arrays[f"{p}.attn.proj.bias"]
     expected_out = (
         x_np.reshape(-1, cfg.C)
-        + act_np.reshape(-1, cfg.C) @ proj_w_np
+        + fa_ref["out"].reshape(-1, cfg.C) @ proj_w_np
         + proj_b_np
     ).reshape(x_np.shape).astype(np.float32)
     dO = np.asarray(upstream, dtype=np.float32)
-    expected_dw = (act_np.reshape(-1, cfg.C).T @ dO.reshape(-1, cfg.C)).astype(np.float32)
+    expected_dw = (fa_ref["out"].reshape(-1, cfg.C).T @ dO.reshape(-1, cfg.C)).astype(np.float32)
     expected_dact = (dO.reshape(-1, cfg.C) @ proj_w_np.T).reshape(x_np.shape).astype(np.float32)
     expected_db = np.sum(dO.reshape(-1, cfg.C), axis=0).astype(np.float32)
 
     rt = reset_runtime("cuda")
     x = make_tensor(x_np.shape, np.float32, "cuda", True, x_np)
-    act = make_tensor(act_np.shape, np.float32, "cuda", True, act_np)
+    names = ("wq", "bq", "wk", "bk", "wv", "bv")
+    fa_tensors = {n: make_tensor(fa_params[n].shape, np.float32, "cuda", True, fa_params[n], grad_dtype=grad_dtype) for n in names}
+    rope_cos = make_tensor(fa_ref["rope_cos"].shape, np.float32, "cuda", False, fa_ref["rope_cos"])
+    rope_sin = make_tensor(fa_ref["rope_sin"].shape, np.float32, "cuda", False, fa_ref["rope_sin"])
+    act = FusedRMSNormFlashAttentionOp(n_head=cfg.H, eps=1e-6, is_causal=True)(
+        x, *(fa_tensors[n] for n in names), rope_cos, rope_sin
+    )
     proj_w = make_tensor(proj_w_np.shape, np.float32, "cuda", True, proj_w_np, grad_dtype=grad_dtype)
     proj_b = make_tensor(proj_b_np.shape, np.float32, "cuda", True, proj_b_np, grad_dtype=grad_dtype)
     out = FusedLinearAddOp()(x, act, proj_w, proj_b)
@@ -507,31 +526,57 @@ def probe_linear_add_internal(cfg, x_np, act_np, arrays, block, upstream, grad_d
     rt.build_topo(out)
     rt.bind_memory()
 
+    fla_node = rt.topo[-1]
+    sb = fla_node.backward.keywords["scratch"]
     M = cfg.B * cfg.T
-    _dispatch(
-        rt,
-        lambda: rt.backend.ctx.dispatch(
-            "fused_linear_add_forward_kernel",
-            [x.storage.ptr.buffer_id, act.storage.ptr.buffer_id, proj_w.storage.ptr.buffer_id, proj_b.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
-            [x.storage.ptr.offset, act.storage.ptr.offset, proj_w.storage.ptr.offset, proj_b.storage.ptr.offset, out.storage.ptr.offset],
-            [M, cfg.C, cfg.C],
-            (cfg.C + 63) // 64, (M + 63) // 64, 1, 256,
-        ),
-    )
+    total_pairs = M * cfg.H * (cfg.D // 2)
+    eps_bits = f32_bits(1e-6)
+
+    rt.forward()
+    rt.backend.synchronize()
     check("fused_linear_add_forward_kernel/output", copy_to_host(rt, out), expected_out)
 
-    for tensor in (x, act, proj_w, proj_b, out):
+    for tensor in (x, act, proj_w, proj_b, out, *fa_tensors.values()):
         if tensor.grad is not None:
             rt.backend.fill(tensor.grad, 0.0)
     rt.backend.copy_from_host(out.grad, dO)
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "fused_rms_fa_qkv_kernel",
+        [x.storage.ptr.buffer_id] + [fa_tensors[n].storage.ptr.buffer_id for n in names]
+        + [act.grad.storage.ptr.buffer_id, sb["fa_k"].ptr.buffer_id, sb["fa_v"].ptr.buffer_id],
+        [x.storage.ptr.offset] + [fa_tensors[n].storage.ptr.offset for n in names]
+        + [act.grad.storage.ptr.offset, sb["fa_k"].ptr.offset, sb["fa_v"].ptr.offset],
+        [cfg.B, cfg.T, cfg.C, cfg.H, eps_bits, 1],
+        (cfg.C + 63) // 64, (M + 63) // 64, 3, 256,
+    ))
+    check("recompute/fused_rms_fa_qkv_kernel/Q", read_storage_f32(rt, act.grad.storage, (cfg.B, cfg.T, cfg.C)), heads_to_btc(fa_ref["q_raw"]))
+    check("recompute/fused_rms_fa_qkv_kernel/K", read_storage_f32(rt, sb["fa_k"]), fa_ref["k_raw"])
+    check("recompute/fused_rms_fa_qkv_kernel/V", read_storage_f32(rt, sb["fa_v"]), fa_ref["v"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rope_qk_inplace_kernel",
+        [act.grad.storage.ptr.buffer_id, sb["fa_k"].ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+        [act.grad.storage.ptr.offset, sb["fa_k"].ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+        [cfg.B, cfg.H, cfg.T, cfg.D, 2],
+        (total_pairs + 255) // 256, 1, 1, 256,
+    ))
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "flash_attn_fwd_kernel",
+        [act.grad.storage.ptr.buffer_id, sb["fa_k"].ptr.buffer_id, sb["fa_v"].ptr.buffer_id, act.grad.storage.ptr.buffer_id, 0],
+        [act.grad.storage.ptr.offset, sb["fa_k"].ptr.offset, sb["fa_v"].ptr.offset, act.grad.storage.ptr.offset, 0],
+        [cfg.B, cfg.H, cfg.T, cfg.C, 1, 0, 1],
+        (cfg.T + 31) // 32, cfg.B * cfg.H, 1, 256,
+    ))
+    check("recompute/flash_attn_fwd_kernel/attention_output", copy_to_host(rt, act.grad), fa_ref["out"])
 
     dw_bf16 = int(np.dtype(proj_w.grad.storage.dtype) == np.dtype(np.uint16))
     _dispatch(
         rt,
         lambda: rt.backend.ctx.dispatch(
             "cuda_sgemm_tn_kernel",
-            [act.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, proj_w.grad.storage.ptr.buffer_id],
-            [act.storage.ptr.offset, out.grad.storage.ptr.offset, proj_w.grad.storage.ptr.offset],
+            [act.grad.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, proj_w.grad.storage.ptr.buffer_id],
+            [act.grad.storage.ptr.offset, out.grad.storage.ptr.offset, proj_w.grad.storage.ptr.offset],
             [cfg.C, cfg.C, M, 0, dw_bf16],
             (cfg.C + 63) // 64, (cfg.C + 63) // 64, 1, 256,
         ),
@@ -577,6 +622,15 @@ def probe_linear_add_internal(cfg, x_np, act_np, arrays, block, upstream, grad_d
         ),
     )
     check_parameter_gradient("bias_grad_reduce_kernel/proj_b.grad", copy_to_host(rt, proj_b.grad), expected_db, grad_dtype)
+
+    for tensor in (x, act, proj_w, proj_b):
+        rt.backend.fill(tensor.grad, 0.0)
+    rt.backend.copy_from_host(out.grad, dO)
+    _dispatch(rt, lambda: fla_node.backward(fla_node.inputs, fla_node.outputs))
+    check_parameter_gradient("FusedLinearAdd/recompute_bwd/proj_w.grad", copy_to_host(rt, proj_w.grad), expected_dw, grad_dtype)
+    check("FusedLinearAdd/recompute_bwd/residual.grad", copy_to_host(rt, x.grad), dO)
+    check("FusedLinearAdd/recompute_bwd/attention.grad", copy_to_host(rt, act.grad), expected_dact)
+    check_parameter_gradient("FusedLinearAdd/recompute_bwd/proj_b.grad", copy_to_host(rt, proj_b.grad), expected_db, grad_dtype)
 
 def read_storage_f32(rt, storage, shape=None):
     shape = tuple(shape if shape is not None else storage.shape)
@@ -854,6 +908,252 @@ def probe_mlp_internal(cfg, x_np, act_np, arrays, block, upstream, residual_grad
     ))
     check("rmsnorm_backward_kernel/x.grad", copy_to_host(rt, x_t.grad), oracle["dx"])
 
+def apply_rope_reference(q, k, cos, sin):
+    d2 = q.shape[-1] // 2
+    q1, q2 = q[..., :d2].copy(), q[..., d2:].copy()
+    k1, k2 = k[..., :d2].copy(), k[..., d2:].copy()
+    c, s = cos[None, None, :, :], sin[None, None, :, :]
+    q[..., :d2] = q1 * c + q2 * s
+    q[..., d2:] = -q1 * s + q2 * c
+    k[..., :d2] = k1 * c + k2 * s
+    k[..., d2:] = -k1 * s + k2 * c
+
+
+def apply_rope_backward_reference(dq, dk, cos, sin):
+    d2 = dq.shape[-1] // 2
+    dq1, dq2 = dq[..., :d2].copy(), dq[..., d2:].copy()
+    dk1, dk2 = dk[..., :d2].copy(), dk[..., d2:].copy()
+    c, s = cos[None, None, :, :], sin[None, None, :, :]
+    dq[..., :d2] = dq1 * c - dq2 * s
+    dq[..., d2:] = dq1 * s + dq2 * c
+    dk[..., :d2] = dk1 * c - dk2 * s
+    dk[..., d2:] = dk1 * s + dk2 * c
+
+
+def heads_to_btc(value):
+    value = np.asarray(value)
+    B, H, T, D = value.shape
+    return value.transpose(0, 2, 1, 3).reshape(B, T, H * D).copy()
+
+
+def attention_oracle(x, params, upstream, heads, eps=1e-6, causal=True, rope_theta=100000.0):
+    x = np.asarray(x, dtype=np.float32)
+    upstream = np.asarray(upstream, dtype=np.float32)
+    B, T, C = x.shape
+    H, D = heads, C // heads
+
+    positions = np.arange(T, dtype=np.float32)[:, None]
+    channels = np.arange(0, D, 2, dtype=np.float32)[None, :]
+    freqs = positions * np.asarray(rope_theta ** (-channels / D), dtype=np.float32)
+    rope_cos, rope_sin = np.cos(freqs).astype(np.float32), np.sin(freqs).astype(np.float32)
+
+    _, inv_rms, x_norm = rmsnorm_values(x, eps=eps)
+    x_flat = x_norm.reshape(B * T, C)
+    q = (x_flat @ params["wq"] + params["bq"]).astype(np.float32).reshape(B, T, H, D).transpose(0, 2, 1, 3).copy()
+    k = (x_flat @ params["wk"] + params["bk"]).astype(np.float32).reshape(B, T, H, D).transpose(0, 2, 1, 3).copy()
+    v = (x_flat @ params["wv"] + params["bv"]).astype(np.float32).reshape(B, T, H, D).transpose(0, 2, 1, 3).copy()
+    q_raw, k_raw = q.copy(), k.copy()
+    apply_rope_reference(q, k, rope_cos, rope_sin)
+
+    scale = np.float32(1.0 / math.sqrt(D))
+    scores = np.matmul(q, k.transpose(0, 1, 3, 2)) * scale
+    if causal:
+        scores[..., np.triu(np.ones((T, T), dtype=bool), 1)] = -np.inf
+    row_max = np.max(scores, axis=-1, keepdims=True)
+    exp_scores = np.exp(scores - row_max)
+    row_sum = np.sum(exp_scores, axis=-1, keepdims=True)
+    probs = exp_scores / row_sum
+    out_h = np.matmul(probs, v)
+    out = out_h.transpose(0, 2, 1, 3).reshape(B, T, C).astype(np.float32)
+
+    dO = upstream.reshape(B, T, H, D).transpose(0, 2, 1, 3)
+    work = np.matmul(dO, v.transpose(0, 1, 3, 2))
+    d_scores = (work - np.sum(probs * work, axis=-1, keepdims=True)) * probs * scale
+    dq_rot = np.matmul(d_scores, k).astype(np.float32)
+    dk_rot = np.matmul(d_scores.transpose(0, 1, 3, 2), q).astype(np.float32)
+    dv = np.matmul(probs.transpose(0, 1, 3, 2), dO).astype(np.float32)
+
+    dq, dk = dq_rot.copy(), dk_rot.copy()
+    apply_rope_backward_reference(dq, dk, rope_cos, rope_sin)
+    dq2 = dq.transpose(0, 2, 1, 3).reshape(B * T, C)
+    dk2 = dk.transpose(0, 2, 1, 3).reshape(B * T, C)
+    dv2 = dv.transpose(0, 2, 1, 3).reshape(B * T, C)
+
+    dx_norm = (dq2 @ params["wq"].T + dk2 @ params["wk"].T + dv2 @ params["wv"].T).reshape(B, T, C).astype(np.float32)
+    dx_local = (inv_rms * (dx_norm - x_norm * np.mean(dx_norm * x_norm, axis=-1, keepdims=True))).astype(np.float32)
+
+    return {
+        "rope_cos": rope_cos, "rope_sin": rope_sin,
+        "x_norm": x_norm, "q": q, "k": k, "v": v, "q_raw": q_raw, "k_raw": k_raw,
+        "out": out,
+        "lse": (row_max[..., 0] + np.log(row_sum[..., 0])).astype(np.float32),
+        "d_val": np.sum(out_h * dO, axis=-1).astype(np.float32),
+        "dq": dq, "dk": dk, "dv": dv, "dq_rot": dq_rot, "dk_rot": dk_rot,
+        "dx_norm": dx_norm, "dx_local": dx_local,
+        "dwq": (x_flat.T @ dq2).astype(np.float32),
+        "dwk": (x_flat.T @ dk2).astype(np.float32),
+        "dwv": (x_flat.T @ dv2).astype(np.float32),
+        "dbq": np.sum(dq2, axis=0).astype(np.float32),
+        "dbk": np.sum(dk2, axis=0).astype(np.float32),
+        "dbv": np.sum(dv2, axis=0).astype(np.float32),
+    }
+
+
+def probe_fa_internal(cfg, x_np, arrays, block, upstream, grad_dtype=np.float32):
+    """对齐 check_tiny_gpt2_kernel.py 的 probe_fa_internal，逐级验证 FusedRMSNormFlashAttention 各 CUDA 内核。"""
+    print("\n=== Internal kernels: FusedRMSNormFlashAttention ===")
+    p = f"blocks[{block}]"
+    params = {
+        "wq": arrays[f"{p}.attn.q_proj.weight"],
+        "bq": arrays[f"{p}.attn.q_proj.bias"],
+        "wk": arrays[f"{p}.attn.k_proj.weight"],
+        "bk": arrays[f"{p}.attn.k_proj.bias"],
+        "wv": arrays[f"{p}.attn.v_proj.weight"],
+        "bv": arrays[f"{p}.attn.v_proj.bias"],
+    }
+    oracle = attention_oracle(x_np, params, upstream, cfg.H)
+
+    rt = reset_runtime("cuda")
+    x = make_tensor(x_np.shape, np.float32, "cuda", True, x_np)
+    names = ("wq", "bq", "wk", "bk", "wv", "bv")
+    p_tensors = {n: make_tensor(params[n].shape, np.float32, "cuda", True, params[n], grad_dtype=grad_dtype) for n in names}
+    rope_cos = make_tensor(oracle["rope_cos"].shape, np.float32, "cuda", False, oracle["rope_cos"])
+    rope_sin = make_tensor(oracle["rope_sin"].shape, np.float32, "cuda", False, oracle["rope_sin"])
+    out = FusedRMSNormFlashAttentionOp(n_head=cfg.H, eps=1e-6, is_causal=True)(
+        x, *(p_tensors[n] for n in names), rope_cos, rope_sin
+    )
+    rt.loss = out
+    rt.build_topo(out)
+    rt.bind_memory()
+
+    node = rt.topo[-1]
+    sf = node.forward.keywords["scratch"]
+    sb = node.backward.keywords["scratch"]
+    B, T, C, H, D = cfg.B, cfg.T, cfg.C, cfg.H, cfg.D
+    N = B * T
+    total_pairs = N * H * (D // 2)
+    eps_bits = f32_bits(1e-6)
+
+    def dispatch_qkv(scratch):
+        rt.backend.ctx.dispatch(
+            "fused_rms_fa_qkv_kernel",
+            [x.storage.ptr.buffer_id] + [p_tensors[n].storage.ptr.buffer_id for n in names]
+            + [scratch[n].ptr.buffer_id for n in ("q", "k", "v")],
+            [x.storage.ptr.offset] + [p_tensors[n].storage.ptr.offset for n in names]
+            + [scratch[n].ptr.offset for n in ("q", "k", "v")],
+            [B, T, C, H, eps_bits, 0], (C + 63) // 64, (N + 63) // 64, 3, 256,
+        )
+
+    def dispatch_rope(q_st, k_st, mode):
+        rt.backend.ctx.dispatch(
+            "rope_qk_inplace_kernel",
+            [q_st.ptr.buffer_id, k_st.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+            [q_st.ptr.offset, k_st.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+            [B, H, T, D, mode], (total_pairs + 255) // 256, 1, 1, 256,
+        )
+
+    _dispatch(rt, lambda: dispatch_qkv(sf))
+    check("fused_rms_fa_qkv_kernel/Q", read_storage_f32(rt, sf["q"]), oracle["q_raw"])
+    check("fused_rms_fa_qkv_kernel/K", read_storage_f32(rt, sf["k"]), oracle["k_raw"])
+    check("fused_rms_fa_qkv_kernel/V", read_storage_f32(rt, sf["v"]), oracle["v"])
+
+    _dispatch(rt, lambda: dispatch_rope(sf["q"], sf["k"], 0))
+    check("rope_qk_inplace_kernel/Q", read_storage_f32(rt, sf["q"]), oracle["q"])
+    check("rope_qk_inplace_kernel/K", read_storage_f32(rt, sf["k"]), oracle["k"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "flash_attn_fwd_kernel",
+        [sf["q"].ptr.buffer_id, sf["k"].ptr.buffer_id, sf["v"].ptr.buffer_id, out.storage.ptr.buffer_id, 0],
+        [sf["q"].ptr.offset, sf["k"].ptr.offset, sf["v"].ptr.offset, out.storage.ptr.offset, 0],
+        [B, H, T, C, 1, 0, 0], (T + 31) // 32, B * H, 1, 256,
+    ))
+    check("flash_attn_fwd_kernel/output", copy_to_host(rt, out), oracle["out"])
+
+    for tensor in [x, out, *p_tensors.values()]:
+        if tensor.grad is not None:
+            rt.backend.fill(tensor.grad, 0.0)
+    rt.backend.copy_from_host(out.grad, np.asarray(upstream, dtype=np.float32))
+
+    _dispatch(rt, lambda: dispatch_qkv(sb))
+    _dispatch(rt, lambda: dispatch_rope(sb["q"], sb["k"], 0))
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "flash_attn_fwd_kernel",
+        [sb["q"].ptr.buffer_id, sb["k"].ptr.buffer_id, sb["v"].ptr.buffer_id, sb["dk"].ptr.buffer_id, sb["lse"].ptr.buffer_id],
+        [sb["q"].ptr.offset, sb["k"].ptr.offset, sb["v"].ptr.offset, sb["dk"].ptr.offset, sb["lse"].ptr.offset],
+        [B, H, T, C, 1, 1, 0], (T + 31) // 32, B * H, 1, 256,
+    ))
+    check("backward/flash_attn_fwd_kernel/output", read_storage_f32(rt, sb["dk"], (B, T, C)), oracle["out"])
+    check("backward/flash_attn_fwd_kernel/lse", read_storage_f32(rt, sb["lse"]), oracle["lse"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "flash_attn_bwd_prepare_kernel",
+        [sb["dk"].ptr.buffer_id, out.grad.storage.ptr.buffer_id, sb["d_val"].ptr.buffer_id],
+        [sb["dk"].ptr.offset, out.grad.storage.ptr.offset, sb["d_val"].ptr.offset],
+        [B, H, T, C], (N * H + 3) // 4, 1, 1, 128,
+    ))
+    check("flash_attn_bwd_prepare_kernel/d_val", read_storage_f32(rt, sb["d_val"]), oracle["d_val"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "flash_attn_bwd_kernel",
+        [sb["q"].ptr.buffer_id, sb["k"].ptr.buffer_id, sb["v"].ptr.buffer_id, out.grad.storage.ptr.buffer_id,
+         sb["dq"].ptr.buffer_id, sb["dk"].ptr.buffer_id, sb["dv"].ptr.buffer_id,
+         sb["lse"].ptr.buffer_id, sb["d_val"].ptr.buffer_id],
+        [sb["q"].ptr.offset, sb["k"].ptr.offset, sb["v"].ptr.offset, out.grad.storage.ptr.offset,
+         sb["dq"].ptr.offset, sb["dk"].ptr.offset, sb["dv"].ptr.offset,
+         sb["lse"].ptr.offset, sb["d_val"].ptr.offset],
+        [B, H, T, C, 1], (T + 15) // 16, B * H, 2, 256,
+    ))
+    check("flash_attn_bwd_kernel/dQ", read_storage_f32(rt, sb["dq"], (B, T, C)), heads_to_btc(oracle["dq_rot"]))
+    check("flash_attn_bwd_kernel/dK", read_storage_f32(rt, sb["dk"], (B, T, C)), heads_to_btc(oracle["dk_rot"]))
+    check("flash_attn_bwd_kernel/dV", read_storage_f32(rt, sb["dv"], (B, T, C)), heads_to_btc(oracle["dv"]))
+
+    _dispatch(rt, lambda: dispatch_rope(sb["dq"], sb["dk"], 1))
+    check("rope_qk_inplace_backward/dQ", read_storage_f32(rt, sb["dq"], (B, T, C)), heads_to_btc(oracle["dq"]))
+    check("rope_qk_inplace_backward/dK", read_storage_f32(rt, sb["dk"], (B, T, C)), heads_to_btc(oracle["dk"]))
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_forward_kernel",
+        [x.storage.ptr.buffer_id, 0, sb["q"].ptr.buffer_id],
+        [x.storage.ptr.offset, 0, sb["q"].ptr.offset],
+        [N, C, eps_bits], (N + 3) // 4, 1, 1, 128,
+    ))
+    for wn, dn, exp_key in (("wq", "dq", "dwq"), ("wk", "dk", "dwk"), ("wv", "dv", "dwv")):
+        dw_bf16 = int(np.dtype(p_tensors[wn].grad.storage.dtype) == np.dtype(np.uint16))
+        _dispatch(rt, lambda wn=wn, dn=dn, dw_bf16=dw_bf16: rt.backend.ctx.dispatch(
+            "cuda_sgemm_tn_kernel",
+            [sb["q"].ptr.buffer_id, sb[dn].ptr.buffer_id, p_tensors[wn].grad.storage.ptr.buffer_id],
+            [sb["q"].ptr.offset, sb[dn].ptr.offset, p_tensors[wn].grad.storage.ptr.offset],
+            [C, C, N, 0, dw_bf16], (C + 63) // 64, (C + 63) // 64, 1, 256,
+        ))
+        check_parameter_gradient(f"cuda_sgemm_tn_kernel/{wn}.grad", copy_to_host(rt, p_tensors[wn].grad), oracle[exp_key], grad_dtype)
+
+    for bn, dn, exp_key in (("bq", "dq", "dbq"), ("bk", "dk", "dbk"), ("bv", "dv", "dbv")):
+        db_bf16 = int(np.dtype(p_tensors[bn].grad.storage.dtype) == np.dtype(np.uint16))
+        _dispatch(rt, lambda bn=bn, dn=dn, db_bf16=db_bf16: rt.backend.ctx.dispatch(
+            "bias_grad_reduce_kernel",
+            [sb[dn].ptr.buffer_id, p_tensors[bn].grad.storage.ptr.buffer_id],
+            [sb[dn].ptr.offset, p_tensors[bn].grad.storage.ptr.offset],
+            [N, C, 0, db_bf16], (C + 7) // 8, 1, 1, 256,
+        ))
+        check_parameter_gradient(f"bias_grad_reduce_kernel/{bn}.grad", copy_to_host(rt, p_tensors[bn].grad), oracle[exp_key], grad_dtype)
+
+    for accum_flag, (dn, wn) in enumerate((("dq", "wq"), ("dk", "wk"), ("dv", "wv"))):
+        _dispatch(rt, lambda dn=dn, wn=wn, accum_flag=accum_flag: rt.backend.ctx.dispatch(
+            "cuda_sgemm_nt_kernel",
+            [sb[dn].ptr.buffer_id, p_tensors[wn].storage.ptr.buffer_id, sb["k"].ptr.buffer_id],
+            [sb[dn].ptr.offset, p_tensors[wn].storage.ptr.offset, sb["k"].ptr.offset],
+            [N, C, C, int(accum_flag > 0)], (C + 63) // 64, (N + 63) // 64, 1, 256,
+        ))
+    check("three_projection_gemms/dx_norm", read_storage_f32(rt, sb["k"], (B, T, C)), oracle["dx_norm"])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "rmsnorm_backward_kernel",
+        [x.storage.ptr.buffer_id, sb["k"].ptr.buffer_id, 0, x.grad.storage.ptr.buffer_id, 0],
+        [x.storage.ptr.offset, sb["k"].ptr.offset, 0, x.grad.storage.ptr.offset, 0],
+        [N, C, eps_bits, 0], (N + 3) // 4, 1, 1, 128,
+    ))
+    check("rmsnorm_backward_kernel/x.grad", copy_to_host(rt, x.grad), oracle["dx_local"])
+
 def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.float32, check_accum=True):
     act_atol, act_rtol = tolerances_for_grad_dtype(grad_dtype, "activation")
     act_grad_atol, act_grad_rtol = tolerances_for_grad_dtype(grad_dtype, "activation_grad")
@@ -892,6 +1192,38 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
     check(f"{fla_label}/backward/input[1].grad", cuda_fla["grads"]["act"], cpu_fla_bwd[1], atol=act_grad_atol, rtol=act_grad_rtol)
     check_parameter_gradient(f"{fla_label}/backward/{p}.attn.proj.weight.grad", cuda_fla["grads"][f"{p}.attn.proj.weight"], cpu_fla_bwd[2], grad_dtype)
     check_parameter_gradient(f"{fla_label}/backward/{p}.attn.proj.bias.grad", cuda_fla["grads"][f"{p}.attn.proj.bias"], cpu_fla_bwd[3], grad_dtype)
+
+    fa_label = f"FusedRMSNormFlashAttention[{block}]"
+    fa_x_np, wq_np, bq_np, wk_np, bk_np, wv_np, bv_np, rcos_np, rsin_np = cpu_trace["forward_inputs"][fa_label]
+    fa_upstream = cpu_trace["backward"][fa_label]["output_grads"][0]
+    fa_residual = cpu_trace["backward"][fa_label]["input_grads_before"][0]
+    cpu_fa_bwd = {item["index"]: item["grad"] for item in cpu_trace["backward"][fa_label]["inputs"]}
+
+    def build_fa(dev, gdtype):
+        fx = make_tensor(fa_x_np.shape, np.float32, dev, True, fa_x_np)
+        wq = make_tensor(wq_np.shape, np.float32, dev, True, wq_np, grad_dtype=gdtype)
+        bq = make_tensor(bq_np.shape, np.float32, dev, True, bq_np, grad_dtype=gdtype)
+        wk = make_tensor(wk_np.shape, np.float32, dev, True, wk_np, grad_dtype=gdtype)
+        bk = make_tensor(bk_np.shape, np.float32, dev, True, bk_np, grad_dtype=gdtype)
+        wv = make_tensor(wv_np.shape, np.float32, dev, True, wv_np, grad_dtype=gdtype)
+        bv = make_tensor(bv_np.shape, np.float32, dev, True, bv_np, grad_dtype=gdtype)
+        rcos = make_tensor(rcos_np.shape, np.float32, dev, False, rcos_np)
+        rsin = make_tensor(rsin_np.shape, np.float32, dev, False, rsin_np)
+        out = FusedRMSNormFlashAttentionOp(n_head=fa_x_np.shape[-1] // (rcos_np.shape[-1] * 2), eps=1e-6, is_causal=True)(
+            fx, wq, bq, wk, bk, wv, bv, rcos, rsin
+        )
+        return out, {
+            "fa_x": fx,
+            f"{p}.attn.q_proj.weight": wq, f"{p}.attn.q_proj.bias": bq,
+            f"{p}.attn.k_proj.weight": wk, f"{p}.attn.k_proj.bias": bk,
+            f"{p}.attn.v_proj.weight": wv, f"{p}.attn.v_proj.bias": bv,
+        }
+
+    cuda_fa = _run_op_graph("cuda", build_fa, fa_upstream, grad_dtype=grad_dtype)
+    check(f"{fa_label}/forward/output[0]", cuda_fa["out"], cpu_trace["forward"][fa_label][0], atol=act_atol, rtol=act_rtol)
+    check(f"{fa_label}/backward/input[0].grad", cuda_fa["grads"]["fa_x"], cpu_fa_bwd[0] - fa_residual, atol=act_grad_atol, rtol=act_grad_rtol)
+    for idx, suffix in ((1, "q_proj.weight"), (2, "q_proj.bias"), (3, "k_proj.weight"), (4, "k_proj.bias"), (5, "v_proj.weight"), (6, "v_proj.bias")):
+        check_parameter_gradient(f"{fa_label}/backward/{p}.attn.{suffix}.grad", cuda_fa["grads"][f"{p}.attn.{suffix}"], cpu_fa_bwd[idx], grad_dtype)
 
     mlp_label = f"FusedRMSNormMLP[{block}]"
     mlp_x_np, fc1_w_np, fc2_w_np = cpu_trace["forward_inputs"][mlp_label]
@@ -932,6 +1264,12 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
             cuda_mlp_acc = _run_op_graph("cuda", build_mlp, mlp_upstream, grad_dtype=grad_dtype, accum_steps=k_steps, seed=seed + 700 + k_steps)
             for pname in (f"{p}.mlp.fc1.weight", f"{p}.mlp.fc2.weight"):
                 check(f"grad_accum[{k_steps}]/{pname}.grad", cuda_mlp_acc["grads"][pname], cpu_mlp_acc["grads"][pname], atol=atol_g, rtol=rtol_g)
+
+            cpu_fa_acc = _run_op_graph("cpu", build_fa, fa_upstream, accum_steps=k_steps, seed=seed + 800 + k_steps)
+            cuda_fa_acc = _run_op_graph("cuda", build_fa, fa_upstream, grad_dtype=grad_dtype, accum_steps=k_steps, seed=seed + 800 + k_steps)
+            for suffix in ("q_proj.weight", "q_proj.bias", "k_proj.weight", "k_proj.bias", "v_proj.weight", "v_proj.bias"):
+                pname = f"{p}.attn.{suffix}"
+                check(f"grad_accum[{k_steps}]/{pname}.grad", cuda_fa_acc["grads"][pname], cpu_fa_acc["grads"][pname], atol=atol_g, rtol=rtol_g)
 
 def main():
     global PRINT_PASSES
@@ -985,6 +1323,12 @@ def main():
             mlp_bwd["input_grads_before"][0],
             grad_dtype=grad_dtype,
         )
+
+        fa_label = f"FusedRMSNormFlashAttention[{args.kernel_block}]"
+        fa_x_np = cpu_trace["forward_inputs"][fa_label][0]
+        fa_upstream = cpu_trace["backward"][fa_label]["output_grads"][0]
+        probe_fa_internal(cfg, fa_x_np, arrays, args.kernel_block, fa_upstream, grad_dtype=grad_dtype)
+
 
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")

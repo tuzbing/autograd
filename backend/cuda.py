@@ -3,7 +3,7 @@ import numpy as np
 from math import prod
 from .base import Backend
 from op import (
-	GatherOp, FusedLinearAddOp, FusedRMSNormMLPOp
+	GatherOp, FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp
 )
 from utils import f32_bits, bf16_bits
 
@@ -19,11 +19,13 @@ class CudaBackend(Backend):
 			GatherOp: self.cuda_gather_forward,
 			FusedLinearAddOp: self.cuda_fused_linear_add_forward,
 			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_forward,
+			FusedRMSNormFlashAttentionOp: self.cuda_fused_rms_fa_forward,
 		}
 		self.backward_kernels = {
 			GatherOp: self.cuda_gather_backward,
 			FusedLinearAddOp: self.cuda_fused_linear_add_backward,
 			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_backward,
+			FusedRMSNormFlashAttentionOp: self.cuda_fused_rms_fa_backward,
 		}
 
 	def copy_from_host(self, tensor, host_np):
@@ -143,10 +145,15 @@ class CudaBackend(Backend):
 
 		# 1. dW = act^T [K, M] @ dO [M, N]
 		if w.requires_grad:
+			if act.op is not None and act.op.op.op_name == "FusedRMSNormFlashAttention":
+				act_storage = act.grad.storage
+				self.cuda_recompute_fused_rms_fa(act, scratch["fa_k"], scratch["fa_v"], act_storage)
+			else:
+				act_storage = act.storage
 			dw_bf16 = int(np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16))
 			self.ctx.dispatch("cuda_sgemm_tn_kernel",
-				[act.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
-				[act.storage.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+				[act_storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+				[act_storage.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
 				[K, N, M, accumulate, dw_bf16],
 				(N + 63) // 64, (K + 63) // 64, 1, 256)
 
@@ -323,3 +330,159 @@ class CudaBackend(Backend):
 					[x.storage.ptr.offset, hidden.ptr.offset, gu.ptr.offset, norm_weight.grad.storage.ptr.offset],
 					[N, C, accum_g, dg_bf16], (C + 7) // 8, 1, 1, 256)
 
+	def cuda_recompute_fused_rms_fa(self, act, k_buf, v_buf, out_buf):
+		x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = act.op.inputs
+		B, T, C = x.shape
+		H = act.op.op.n_head
+		D = C // H
+		N = B * T
+		is_causal = int(bool(act.op.op.is_causal))
+		eps_bits = f32_bits(act.op.op.eps)
+		total_pairs = N*H*(D // 2)
+
+		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
+			 out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, v_buf.ptr.buffer_id],
+			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
+			 out_buf.ptr.offset, k_buf.ptr.offset, v_buf.ptr.offset],
+			[B, T, C, H, eps_bits, 1], (C + 63) // 64, (N + 63) // 64, 3, 256)
+
+		self.ctx.dispatch("rope_qk_inplace_kernel",
+			[out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+			[out_buf.ptr.offset, k_buf.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+			[B, H, T, D, 2], (total_pairs + 255) // 256, 1, 1, 256)
+
+		self.ctx.dispatch("flash_attn_fwd_kernel",
+			[out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, v_buf.ptr.buffer_id, out_buf.ptr.buffer_id, 0],
+			[out_buf.ptr.offset, k_buf.ptr.offset, v_buf.ptr.offset, out_buf.ptr.offset, 0],
+			[B, H, T, C, is_causal, 0, 1], (T + 31) // 32, B * H, 1, 256)
+
+	def cuda_fused_rms_fa_forward(self, inputs, outputs, scratch=None):
+		x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+		out = outputs[0]
+		B, T, C = x.shape
+		H = out.op.op.n_head
+		D = C // H
+		N = B * T
+		is_causal = int(bool(out.op.op.is_causal))
+		eps_bits = f32_bits(out.op.op.eps)
+		total_pairs = N*H*(D//2)
+		q, k, v = scratch["q"], scratch["k"], scratch["v"]
+
+		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
+			 q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
+			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
+			 q.ptr.offset, k.ptr.offset, v.ptr.offset],
+			[B, T, C, H, eps_bits, 0], (C + 63) // 64, (N + 63) // 64, 3, 256)
+
+		self.ctx.dispatch("rope_qk_inplace_kernel",
+			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+			[q.ptr.offset, k.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+			[B, H, T, D, 0], (total_pairs + 255) // 256, 1, 1, 256)
+
+		self.ctx.dispatch("flash_attn_fwd_kernel",
+			[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.storage.ptr.buffer_id, 0],
+			[q.ptr.offset, k.ptr.offset, v.ptr.offset, out.storage.ptr.offset, 0],
+			[B, H, T, C, is_causal, 0, 0], (T + 31) // 32, B * H, 1, 256)
+
+	def cuda_fused_rms_fa_backward(self, inputs, outputs, scratch=None):
+		x, wq, bq, wk, bk, wv, bv, rope_cos, rope_sin = inputs
+		out = outputs[0]
+		if out.grad is None:
+			return
+		if not any(t.requires_grad for t in (x, wq, bq, wk, bk, wv, bv)):
+			return
+
+		B, T, C = x.shape
+		H = out.op.op.n_head
+		D = C // H
+		N = B * T
+		is_causal = int(bool(out.op.op.is_causal))
+		eps_bits = f32_bits(out.op.op.eps)
+		accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
+		total_pairs = N * H * (D // 2)
+
+		q, k, v = scratch["q"], scratch["k"], scratch["v"]
+		dq, dk, dv = scratch["dq"], scratch["dk"], scratch["dv"]
+		lse, d_val = scratch["lse"], scratch["d_val"]
+
+		# 1. 重算 Q, K, V 及前向 RoPE
+		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
+			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
+			 q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
+			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
+			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
+			 q.ptr.offset, k.ptr.offset, v.ptr.offset],
+			[B, T, C, H, eps_bits, 0], (C + 63) // 64, (N + 63) // 64, 3, 256)
+
+		self.ctx.dispatch("rope_qk_inplace_kernel",
+			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+			[q.ptr.offset, k.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+			[B, H, T, D, 0], (total_pairs + 255) // 256, 1, 1, 256)
+
+		# 2. 重算 O（复用 dk）与 LSE，计算 d_val = sum(O * dO)
+		self.ctx.dispatch("flash_attn_fwd_kernel",
+			[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, dk.ptr.buffer_id, lse.ptr.buffer_id],
+			[q.ptr.offset, k.ptr.offset, v.ptr.offset, dk.ptr.offset, lse.ptr.offset],
+			[B, H, T, C, is_causal, 1, 0], (T + 31) // 32, B * H, 1, 256)
+
+		self.ctx.dispatch("flash_attn_bwd_prepare_kernel",
+			[dk.ptr.buffer_id, out.grad.storage.ptr.buffer_id, d_val.ptr.buffer_id],
+			[dk.ptr.offset, out.grad.storage.ptr.offset, d_val.ptr.offset],
+			[B, H, T, C], (N * H + 3) // 4, 1, 1, 128)
+
+		# 3. 注意力反向写出紧凑 [B, T, C] 布局的 dQ_rot, dK_rot, dV，并原地执行反向 RoPE
+		self.ctx.dispatch("flash_attn_bwd_kernel",
+			[q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id, out.grad.storage.ptr.buffer_id,
+			 dq.ptr.buffer_id, dk.ptr.buffer_id, dv.ptr.buffer_id, lse.ptr.buffer_id, d_val.ptr.buffer_id],
+			[q.ptr.offset, k.ptr.offset, v.ptr.offset, out.grad.storage.ptr.offset,
+			 dq.ptr.offset, dk.ptr.offset, dv.ptr.offset, lse.ptr.offset, d_val.ptr.offset],
+			[B, H, T, C, is_causal], (T + 15) // 16, B * H, 2, 256)
+
+		self.ctx.dispatch("rope_qk_inplace_kernel",
+			[dq.ptr.buffer_id, dk.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+			[dq.ptr.offset, dk.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+			[B, H, T, D, 1], (total_pairs + 255) // 256, 1, 1, 256)
+
+		# 4. 复用 q 暂存 X_norm，直接复用 cuda_sgemm_tn_kernel 计算 FP32/BF16 dWq, dWk, dWv
+		if wq.requires_grad or wk.requires_grad or wv.requires_grad:
+			self.ctx.dispatch("rmsnorm_forward_kernel",
+				[x.storage.ptr.buffer_id, 0, q.ptr.buffer_id],
+				[x.storage.ptr.offset, 0, q.ptr.offset],
+				[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
+			for weight, dproj in ((wq, dq), (wk, dk), (wv, dv)):
+				if weight.requires_grad:
+					dw_bf16 = int(np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16))
+					self.ctx.dispatch("cuda_sgemm_tn_kernel",
+						[q.ptr.buffer_id, dproj.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
+						[q.ptr.offset, dproj.ptr.offset, weight.grad.storage.ptr.offset],
+						[C, C, N, accumulate, dw_bf16], (C + 63) // 64, (C + 63) // 64, 1, 256)
+
+		# 5. 直接复用 bias_grad_reduce_kernel 计算 FP32/BF16 dbq, dbk, dbv
+		for bias, dproj in ((bq, dq), (bk, dk), (bv, dv)):
+			if bias.requires_grad:
+				accum_b = int(bias.op is None and bool(accumulate))
+				db_bf16 = int(np.dtype(bias.grad.storage.dtype) == np.dtype(np.uint16))
+				self.ctx.dispatch("bias_grad_reduce_kernel",
+					[dproj.ptr.buffer_id, bias.grad.storage.ptr.buffer_id],
+					[dproj.ptr.offset, bias.grad.storage.ptr.offset],
+					[N, C, accum_b, db_bf16], (C + 7) // 8, 1, 1, 256)
+
+		# 6. 复用 k 累加 dX_norm = dQ@Wq^T + dK@Wk^T + dV@Wv^T，并经 rmsnorm_backward_kernel 写入 x.grad
+		if x.requires_grad:
+			for accum_flag, (dproj, weight) in enumerate(((dq, wq), (dk, wk), (dv, wv))):
+				self.ctx.dispatch("cuda_sgemm_nt_kernel",
+					[dproj.ptr.buffer_id, weight.storage.ptr.buffer_id, k.ptr.buffer_id],
+					[dproj.ptr.offset, weight.storage.ptr.offset, k.ptr.offset],
+					[N, C, C, int(accum_flag > 0)], (C + 63) // 64, (N + 63) // 64, 1, 256)
+			accum_x = int(x.op is not None or bool(accumulate))
+			self.ctx.dispatch("rmsnorm_backward_kernel",
+				[x.storage.ptr.buffer_id, k.ptr.buffer_id, 0, x.grad.storage.ptr.buffer_id, 0],
+				[x.storage.ptr.offset, k.ptr.offset, 0, x.grad.storage.ptr.offset, 0],
+				[N, C, eps_bits, accum_x], (N + 3) // 4, 1, 1, 128)
