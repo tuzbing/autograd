@@ -137,17 +137,7 @@ class CudaBackend(Backend):
 						[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
 						[grid_size], (grid_size + 255) // 256, 1, 1, 256)
 			return _fwd
-		elif (len(y.shape) == 2 or (len(y.shape) == 3 and y.shape[0] == 1) or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1)):
-			tc_val = out.shape[-2] * out.shape[-1]
-			def _fwd(inputs, outputs, scratch=None):
-				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
-				self.ctx.dispatch("add_pos_forward",
-					[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
-					[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
-					[grid_size, tc_val], (grid_size + 255) // 256, 1, 1, 256)
-			return _fwd
-		elif (len(y.shape) == 1 or (len(y.shape) == 3 and y.shape[0] == 1 and y.shape[1] == 1) 
-				or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1 and y.shape[2] == 1)):
+		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == -1:
 			c_val = out.shape[-1]
 			def _fwd(inputs, outputs, scratch=None):
 				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
@@ -155,6 +145,15 @@ class CudaBackend(Backend):
 					[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
 					[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
 					[grid_size, c_val], (grid_size + 255) // 256, 1, 1, 256)
+			return _fwd
+		elif y.ndim >= 2 and y.shape[-2:] == out.shape[-2:] and prod(y.shape[:-2]) == 1:
+			tc_val = out.shape[-2] * out.shape[-1]
+			def _fwd(inputs, outputs, scratch=None):
+				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
+				self.ctx.dispatch("add_pos_forward",
+					[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
+					[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
+					[grid_size, tc_val], (grid_size + 255) // 256, 1, 1, 256)
 			return _fwd
 		else:
 			raise RuntimeError(f"Unsupported Add shape: x.shape={x.shape}, y.shape={y.shape}")
@@ -195,27 +194,7 @@ class CudaBackend(Backend):
 						[og.ptr.buffer_id, buf_dx, buf_dy], [og.ptr.offset, off_dx, off_dy],
 						[grid_size], (grid_size + 255) // 256, 1, 1, 256)
 			return _bwd
-		elif (len(y.shape) == 2 or (len(y.shape) == 3 and y.shape[0] == 1) or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1)):
-			b_val, tc_val = prod(out.shape[:-2]), out.shape[-2] * out.shape[-1]
-			def _bwd(inputs, outputs, scratch=None):
-				if outputs[0].grad is None:
-					return
-				og = outputs[0].grad.storage
-				if inputs[0].requires_grad:
-					xg = inputs[0].grad.storage
-					if xg.ptr.buffer_id != og.ptr.buffer_id or xg.ptr.offset != og.ptr.offset:
-						self.ctx.dispatch("contiguous_backward_kernel",
-							[og.ptr.buffer_id, xg.ptr.buffer_id], [og.ptr.offset, xg.ptr.offset],
-							[grid_size], (grid_size + 255) // 256, 1, 1, 256)
-				if inputs[1].requires_grad:
-					yg = inputs[1].grad.storage
-					accum = int(inputs[1].op is None and bool(getattr(self, "accumulate_parameter_grads", False)))
-					self.ctx.dispatch("pos_emb_grad",
-						[og.ptr.buffer_id, yg.ptr.buffer_id], [og.ptr.offset, yg.ptr.offset],
-						[b_val, tc_val, accum], (tc_val + 255) // 256, 1, 1, 256)
-			return _bwd
-		elif (len(y.shape) == 1 or (len(y.shape) == 3 and y.shape[0] == 1 and y.shape[1] == 1)
-				or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1 and y.shape[2] == 1)):
+		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == 1:
 			rows_val, c_val = prod(out.shape[:-1]), out.shape[-1]
 			def _bwd(inputs, outputs, scratch=None):
 				if outputs[0].grad is None:
@@ -234,6 +213,25 @@ class CudaBackend(Backend):
 					self.ctx.dispatch(kernel,
 						[og.ptr.buffer_id, yg.ptr.buffer_id], [og.ptr.offset, yg.ptr.offset],
 						[rows_val, c_val, accum], (c_val + 15) // 16, 1, 1, 256)
+			return _bwd
+		elif y.ndim >= 2 and y.shape[-2:] == out.shape[-2:] and prod(y.shape[:-2]) == 1:
+			b_val, tc_val = prod(out.shape[:-2]), out.shape[-2] * out.shape[-1]
+			def _bwd(inputs, outputs, scratch=None):
+				if outputs[0].grad is None:
+					return
+				og = outputs[0].grad.storage
+				if inputs[0].requires_grad:
+					xg = inputs[0].grad.storage
+					if xg.ptr.buffer_id != og.ptr.buffer_id or xg.ptr.offset != og.ptr.offset:
+						self.ctx.dispatch("contiguous_backward_kernel",
+							[og.ptr.buffer_id, xg.ptr.buffer_id], [og.ptr.offset, xg.ptr.offset],
+							[grid_size], (grid_size + 255) // 256, 1, 1, 256)
+				if inputs[1].requires_grad:
+					yg = inputs[1].grad.storage
+					accum = int(inputs[1].op is None and bool(getattr(self, "accumulate_parameter_grads", False)))
+					self.ctx.dispatch("pos_emb_grad",
+						[og.ptr.buffer_id, yg.ptr.buffer_id], [og.ptr.offset, yg.ptr.offset],
+						[b_val, tc_val, accum], (tc_val + 255) // 256, 1, 1, 256)
 			return _bwd
 		else:
 			raise RuntimeError(f"Unsupported Add shape: x.shape={x.shape}, y.shape={y.shape}")
