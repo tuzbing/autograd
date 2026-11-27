@@ -5,8 +5,8 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 
-from storage import CPUAllocator, MetalAllocator
-from backend import CPUBackend, MetalBackend
+# from storage import CPUAllocator, MetalAllocator, MetalBackend
+# from backend import CPUBackend, MetalBackend, MetalBackend
 from op import MatMulOp
 from tensor import Tensor
 from scratch import ScratchViews, plan_node_scratch
@@ -353,7 +353,7 @@ class Runtime:
 			self.unified_arena = None
 			return
 
-		if self.allocator.device == "mps":
+		if self.allocator.device in ("mps", "cuda"):
 			for mlp_node in self.topo:
 				if mlp_node.op.op_name != "FusedRMSNormMLP":
 					continue
@@ -544,7 +544,8 @@ class Runtime:
 					if x in tensor_lifetimes:
 						tensor_lifetimes[x][1] = max(tensor_lifetimes[x][1], step)
 
-				if node.op.op_name == "FusedLinearCrossEntropy":
+				# if node.op.op_name == "FusedLinearCrossEntropy":
+				if node.op.op_name in ("FusedLinearCrossEntropy", "FusedRMSNormLinearCrossEntropy"):
 					xg = node.inputs[0].grad
 					if xg is not None and node.inputs[0].op is not None:
 						if xg not in tensor_lifetimes:
@@ -599,7 +600,7 @@ class Runtime:
 			self.unified_arena = None
 			return
 
-		if self.allocator.device == "mps":
+		if self.allocator.device in ("mps", "cuda"):
 			for mlp_node in self.topo:
 				if mlp_node.op.op_name != "FusedRMSNormMLP":
 					continue
@@ -813,7 +814,7 @@ class Runtime:
 			self.backend.end_pass()
 			return
 
-		if self.allocator.device != "mps":
+		if self.allocator.device not in ("mps", "cuda"):
 			if not self.accumulate_parameter_grads:
 				self.zero_grad()
 			self.forward()

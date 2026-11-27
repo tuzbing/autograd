@@ -159,7 +159,8 @@ def approximate_allocated_bytes(runtime, model, optimizer, input_ids, labels):
         if storage is None or isinstance(storage, tuple):
             return
         if hasattr(storage.ptr, "buffer_id"):
-            key = ("mps", storage.ptr.buffer_id)
+            # key = ("mps", storage.ptr.buffer_id)
+            key = (storage.device, storage.ptr.buffer_id)
             extent = storage.ptr.offset + storage.nbytes
         else:
             key = ("cpu", id(storage.ptr))
@@ -243,8 +244,8 @@ def main():
             f"total_batch_size {args.total_batch_size} must be divisible by B*T={tokens_per_microbatch}"
         )
     grad_accum_steps = args.total_batch_size // tokens_per_microbatch
-    if grad_accum_steps > 1 and device != "mps":
-        raise ValueError("gradient accumulation > 1 is supported only on MPS")
+    if grad_accum_steps > 1 and device not in ("mps", "cuda"):
+        raise ValueError("gradient accumulation > 1 is supported only on MPS/CUDA")
 
     model = GPT2(
         vocab_size,
@@ -307,6 +308,8 @@ def main():
             for w in (blk.attn.proj.weight, blk.mlp.fc2.weight):
                 if device == "mps":
                     backend.numpy_view(w)[:] *= resid_scale
+                elif device == "cuda":
+                    backend.copy_from_host(w, backend.copy_to_host(w) * resid_scale)
                 else:
                     w.storage.data[:] *= resid_scale
 

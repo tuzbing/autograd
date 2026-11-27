@@ -257,14 +257,28 @@ def read_gguf_metadata(path):
     return metadata
 
 
-def storage_view(backend, storage):
+# def storage_view(backend, storage):
+#     if hasattr(storage.ptr, "buffer_id"):
+#         tensor = Tensor(
+#             storage.shape, storage.dtype, device="mps", requires_grad=False
+#         )
+#         tensor.storage = storage
+#         return backend.numpy_view(tensor)
+#     return storage.data.reshape(storage.shape)
+def read_storage_host(backend, storage):
     if hasattr(storage.ptr, "buffer_id"):
-        tensor = Tensor(
-            storage.shape, storage.dtype, device="mps", requires_grad=False
-        )
-        tensor.storage = storage
-        return backend.numpy_view(tensor)
-    return storage.data.reshape(storage.shape)
+        t = Tensor(storage.shape, storage.dtype, device=storage.device, requires_grad=False)
+        t.storage = storage
+        return backend.copy_to_host(t)
+    return storage.data.reshape(storage.shape).copy()
+
+def write_storage_host(backend, storage, array):
+    if hasattr(storage.ptr, "buffer_id"):
+        t = Tensor(storage.shape, storage.dtype, device=storage.device, requires_grad=False)
+        t.storage = storage
+        backend.copy_from_host(t, array)
+    else:
+        storage.data.reshape(storage.shape)[:] = array
 
 
 def optimizer_storages(optimizer):
@@ -348,7 +362,7 @@ def save_optimizer(path, optimizer, model, backend, extra_meta=None):
         metadata.update(extra_meta)
 
     arrays = {
-        name: storage_view(backend, storage).copy()
+        name: read_storage_host(backend, storage).copy()
         for name, storage in optimizer_storages(optimizer).items()
     }
 
@@ -392,7 +406,8 @@ def load_optimizer(path, optimizer, model, backend):
                 raise ValueError(f"Optimizer buffer mismatch: {name}")
 
         for name, storage in storages.items():
-            storage_view(backend, storage)[:] = data[name]
+            # read_storage_host(backend, storage)[:] = data[name]
+            write_storage_host(backend, storage, data[name])
 
     optimizer.t = int(metadata["t"])
     optimizer.betas = tuple(metadata["betas"])

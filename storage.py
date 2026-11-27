@@ -1,8 +1,6 @@
 import numpy as np
 from math import prod
 
-import metal_ext
-
 class Storage:
 	__slots__ = ("ptr", "shape", "dtype", "device", "nbytes")
 	def __init__(self, ptr, shape, dtype, device, nbytes):
@@ -72,6 +70,7 @@ class MetalMemPointer:
 class MetalAllocator(Allocator):
 	def __init__(self):
 		super().__init__("mps")
+		import metal_ext
 		self.ctx = metal_ext.MetalContext()
 
 	def alloc(self, shape, dtype):
@@ -88,3 +87,9 @@ class MetalAllocator(Allocator):
 		nbytes = prod(shape) * dt.itemsize
 		new_ptr = MetalMemPointer(storage.ptr.buffer_id, storage.ptr.offset+offset_bytes)
 		return Storage(new_ptr, shape, dtype, self.device, nbytes)
+
+class CudaAllocator(MetalAllocator):
+	def __init__(self):
+		Allocator.__init__(self, "cuda")
+		import cuda_ext
+		self.ctx = cuda_ext.get_ctx()

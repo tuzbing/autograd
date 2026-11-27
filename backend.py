@@ -13,8 +13,6 @@ from utils import xavier_uniform, reduce_broadcast_grad, tensor_to_numpy, is_mat
 from gemm import fp16_gemm_kernel_name, get_fp16_gemm_config
 from scratch import align_up
 
-import metal_ext
-
 GELU_C = 0.7978845608028654
 GELU_A = 0.044715
 GELU_A3 = 0.134145
@@ -2610,6 +2608,7 @@ class CPUBackend(Backend):
 # ---------------------------------------------------------------
 class MetalBackend(Backend):
 	def __init__(self):
+		import metal_ext
 		self.ctx = metal_ext.MetalContext()
 		self._rollout_cache = None
 		self._rollout_cache_dirty = True

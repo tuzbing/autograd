@@ -187,17 +187,19 @@ class AdamW:
 	    self.qmap_m = rt.allocator.empty((256,), np.float32)
 	    self.qmap_v = rt.allocator.empty((256,), np.float32)
 
-	    rt.backend.ctx.numpy_view_float32(
-	        self.qmap_m.ptr.buffer_id,
-	        self.qmap_m.ptr.offset,
-	        (256,),
-	    )[:] = qmap_m_host
+	    # rt.backend.ctx.numpy_view_float32(
+	    #     self.qmap_m.ptr.buffer_id,
+	    #     self.qmap_m.ptr.offset,
+	    #     (256,),
+	    # )[:] = qmap_m_host
 
-	    rt.backend.ctx.numpy_view_float32(
-	        self.qmap_v.ptr.buffer_id,
-	        self.qmap_v.ptr.offset,
-	        (256,),
-	    )[:] = qmap_v_host
+	    # rt.backend.ctx.numpy_view_float32(
+	    #     self.qmap_v.ptr.buffer_id,
+	    #     self.qmap_v.ptr.offset,
+	    #     (256,),
+	    # )[:] = qmap_v_host
+	    rt.backend.ctx.copy_from_host(self.qmap_m.ptr.buffer_id, self.qmap_m.ptr.offset, qmap_m_host)
+	    rt.backend.ctx.copy_from_host(self.qmap_v.ptr.buffer_id, self.qmap_v.ptr.offset, qmap_v_host)
 
 	    self.m = [None] * len(self.params)
 	    self.v = [None] * len(self.params)
@@ -271,7 +273,8 @@ class AdamW:
 
 	    qmap_m_host = build_dynamic_map(signed=True)
 	    self.qmap_m = rt.allocator.empty((256,), np.float32)
-	    rt.backend.ctx.numpy_view_float32(self.qmap_m.ptr.buffer_id, self.qmap_m.ptr.offset, (256,))[:] = qmap_m_host
+	    # rt.backend.ctx.numpy_view_float32(self.qmap_m.ptr.buffer_id, self.qmap_m.ptr.offset, (256,))[:] = qmap_m_host
+	    rt.backend.ctx.copy_from_host(self.qmap_m.ptr.buffer_id, self.qmap_m.ptr.offset, qmap_m_host)
 
 	def _prepare_mini8bit_meta(self, rt, min_8bit_size=4096):
 		stochastic_ids = set()
@@ -502,7 +505,7 @@ class AdamW:
 	def zero_grad(self):
 		for p in self.params:
 			if p.grad is not None:
-				if p.grad.storage.device == "mps":
+				if p.grad.storage.device in ("mps", "cuda"):
 					self.backend.fill_storage2(p.grad.storage, 0.0)
 				else:
 					self.backend.fill(p.grad, 0.0)
@@ -563,7 +566,8 @@ class AdamW:
 				self.backend.grad_norm_sq(grad_storage, partial, int(numel))
 			self.backend.end_pass()
 			for partial in partial_bufs:
-				view = self.backend.ctx.numpy_view_float32(partial.ptr.buffer_id, partial.ptr.offset, partial.shape)
+				# view = self.backend.ctx.numpy_view_float32(partial.ptr.buffer_id, partial.ptr.offset, partial.shape)
+				view = self.backend.ctx.copy_to_host(partial.ptr.buffer_id, partial.ptr.offset, partial.shape)
 				norm_sq += float(np.sum(view, dtype=np.float64))
 			grad_norm = math.sqrt(norm_sq)
 			if not math.isfinite(grad_norm):

@@ -193,7 +193,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		logits_budget_elements = max(V, 8*N*C)
 		logits_rows = max(1, min(512, logits_budget_elements//V, N))
 
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			vocab_blocks = (V+95)//96
 			slots = [
 				('row_loss', (N, 1), x.dtype),
@@ -255,10 +255,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		C = x.shape[-1]
 		N = prod(x.shape[:-1])
 
-		if x.device == "mps":
-			# logits_budget_elements = max(V, 8*N*C)
-			# logits_rows = max(1, min(512, logits_budget_elements//V, N))
-			
+		if x.device in ("mps", "cuda"):
 			mlp_node = x.op.inputs[1].op if (x.op is not None and x.op.op.op_name == "Add" and len(x.op.inputs) == 2) else None
 			if mlp_node is not None and mlp_node.op.op_name == "FusedRMSNormMLP":
 				H = mlp_node.inputs[-2].shape[1] // 2
@@ -341,7 +338,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		gu_shape = x.shape[:-1] + (2*H,)
 		hidden_shape = x.shape[:-1] + (H,)
 
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			fwd_slots = [
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
@@ -468,7 +465,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		# H, D = outputs[0].shape[1], outputs[0].shape[3]
 		H = op.n_head
 		D = C // H
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			fwd = pack_slots([
 				('k', (B, H, T, D), x.dtype),
 				('v', (B, H, T, D), x.dtype),
@@ -512,7 +509,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		B, T, C = x.shape
 		H = op.n_head
 		D = C // H 
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			fwd = pack_slots([
 				('q', (B, H, T, D), x.dtype),
 				('k', (B, H, T, D), x.dtype),
@@ -562,7 +559,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		B, T, C = x.shape
 		H, HKV = op.n_head, op.n_kv_head
 		D = C // H
-		if x.device == "mps":
+		if x.device in ("mps", "cuda"):
 			fwd = pack_slots([
 				("q", (B, H, T, D), x.dtype),
 				("k", (B, HKV, T, D), x.dtype),
@@ -616,7 +613,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 	elif type(op).__name__ == "FusedLinearAddOp":
 		x, act, w, b = inputs
 		out = outputs[0]
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			if act.op is not None and type(act.op.op).__name__ == "FusedRMSNormFlashAttentionOp":
 				B, T, C = x.shape
 				H = act.op.op.n_head
@@ -692,7 +689,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		D = C // H
 		S = inputs[7].shape[1]
 
-		if x.device == 'mps':
+		if x.device in ("mps", "cuda"):
 			fwd = pack_slots([
 				("q", (B, H, T, D), x.dtype),
 				("k", (B, H, T, D), x.dtype),
@@ -717,7 +714,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 			])
 	elif type(op).__name__ == "RolloutSampleOp":
 		x = inputs[0]
-		if x.device == "mps":
+		if x.device in ("mps", "cuda"):
 			B, V = inputs[7].shape[0], inputs[12].shape[-1]
 			P = 1 << (V-1).bit_length()
 			fwd = pack_slots([
