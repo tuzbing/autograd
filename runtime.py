@@ -318,7 +318,7 @@ class Runtime:
 					if t in tensor_lifetimes:
 						tensor_lifetimes[t][1] = max(tensor_lifetimes[t][1], step)
 
-				if node.op.op_name == "FusedRMSNormMLP" and node.inputs:
+				if self.allocator.device == "mps" and node.op.op_name == "FusedRMSNormMLP" and node.inputs:
 					x_after_attn = node.inputs[0]
 					fla_node = x_after_attn.op 
 					if fla_node is not None and fla_node.op.op_name == "FusedLinearAdd" and len(fla_node.inputs) == 4:
@@ -565,7 +565,7 @@ class Runtime:
 					if t in tensor_lifetimes:
 						tensor_lifetimes[t][1] = max(tensor_lifetimes[t][1], step)
 
-				if node.op.op_name == "FusedRMSNormMLP" and node.inputs:
+				if self.allocator.device == "mps" and node.op.op_name == "FusedRMSNormMLP" and node.inputs:
 					x_after_attn = node.inputs[0]
 					fla_node = x_after_attn.op 
 					if fla_node is not None and fla_node.op.op_name == "FusedLinearAdd" and len(fla_node.inputs) == 4:

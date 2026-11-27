@@ -3,7 +3,7 @@ import numpy as np
 from math import prod
 from .base import Backend
 from op import (
-	GatherOp
+	GatherOp, FusedLinearAddOp
 )
 from utils import f32_bits, bf16_bits
 
@@ -17,9 +17,11 @@ class CudaBackend(Backend):
 		self._rollout_cache_dirty = True
 		self.forward_kernels = {
 			GatherOp: self.cuda_gather_forward,
+			FusedLinearAddOp: self.cuda_fused_linear_add_forward,
 		}
 		self.backward_kernels = {
 			GatherOp: self.cuda_gather_backward,
+			FusedLinearAddOp: self.cuda_fused_linear_add_backward,
 		}
 
 	def copy_from_host(self, tensor, host_np):
@@ -93,12 +95,12 @@ class CudaBackend(Backend):
 		rows = prod(indices.shape)
 		C = weight.shape[-1]
 		vec4 = int(C % 4 == 0 and weight.storage.ptr.offset % 16 == 0 and out.storage.ptr.offset % 16 == 0)
-		n_work = (rows * C) // 4 if vec4 else (rows * C)
+		cols_work = (C >> 2) if vec4 else C
 		self.ctx.dispatch("gather_forward_kernel",
 			[indices.storage.ptr.buffer_id, weight.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
 			[indices.storage.ptr.offset, weight.storage.ptr.offset, out.storage.ptr.offset],
 			[rows, C, vec4],
-			(n_work + 255) // 256, 1, 1, 256)
+			(cols_work + 255) // 256, min(rows, 65535), 1, 256)
 
 	def cuda_gather_backward(self, inputs, outputs, scratch=None):
 		indices, weight = inputs[0], inputs[1]
@@ -109,130 +111,74 @@ class CudaBackend(Backend):
 		C = weight.shape[-1]
 		buf_ids = [indices.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, weight.grad.storage.ptr.buffer_id]
 		offsets = [indices.storage.ptr.offset, out.grad.storage.ptr.offset, weight.grad.storage.ptr.offset]
-		if np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16):
-			self.ctx.dispatch("gather_backward_bf16_kernel",
-				buf_ids, offsets, [rows, C], (C+127)//128, rows, 1, 32)
-		else:
-			total = rows * C
-			self.ctx.dispatch("gather_backward_kernel",
-				buf_ids, offsets, [total, C], (total+255)//256, 1, 1, 256)
+		out_bf16 = int(np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16))
+		self.ctx.dispatch("gather_backward_kernel",
+			buf_ids, offsets, [rows, C, out_bf16],
+			(C + 255) // 256, min(rows, 65535), 1, 256)
 
-	def bind_add_forward(self, node):
-		x, y = node.inputs[0], node.inputs[1]
-		out = node.outputs[0]
-		grid_size = prod(out.shape)
-		if x.shape == y.shape:
-			def _fwd(inputs, outputs, scratch=None):
-				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
-				if (grid_size % 4 == 0 and xs.ptr.offset % 16 == 0
-						and ys.ptr.offset % 16 == 0 and os_.ptr.offset % 16 == 0):
-					n4 = grid_size // 4
-					self.ctx.dispatch("add_residual_forward_vec4",
-						[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
-						[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
-						[n4], (n4 + 255) // 256, 1, 1, 256)
-				else:
-					self.ctx.dispatch("add_residual_forward",
-						[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
-						[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
-						[grid_size], (grid_size + 255) // 256, 1, 1, 256)
-			return _fwd
-		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == 1:
-			c_val = out.shape[-1]
-			def _fwd(inputs, outputs, scratch=None):
-				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
-				self.ctx.dispatch("add_bias_forward",
-					[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
-					[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
-					[grid_size, c_val], (grid_size + 255) // 256, 1, 1, 256)
-			return _fwd
-		elif y.ndim >= 2 and y.shape[-2:] == out.shape[-2:] and prod(y.shape[:-2]) == 1:
-			tc_val = out.shape[-2] * out.shape[-1]
-			def _fwd(inputs, outputs, scratch=None):
-				xs, ys, os_ = inputs[0].storage, inputs[1].storage, outputs[0].storage
-				self.ctx.dispatch("add_pos_forward",
-					[xs.ptr.buffer_id, ys.ptr.buffer_id, os_.ptr.buffer_id],
-					[xs.ptr.offset, ys.ptr.offset, os_.ptr.offset],
-					[grid_size, tc_val], (grid_size + 255) // 256, 1, 1, 256)
-			return _fwd
-		else:
-			raise RuntimeError(f"Unsupported Add shape: x.shape={x.shape}, y.shape={y.shape}")
+	def cuda_fused_linear_add_forward(self, inputs, outputs, scratch=None):
+		x, act, w, b = inputs
+		out = outputs[0]
+		M = prod(x.shape[:-1])
+		K = act.shape[-1]
+		N = w.shape[-1]
+		b_id = b.storage.ptr.buffer_id if b is not None else 0
+		b_off = b.storage.ptr.offset if b is not None else 0
+		self.ctx.dispatch("fused_linear_add_forward_kernel",
+			[x.storage.ptr.buffer_id, act.storage.ptr.buffer_id, w.storage.ptr.buffer_id, b_id, out.storage.ptr.buffer_id],
+			[x.storage.ptr.offset, act.storage.ptr.offset, w.storage.ptr.offset, b_off, out.storage.ptr.offset],
+			[M, N, K], (N+63) // 64, (M+63)//64, 1, 256)
 
-	def bind_add_backward(self, node):
-		x, y = node.inputs[0], node.inputs[1]
-		out = node.outputs[0]
-		grid_size = prod(out.shape)
-		if x.shape == y.shape:
-			def _bwd(inputs, outputs, scratch=None):
-				if outputs[0].grad is None:
-					return
-				og = outputs[0].grad.storage
-				do_x = inputs[0].requires_grad
-				do_y = inputs[1].requires_grad
-				if do_x and inputs[0].grad.storage.ptr.buffer_id == og.ptr.buffer_id \
-						and inputs[0].grad.storage.ptr.offset == og.ptr.offset:
-					do_x = False
-				if do_y and inputs[1].grad.storage.ptr.buffer_id == og.ptr.buffer_id \
-						and inputs[1].grad.storage.ptr.offset == og.ptr.offset:
-					do_y = False
-				if not do_x and not do_y:
-					return
+	def cuda_fused_linear_add_backward(self, inputs, outputs, scratch=None):
+		x, act, w, b = inputs
+		out = outputs[0]
+		if out.grad is None:
+			return
+		M = prod(x.shape[:-1])
+		K = act.shape[-1]
+		N = w.shape[-1]
+		accumulate = int(bool(getattr(self, "accumulate_parameter_grads", False)))
 
-				buf_dx = inputs[0].grad.storage.ptr.buffer_id if do_x else 0
-				off_dx = inputs[0].grad.storage.ptr.offset if do_x else 0
-				buf_dy = inputs[1].grad.storage.ptr.buffer_id if do_y else 0
-				off_dy = inputs[1].grad.storage.ptr.offset if do_y else 0
-				if (grid_size % 4 == 0 and og.ptr.offset % 16 == 0
-						and (not do_x or off_dx % 16 == 0)
-						and (not do_y or off_dy % 16 == 0)):
-					n4 = grid_size // 4
-					self.ctx.dispatch("add_residual_backward_vec4",
-						[og.ptr.buffer_id, buf_dx, buf_dy], [og.ptr.offset, off_dx, off_dy],
-						[n4], (n4 + 255) // 256, 1, 1, 256)
-				else:
-					self.ctx.dispatch("add_residual_backward",
-						[og.ptr.buffer_id, buf_dx, buf_dy], [og.ptr.offset, off_dx, off_dy],
-						[grid_size], (grid_size + 255) // 256, 1, 1, 256)
-			return _bwd
-		elif y.ndim >= 1 and y.shape[-1] == out.shape[-1] and prod(y.shape[:-1]) == 1:
-			rows_val, c_val = prod(out.shape[:-1]), out.shape[-1]
-			def _bwd(inputs, outputs, scratch=None):
-				if outputs[0].grad is None:
-					return
-				og = outputs[0].grad.storage
-				if inputs[0].requires_grad:
-					xg = inputs[0].grad.storage
-					if xg.ptr.buffer_id != og.ptr.buffer_id or xg.ptr.offset != og.ptr.offset:
-						self.ctx.dispatch("contiguous_backward_kernel",
-							[og.ptr.buffer_id, xg.ptr.buffer_id], [og.ptr.offset, xg.ptr.offset],
-							[grid_size], (grid_size + 255) // 256, 1, 1, 256)
-				if inputs[1].requires_grad:
-					yg = inputs[1].grad.storage
-					accum = int(bool(getattr(self, "accumulate_parameter_grads", False)))
-					kernel = "bias_grad_reduce_bf16" if np.dtype(yg.dtype) == np.dtype(np.uint16) else "bias_grad_reduce"
-					self.ctx.dispatch(kernel,
-						[og.ptr.buffer_id, yg.ptr.buffer_id], [og.ptr.offset, yg.ptr.offset],
-						[rows_val, c_val, accum], (c_val + 15) // 16, 1, 1, 256)
-			return _bwd
-		elif y.ndim >= 2 and y.shape[-2:] == out.shape[-2:] and prod(y.shape[:-2]) == 1:
-			b_val, tc_val = prod(out.shape[:-2]), out.shape[-2] * out.shape[-1]
-			def _bwd(inputs, outputs, scratch=None):
-				if outputs[0].grad is None:
-					return
-				og = outputs[0].grad.storage
-				if inputs[0].requires_grad:
-					xg = inputs[0].grad.storage
-					if xg.ptr.buffer_id != og.ptr.buffer_id or xg.ptr.offset != og.ptr.offset:
-						self.ctx.dispatch("contiguous_backward_kernel",
-							[og.ptr.buffer_id, xg.ptr.buffer_id], [og.ptr.offset, xg.ptr.offset],
-							[grid_size], (grid_size + 255) // 256, 1, 1, 256)
-				if inputs[1].requires_grad:
-					yg = inputs[1].grad.storage
-					accum = int(inputs[1].op is None and bool(getattr(self, "accumulate_parameter_grads", False)))
-					self.ctx.dispatch("pos_emb_grad",
-						[og.ptr.buffer_id, yg.ptr.buffer_id], [og.ptr.offset, yg.ptr.offset],
-						[b_val, tc_val, accum], (tc_val + 255) // 256, 1, 1, 256)
-			return _bwd
-		else:
-			raise RuntimeError(f"Unsupported Add shape: x.shape={x.shape}, y.shape={y.shape}")
+		# 1. dW = act^T [K, M] @ dO [M, N]
+		if w.requires_grad:
+			dw_bf16 = int(np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16))
+			self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				[act.storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+				[act.storage.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
+				[K, N, M, accumulate, dw_bf16],
+				(N + 63) // 64, (K + 63) // 64, 1, 256)
 
+		# 2. dx = dO
+		if x.requires_grad:
+			numel = prod(x.shape)
+			accum_x = int(x.op is None and bool(accumulate))
+			same_buf = (out.grad.storage.ptr.buffer_id == x.grad.storage.ptr.buffer_id and out.grad.storage.ptr.offset == x.grad.storage.ptr.offset)
+			if not (x.is_contiguous and not accum_x and same_buf):
+				contig = int(bool(x.is_contiguous))
+				vec4 = int(contig and numel % 4 == 0 and out.grad.storage.ptr.offset % 16 == 0 and x.grad.storage.ptr.offset % 16 == 0)
+				n_work = (numel >> 2) if vec4 else numel
+				shape4 = ([1] * (4 - x.ndim) + list(x.shape))[-4:]
+				strides4 = ([0] * (4 - x.ndim) + list(x.strides))[-4:]
+				x_grad_off = x.grad.storage.ptr.offset if contig else (x.grad.storage.ptr.offset + x.offset * 4)
+				self.ctx.dispatch("linear_add_dx_backward_kernel",
+					[out.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+					[out.grad.storage.ptr.offset, x_grad_off],
+					[numel, contig, vec4, accum_x, shape4[1], shape4[2], shape4[3], strides4[0], strides4[1], strides4[2], strides4[3]],
+					(n_work + 255) // 256, 1, 1, 256)
+
+		# 3. dAct = dO[M, N] @ W^T[N, K]
+		if act.requires_grad:
+			accum_act = int(act.op is None and bool(accumulate))
+			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				[out.grad.storage.ptr.buffer_id, w.storage.ptr.buffer_id, act.grad.storage.ptr.buffer_id],
+				[out.grad.storage.ptr.offset, w.storage.ptr.offset, act.grad.storage.ptr.offset],
+				[M, K, N, accum_act], (K + 63) // 64, (M + 63) // 64, 1, 256)
+
+		# 4. db = sum(dO, axis=0)
+		if b is not None and b.requires_grad:
+			accum_b = int(b.op is None and bool(accumulate))
+			db_bf16 = int(np.dtype(b.grad.storage.dtype) == np.dtype(np.uint16))
+			self.ctx.dispatch("bias_grad_reduce_kernel",
+				[out.grad.storage.ptr.buffer_id, b.grad.storage.ptr.buffer_id],
+				[out.grad.storage.ptr.offset, b.grad.storage.ptr.offset],
+				[M, N, accum_b, db_bf16], (N + 7) // 8, 1, 1, 256)
