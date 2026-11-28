@@ -489,7 +489,7 @@ def plan_node_scratch(node, use_f16_gemm=False, num_sms=1):
 			}
 			fla_node = x.op
 			recompute_fla = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd" and len(fla_node.inputs) == 4                                               # <--- 新增
-				and fla_node.inputs[1].op is not None and fla_node.inputs[1].op.op_name == "FusedRMSNormFlashAttention")                                                                               # <--- 新增
+				and fla_node.inputs[1].op is not None and fla_node.inputs[1].op.op.op_name == "FusedRMSNormFlashAttention")                                                                               # <--- 新增
 			work_floats = N * (H - C) if recompute_fla else N * H
 			h_tile = min(H, work_floats // N)
 			chunk_rows = max(1, work_floats // H)
@@ -720,6 +720,8 @@ def plan_node_scratch(node, use_f16_gemm=False, num_sms=1):
 					bwd_configs["dw"] = get_cuda_gemm_config(M=K_fla, N=N_fla, K=M_fla, a_transpose=True, num_sms=num_sms)
 				if act.requires_grad:
 					bwd_configs["dact"] = get_cuda_gemm_config(M=M_fla, N=K_fla, K=N_fla, b_transpose=True, num_sms=num_sms)
+				if bwd is None:
+					bwd = ScratchLayout({}, 64)
 				bwd.gemm_configs = bwd_configs
 		else:
 			if act.op is not None and type(act.op.op).__name__ == "FusedRMSNormFlashAttentionOp":
@@ -745,7 +747,7 @@ def plan_node_scratch(node, use_f16_gemm=False, num_sms=1):
 					('tmp_dw', w.shape, w.dtype),
 					('tmp_db', b.shape, b.dtype),
 				])
-				
+
 			elif act.op is not None and type(act.op.op).__name__ == "FusedRMSNormGQAOp":
 				B, T, C = x.shape
 				H, HKV = act.op.op.n_head, act.op.op.n_kv_head
