@@ -196,9 +196,10 @@ def main():
     np.random.seed(42)
 
     device = args.device_type
+    use_fp16_gemm = bool(args.use_fp16_gemm) and device == "mps"
     Runtime._default_runtime = Runtime(
         device=device,
-        use_fp16_gemm=bool(args.use_fp16_gemm),
+        use_fp16_gemm=use_fp16_gemm,
     )
     runtime = Runtime.get_default()
     backend = runtime.backend
@@ -283,7 +284,7 @@ def main():
         print(f"Planned training tokens : {total_tokens:,} ({total_tokens / matrix_params:.2f} tok/matrix_param)")
     else:
         print(f"Planned training        : {args.epochs} full epoch(s) over dataset")
-    print(f"Optimizer & precision   : state={args.optimizer_state}, grad={args.grad_dtype}, fp16_gemm={bool(args.use_fp16_gemm)}")
+    print(f"Optimizer & precision   : state={args.optimizer_state}, grad={args.grad_dtype}, fp16_gemm={use_fp16_gemm}")
 
     input_ids = Tensor((B, T), np.int32, device=device, requires_grad=False, init_val=None)
     labels = Tensor((B, T), np.int32, device=device, requires_grad=False, init_val=None)
