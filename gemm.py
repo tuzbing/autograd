@@ -180,3 +180,34 @@ def fp16_gemm_kernel_name(cfg, with_accum, prefix=None):
 			f"a{int(bool(with_accum))}"
 		)
 
+
+
+def get_cuda_gemm_config(M, N, K, a_transpose=False, b_transpose=False, num_sms=1):
+	if a_transpose and b_transpose:
+		raise ValueError("cuda_sgemm does not support TT layout")
+	mode = "tn" if a_transpose else ("nt" if b_transpose else "nn")
+	use_128 = (M >= 128 and N >= 128)
+	ctas_128 = ((N + 127) // 128) * ((M + 127) // 128)
+
+	split_k = 1
+	if not a_transpose and K >= 2048:
+		target_ctas = num_sms * 4
+		base_ctas = ctas_128 if use_128 else ((N + 63) // 64) * ((M + 63) // 64)
+		if base_ctas < target_ctas:
+			max_splits = 1 << (min(8, K // 512).bit_length() - 1)
+			need = (target_ctas + base_ctas - 1) // base_ctas
+			split_k = min(next_power_of_2(max(2, need)), max_splits)
+
+	if use_128 and split_k == 1 and ctas_128 < num_sms * 2:
+		use_128 = False
+
+	bm = 128 if use_128 else 64
+	bn = 128 if use_128 else 64
+	kernel = f"cuda_sgemm_{mode}_{'128_' if use_128 else ''}kernel"
+	return dict(
+		kernel=kernel,
+		bm=bm,
+		bn=bn,
+		bk=8,
+		split_k=split_k,
+	)

@@ -13,6 +13,8 @@ __device__ __forceinline__ uint16_t float_to_bf16_rne(float v) {
     return uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
 }
 
+#include "cuda_gemm.cuh"
+
 __device__ __forceinline__ void atomic_add_bf16(uint16_t* addr, float val) {
     uintptr_t byte_addr = reinterpret_cast<uintptr_t>(addr);
     uint32_t* word_addr = reinterpret_cast<uint32_t*>(byte_addr & ~uintptr_t(3));
@@ -172,147 +174,6 @@ __global__ void add_residual_backward_kernel(
     }
 }
 
-template <bool kTransA, bool kTransB, bool kFusedLinearAdd>
-__device__ __forceinline__ void cuda_sgemm_64x64x16_impl(
-    const float* __restrict__ A,
-    const float* __restrict__ B,
-    const float* res,
-    const float* __restrict__ bias,
-    void* C_out,
-    uint32_t M, uint32_t N, uint32_t K,
-    uint32_t accumulate, uint32_t out_bf16
-) {
-    constexpr uint32_t BM = 64u;
-    constexpr uint32_t BN = 64u;
-    constexpr uint32_t BK = 16u;
-    constexpr int TM = 4;
-    constexpr int TN = 4;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t tx = tid & 15u;
-    const uint32_t ty = tid >> 4;
-    const uint32_t block_n = blockIdx.x * BN;
-    const uint32_t block_m = blockIdx.y * BM;
-    if (block_m >= M || block_n >= N) return;
-
-    __shared__ float As[BK][BM + 2];
-    __shared__ float Bs[BK][BN + 2];
-
-    float acc[TM][TN] = {0.0f};
-
-    for (uint32_t k0 = 0; k0 < K; k0 += BK) {
-        if constexpr (!kTransA) {
-            uint32_t k_sub = tid & 15u;
-            uint32_t g_k = k0 + k_sub;
-            #pragma unroll
-            for (uint32_t m = (tid >> 4); m < BM; m += 16u) {
-                uint32_t g_m = block_m + m;
-                As[k_sub][m] = (g_m < M && g_k < K) ? A[size_t(g_m) * K + g_k] : 0.0f;
-            }
-        } else {
-            uint32_t m = tid & 63u;
-            uint32_t g_m = block_m + m;
-            #pragma unroll
-            for (uint32_t k_sub = (tid >> 6); k_sub < BK; k_sub += 4u) {
-                uint32_t g_k = k0 + k_sub;
-                As[k_sub][m] = (g_k < K && g_m < M) ? A[size_t(g_k) * M + g_m] : 0.0f;
-            }
-        }
-
-        if constexpr (!kTransB) {
-            uint32_t n = tid & 63u;
-            uint32_t g_n = block_n + n;
-            #pragma unroll
-            for (uint32_t k_sub = (tid >> 6); k_sub < BK; k_sub += 4u) {
-                uint32_t g_k = k0 + k_sub;
-                Bs[k_sub][n] = (g_k < K && g_n < N) ? B[size_t(g_k) * N + g_n] : 0.0f;
-            }
-        } else {
-            uint32_t k_sub = tid & 15u;
-            uint32_t g_k = k0 + k_sub;
-            #pragma unroll
-            for (uint32_t n = (tid >> 4); n < BN; n += 16u) {
-                uint32_t g_n = block_n + n;
-                Bs[k_sub][n] = (g_n < N && g_k < K) ? B[size_t(g_n) * K + g_k] : 0.0f;
-            }
-        }
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int kk = 0; kk < int(BK); ++kk) {
-            float a_reg[TM];
-            float b_reg[TN];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) a_reg[i] = As[kk][i * 16 + ty];
-            #pragma unroll
-            for (int j = 0; j < TN; ++j) b_reg[j] = Bs[kk][j * 16 + tx];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) {
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) {
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    float bias_reg[TN];
-    if constexpr (kFusedLinearAdd) {
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            uint32_t col = block_n + uint32_t(j * 16) + tx;
-            bias_reg[j] = (bias && col < N) ? __ldg(&bias[col]) : 0.0f;
-        }
-    }
-
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        uint32_t row = block_m + uint32_t(i * 16) + ty;
-        if (row >= M) continue;
-        #pragma unroll
-        for (int j = 0; j < TN; ++j) {
-            uint32_t col = block_n + uint32_t(j * 16) + tx;
-            if (col >= N) continue;
-            size_t idx = size_t(row) * N + col;
-            float val = acc[i][j];
-            if constexpr (kFusedLinearAdd) {
-                static_cast<float*>(C_out)[idx] = val + res[idx] + bias_reg[j];
-            } else if (out_bf16) {
-                uint16_t* dst = static_cast<uint16_t*>(C_out);
-                if (accumulate) val += bf16_to_float(dst[idx]);
-                dst[idx] = float_to_bf16_rne(val);
-            } else {
-                float* dst = static_cast<float*>(C_out);
-                dst[idx] = accumulate ? (dst[idx] + val) : val;
-            }
-        }
-    }
-}
-
-__global__ void cuda_sgemm_nt_kernel(
-    const float* __restrict__ A, const float* __restrict__ B, float* C_out,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t accumulate
-) {
-    cuda_sgemm_64x64x16_impl<false, true, false>(A, B, nullptr, nullptr, C_out, M, N, K, accumulate, 0u);
-}
-
-__global__ void fused_linear_add_forward_kernel(
-    const float* x, const float* __restrict__ act, const float* __restrict__ w,
-    const float* __restrict__ b, float* out, uint32_t M, uint32_t N, uint32_t K
-) {
-    cuda_sgemm_64x64x16_impl<false, false, true>(act, w, x, b, out, M, N, K, 0u, 0u);
-}
-
-__global__ void cuda_sgemm_tn_kernel(
-    const float* __restrict__ A, const float* __restrict__ B, void* C_out,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t accumulate, uint32_t out_bf16
-) {
-    cuda_sgemm_64x64x16_impl<true, false, false>(A, B, nullptr, nullptr, C_out, M, N, K, accumulate, out_bf16);
-}
-
 __global__ void linear_add_dx_backward_kernel(
     const float* __restrict__ grad_out,
     float* grad_x,
@@ -394,13 +255,6 @@ __global__ void bias_grad_reduce_kernel(
     }
 }
 
-__global__ void cuda_sgemm_nn_kernel(
-    const float* __restrict__ A, const float* __restrict__ B, float* C_out,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t accumulate
-) {
-    cuda_sgemm_64x64x16_impl<false, false, false>(A, B, nullptr, nullptr, C_out, M, N, K, accumulate, 0u);
-}
-
 __device__ __forceinline__ float warp_allreduce_sum(float val) {
     #pragma unroll
     for (int mask = 16; mask > 0; mask >>= 1) {
@@ -474,85 +328,6 @@ __global__ void rmsnorm_forward_kernel(
     } else {
         for (uint32_t c = lane; c < C; c += 32u) {
             out_row[c] = x_row[c] * inv_rms;
-        }
-    }
-}
-
-__global__ void fused_wgu_swiglu_forward_kernel(
-    const float* __restrict__ x_norm,
-    const float* __restrict__ wgu,
-    float* __restrict__ hidden,
-    uint32_t M, uint32_t H, uint32_t K
-) {
-    constexpr uint32_t BM = 64u;
-    constexpr uint32_t BH = 32u;
-    constexpr uint32_t BK = 16u;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t tx = tid & 15u;
-    const uint32_t ty = tid >> 4;
-    const uint32_t block_h = blockIdx.x * BH;
-    const uint32_t block_m = blockIdx.y * BM;
-    if (block_m >= M || block_h >= H) return;
-
-    const size_t H2 = size_t(H) * 2u;
-    __shared__ float As[BK][BM + 2];
-    __shared__ float Bs[BK][66];
-
-    float acc[4][4] = {0.0f};
-
-    for (uint32_t k0 = 0; k0 < K; k0 += BK) {
-        uint32_t k_sub_a = tid & 15u;
-        uint32_t g_k_a = k0 + k_sub_a;
-        #pragma unroll
-        for (uint32_t m = (tid >> 4); m < BM; m += 16u) {
-            uint32_t g_m = block_m + m;
-            As[k_sub_a][m] = (g_m < M && g_k_a < K) ? x_norm[size_t(g_m) * K + g_k_a] : 0.0f;
-        }
-
-        uint32_t n = tid & 63u;
-        uint32_t col_h = block_h + (n & 31u);
-        size_t w_col = (n < 32u) ? size_t(col_h) : (size_t(H) + size_t(col_h));
-        #pragma unroll
-        for (uint32_t k_sub_b = (tid >> 6); k_sub_b < BK; k_sub_b += 4u) {
-            uint32_t g_k_b = k0 + k_sub_b;
-            Bs[k_sub_b][n] = (g_k_b < K && col_h < H) ? wgu[size_t(g_k_b) * H2 + w_col] : 0.0f;
-        }
-
-        __syncthreads();
-
-        #pragma unroll
-        for (int kk = 0; kk < int(BK); ++kk) {
-            float a_reg[4];
-            float b_reg[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) a_reg[i] = As[kk][i * 16 + ty];
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) b_reg[j] = Bs[kk][j * 16 + tx];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
-                }
-            }
-        }
-
-        __syncthreads();
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint32_t row = block_m + uint32_t(i * 16) + ty;
-        if (row >= M) continue;
-        #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-            uint32_t col = block_h + uint32_t(j * 16) + tx;
-            if (col >= H) continue;
-            float g = acc[i][j];
-            float u = acc[i][j + 2];
-            float silu = g / (1.0f + expf(-g));
-            hidden[size_t(row) * H + col] = silu * u;
         }
     }
 }
@@ -772,122 +547,6 @@ __global__ void rmsnorm_dgamma_kernel(
         } else {
             float* dst = static_cast<float*>(dgamma);
             dst[out_col] = accumulate ? (dst[out_col] + total) : total;
-        }
-    }
-}
-
-__global__ void fused_rms_fa_qkv_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ wq, const float* __restrict__ bq,
-    const float* __restrict__ wk, const float* __restrict__ bk,
-    const float* __restrict__ wv, const float* __restrict__ bv,
-    float* __restrict__ q_out,
-    float* __restrict__ k_out,
-    float* __restrict__ v_out,
-    uint32_t B, uint32_t T, uint32_t C, uint32_t H,
-    uint32_t eps_bits, uint32_t q_bthd
-) {
-    const uint32_t tid = threadIdx.x;
-    const uint32_t tx = tid & 15u;
-    const uint32_t ty = tid >> 4;
-    const uint32_t warp_id = tid >> 5;
-    const uint32_t lane = tid & 31u;
-    const uint32_t block_n = blockIdx.x * 64u;
-    const uint32_t block_m = blockIdx.y * 64u;
-    const uint32_t proj_id = blockIdx.z;
-    const uint32_t N = B * T;
-    if (block_m >= N || block_n >= C || proj_id >= 3u || H == 0u || (C % H) != 0u) return;
-
-    const uint32_t D = C / H;
-    const float eps = __uint_as_float(eps_bits);
-    const float* W = (proj_id == 0u) ? wq : ((proj_id == 1u) ? wk : wv);
-    const float* bias = (proj_id == 0u) ? bq : ((proj_id == 1u) ? bk : bv);
-    float* dst = (proj_id == 0u) ? q_out : ((proj_id == 1u) ? k_out : v_out);
-    const bool write_bhtd = (proj_id != 0u) || (q_bthd == 0u);
-
-    __shared__ float As[16][66];
-    __shared__ float Bs[16][66];
-    __shared__ float inv_rms_s[64];
-
-    for (uint32_t r = warp_id; r < 64u; r += 8u) {
-        uint32_t g_m = block_m + r;
-        float sum_sq = 0.0f;
-        if (g_m < N) {
-            const float* x_row = x + size_t(g_m) * C;
-            for (uint32_t c = lane; c < C; c += 32u) {
-                float v = x_row[c];
-                sum_sq = fmaf(v, v, sum_sq);
-            }
-            sum_sq = warp_allreduce_sum(sum_sq);
-        }
-        if (lane == 0u) {
-            inv_rms_s[r] = (g_m < N) ? rsqrtf(sum_sq / float(C) + eps) : 0.0f;
-        }
-    }
-    __syncthreads();
-
-    float acc[4][4] = {0.0f};
-    for (uint32_t k0 = 0u; k0 < C; k0 += 16u) {
-        uint32_t k_sub_a = tid & 15u;
-        uint32_t g_k_a = k0 + k_sub_a;
-        #pragma unroll
-        for (uint32_t m = (tid >> 4); m < 64u; m += 16u) {
-            uint32_t g_m = block_m + m;
-            As[k_sub_a][m] = (g_m < N && g_k_a < C) ? (x[size_t(g_m) * C + g_k_a] * inv_rms_s[m]) : 0.0f;
-        }
-
-        uint32_t n = tid & 63u;
-        uint32_t g_n = block_n + n;
-        #pragma unroll
-        for (uint32_t k_sub_b = (tid >> 6); k_sub_b < 16u; k_sub_b += 4u) {
-            uint32_t g_k_b = k0 + k_sub_b;
-            Bs[k_sub_b][n] = (g_k_b < C && g_n < C) ? W[size_t(g_k_b) * C + g_n] : 0.0f;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int kk = 0; kk < 16; ++kk) {
-            float a_reg[4], b_reg[4];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) a_reg[i] = As[kk][i * 16 + ty];
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) b_reg[j] = Bs[kk][j * 16 + tx];
-            #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    acc[i][j] = fmaf(a_reg[i], b_reg[j], acc[i][j]);
-                }
-            }
-        }
-        __syncthreads();
-    }
-
-    float bias_reg[4];
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        uint32_t col = block_n + uint32_t(j * 16) + tx;
-        bias_reg[j] = (bias && col < C) ? __ldg(&bias[col]) : 0.0f;
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        uint32_t row = block_m + uint32_t(i * 16) + ty;
-        if (row >= N) continue;
-        uint32_t b_idx = row / T;
-        uint32_t t_idx = row - b_idx * T;
-        #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            uint32_t col = block_n + uint32_t(j * 16) + tx;
-            if (col >= C) continue;
-            float val = acc[i][j] + bias_reg[j];
-            if (write_bhtd) {
-                uint32_t h_idx = col / D;
-                uint32_t d_idx = col - h_idx * D;
-                dst[((size_t(b_idx) * H + h_idx) * T + t_idx) * D + d_idx] = val;
-            } else {
-                dst[size_t(row) * C + col] = val;
-            }
         }
     }
 }
@@ -1973,5 +1632,698 @@ __global__ void adamw_mini8bit_step_kernel(
             rounded = down + float(u < (x - down));
         }
         m_state[j] = static_cast<uint8_t>(fminf(fmaxf(rounded + zero, 0.0f), 255.0f));
+    }
+}
+
+__global__ __launch_bounds__(256, 2) void fused_linear_add_128_kernel(
+    const float* x, const float* __restrict__ act, const float* __restrict__ w,
+    const float* __restrict__ b, float* out, uint32_t M, uint32_t N, uint32_t K
+) {
+    cuda_sgemm_128x128x8_impl<false, false, true>(act, w, x, b, out, M, N, K, 0u, 0u);
+}
+
+__global__ __launch_bounds__(256, 3) void fused_linear_add_forward_kernel(
+    const float* x, const float* __restrict__ act, const float* __restrict__ w,
+    const float* __restrict__ b, float* out, uint32_t M, uint32_t N, uint32_t K
+) {
+    cuda_sgemm_64x64x8_impl<false, false, true>(act, w, x, b, out, M, N, K, 0u, 0u);
+}
+
+__global__ __launch_bounds__(256, 2) void fused_wgu_swiglu_128_kernel(
+    const float* __restrict__ x_norm,
+    const float* __restrict__ wgu,
+    float* __restrict__ hidden,
+    uint32_t M, uint32_t H, uint32_t K
+) {
+    constexpr uint32_t BM = 128u;
+    constexpr uint32_t BH = 64u;
+    constexpr uint32_t BK = 8u;
+    constexpr uint32_t PAD = 4u;
+
+    uint32_t pid_m, pid_h;
+    gemm_swizzle_cta<8u>(blockIdx.x, blockIdx.y, gridDim.x, gridDim.y, pid_m, pid_h);
+    const uint32_t block_m = pid_m * BM;
+    const uint32_t block_h = pid_h * BH;
+    if (block_m >= M || block_h >= H || K == 0u) return;
+
+    const size_t H2 = size_t(H) * 2u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t m0 = (warp_id >> 2) * 64u + (lane >> 2) * 4u;
+    const uint32_t m1 = m0 + 32u;
+    const uint32_t n0 = (warp_id & 3u) * 16u + (lane & 3u) * 4u; // Gate [0..63]
+    const uint32_t n1 = n0 + 64u;                                // Up   [64..127]
+
+    __shared__ alignas(16) float As[2][BK][BM + PAD];
+    __shared__ alignas(16) float Bs[2][BK][128u + PAD];
+
+    const bool vec_a = ((K & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(x_norm) & 15u) == 0u);
+    const bool vec_b = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(wgu) & 15u) == 0u);
+    const bool vec_h = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(hidden) & 15u) == 0u);
+
+    auto load_a = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        const uint32_t r = tid >> 1;
+        const uint32_t c = (tid & 1u) * 4u;
+        const uint32_t gm = block_m + r;
+        const uint32_t gk = k0 + c;
+        if (gm >= M) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const size_t base = size_t(gm) * K;
+        if (vec_a && gk + 4u <= K) return *reinterpret_cast<const float4*>(x_norm + base + gk);
+        return make_float4(
+            (gk + 0u < K) ? x_norm[base + gk + 0u] : 0.0f,
+            (gk + 1u < K) ? x_norm[base + gk + 1u] : 0.0f,
+            (gk + 2u < K) ? x_norm[base + gk + 2u] : 0.0f,
+            (gk + 3u < K) ? x_norm[base + gk + 3u] : 0.0f);
+    };
+
+    auto store_a = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+        const uint32_t r = tid >> 1;
+        const uint32_t c = (tid & 1u) * 4u;
+        As[stage][c + 0u][r] = v.x;
+        As[stage][c + 1u][r] = v.y;
+        As[stage][c + 2u][r] = v.z;
+        As[stage][c + 3u][r] = v.w;
+    };
+
+    auto load_b = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        const uint32_t b_k = tid >> 5;
+        const uint32_t b_slot = (tid & 31u) * 4u;
+        const uint32_t gk = k0 + b_k;
+        if (gk >= K) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const bool is_up = (b_slot >= 64u);
+        const uint32_t col_h = block_h + (is_up ? (b_slot - 64u) : b_slot);
+        const size_t base = size_t(gk) * H2 + (is_up ? size_t(H) : 0u);
+        if (vec_b && col_h + 4u <= H) return *reinterpret_cast<const float4*>(wgu + base + col_h);
+        return make_float4(
+            (col_h + 0u < H) ? wgu[base + col_h + 0u] : 0.0f,
+            (col_h + 1u < H) ? wgu[base + col_h + 1u] : 0.0f,
+            (col_h + 2u < H) ? wgu[base + col_h + 2u] : 0.0f,
+            (col_h + 3u < H) ? wgu[base + col_h + 3u] : 0.0f);
+    };
+
+    float acc[8][8] = {0.0f};
+    const uint32_t total_kt = (K + BK - 1u) / BK;
+
+    float4 ldg_a = load_a(0u);
+    float4 ldg_b = load_b(0u);
+    store_a(0u, ldg_a);
+    *reinterpret_cast<float4*>(&Bs[0][tid >> 5][(tid & 31u) * 4u]) = ldg_b;
+    __syncthreads();
+
+    uint32_t read_stage = 0u;
+    for (uint32_t kt = 0u; kt < total_kt; ++kt) {
+        const uint32_t next_kt = kt + 1u;
+        if (next_kt < total_kt) {
+            ldg_a = load_a(next_kt * BK);
+            ldg_b = load_b(next_kt * BK);
+        }
+
+        float4 fa0[2], fa1[2], fb0[2], fb1[2];
+        fa0[0] = *reinterpret_cast<const float4*>(&As[read_stage][0][m0]);
+        fa1[0] = *reinterpret_cast<const float4*>(&As[read_stage][0][m1]);
+        fb0[0] = *reinterpret_cast<const float4*>(&Bs[read_stage][0][n0]);
+        fb1[0] = *reinterpret_cast<const float4*>(&Bs[read_stage][0][n1]);
+
+        #pragma unroll
+        for (int kk = 0; kk < int(BK); ++kk) {
+            if (kk + 1 < int(BK)) {
+                const int rn = (kk + 1) & 1;
+                fa0[rn] = *reinterpret_cast<const float4*>(&As[read_stage][kk + 1][m0]);
+                fa1[rn] = *reinterpret_cast<const float4*>(&As[read_stage][kk + 1][m1]);
+                fb0[rn] = *reinterpret_cast<const float4*>(&Bs[read_stage][kk + 1][n0]);
+                fb1[rn] = *reinterpret_cast<const float4*>(&Bs[read_stage][kk + 1][n1]);
+            }
+            const int rc = kk & 1;
+            gemm_fma_8x8(acc, fa0[rc], fa1[rc], fb0[rc], fb1[rc]);
+        }
+
+        if (next_kt < total_kt) {
+            const uint32_t write_stage = read_stage ^ 1u;
+            store_a(write_stage, ldg_a);
+            *reinterpret_cast<float4*>(&Bs[write_stage][tid >> 5][(tid & 31u) * 4u]) = ldg_b;
+            __syncthreads();
+            read_stage = write_stage;
+        }
+    }
+
+    const uint32_t col_base = block_h + n0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t row = block_m + ((i < 4) ? (m0 + uint32_t(i)) : (m1 + uint32_t(i - 4)));
+        if (row >= M) continue;
+        float out_v[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float g = acc[i][j];
+            float u = acc[i][j + 4];
+            out_v[j] = (g / (1.0f + expf(-g))) * u;
+        }
+        const size_t row_off = size_t(row) * H + col_base;
+        if (vec_h && col_base + 4u <= H) {
+            *reinterpret_cast<float4*>(hidden + row_off) = make_float4(out_v[0], out_v[1], out_v[2], out_v[3]);
+        } else {
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                if (col_base + uint32_t(j) < H) hidden[row_off + uint32_t(j)] = out_v[j];
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 3) void fused_wgu_swiglu_forward_kernel(
+    const float* __restrict__ x_norm,
+    const float* __restrict__ wgu,
+    float* __restrict__ hidden,
+    uint32_t M, uint32_t H, uint32_t K
+) {
+    constexpr uint32_t BM = 64u;
+    constexpr uint32_t BH = 32u;
+    constexpr uint32_t BK = 8u;
+    constexpr uint32_t PAD = 4u;
+
+    uint32_t pid_m, pid_h;
+    gemm_swizzle_cta<8u>(blockIdx.x, blockIdx.y, gridDim.x, gridDim.y, pid_m, pid_h);
+    const uint32_t block_m = pid_m * BM;
+    const uint32_t block_h = pid_h * BH;
+    if (block_m >= M || block_h >= H || K == 0u) return;
+
+    const size_t H2 = size_t(H) * 2u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t m0 = (warp_id >> 2) * 32u + (lane >> 2) * 4u;
+    const uint32_t h0 = (warp_id & 3u) * 8u + (lane & 3u) * 2u;
+
+    __shared__ alignas(16) float As[2][BK][BM + PAD];
+    __shared__ alignas(16) float Bs[2][BK][64u + PAD];
+
+    const bool vec_a = ((K & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(x_norm) & 15u) == 0u);
+    const bool vec_b = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(wgu) & 15u) == 0u);
+
+    auto load_ab = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        if (tid < 128u) {
+            const uint32_t r = tid >> 1;
+            const uint32_t c = (tid & 1u) * 4u;
+            const uint32_t gm = block_m + r;
+            const uint32_t gk = k0 + c;
+            if (gm >= M) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const size_t base = size_t(gm) * K;
+            if (vec_a && gk + 4u <= K) return *reinterpret_cast<const float4*>(x_norm + base + gk);
+            return make_float4(
+                (gk + 0u < K) ? x_norm[base + gk + 0u] : 0.0f,
+                (gk + 1u < K) ? x_norm[base + gk + 1u] : 0.0f,
+                (gk + 2u < K) ? x_norm[base + gk + 2u] : 0.0f,
+                (gk + 3u < K) ? x_norm[base + gk + 3u] : 0.0f);
+        } else {
+            const uint32_t ltid = tid - 128u;
+            const uint32_t b_k = ltid >> 4;
+            const uint32_t b_slot = (ltid & 15u) * 4u;
+            const uint32_t gk = k0 + b_k;
+            if (gk >= K) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const bool is_up = (b_slot >= 32u);
+            const uint32_t col_h = block_h + (is_up ? (b_slot - 32u) : b_slot);
+            const size_t base = size_t(gk) * H2 + (is_up ? size_t(H) : 0u);
+            if (vec_b && col_h + 4u <= H) return *reinterpret_cast<const float4*>(wgu + base + col_h);
+            return make_float4(
+                (col_h + 0u < H) ? wgu[base + col_h + 0u] : 0.0f,
+                (col_h + 1u < H) ? wgu[base + col_h + 1u] : 0.0f,
+                (col_h + 2u < H) ? wgu[base + col_h + 2u] : 0.0f,
+                (col_h + 3u < H) ? wgu[base + col_h + 3u] : 0.0f);
+        }
+    };
+
+    auto store_ab = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+        if (tid < 128u) {
+            const uint32_t r = tid >> 1;
+            const uint32_t c = (tid & 1u) * 4u;
+            As[stage][c + 0u][r] = v.x;
+            As[stage][c + 1u][r] = v.y;
+            As[stage][c + 2u][r] = v.z;
+            As[stage][c + 3u][r] = v.w;
+        } else {
+            const uint32_t ltid = tid - 128u;
+            *reinterpret_cast<float4*>(&Bs[stage][ltid >> 4][(ltid & 15u) * 4u]) = v;
+        }
+    };
+
+    float acc_g[4][2] = {0.0f};
+    float acc_u[4][2] = {0.0f};
+    const uint32_t total_kt = (K + BK - 1u) / BK;
+
+    float4 ldg_v = load_ab(0u);
+    store_ab(0u, ldg_v);
+    __syncthreads();
+
+    uint32_t read_stage = 0u;
+    for (uint32_t kt = 0u; kt < total_kt; ++kt) {
+        const uint32_t next_kt = kt + 1u;
+        if (next_kt < total_kt) ldg_v = load_ab(next_kt * BK);
+
+        #pragma unroll
+        for (int kk = 0; kk < int(BK); ++kk) {
+            const float4 fa = *reinterpret_cast<const float4*>(&As[read_stage][kk][m0]);
+            const float2 fg = *reinterpret_cast<const float2*>(&Bs[read_stage][kk][h0]);
+            const float2 fu = *reinterpret_cast<const float2*>(&Bs[read_stage][kk][32u + h0]);
+            const float av[4] = {fa.x, fa.y, fa.z, fa.w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc_g[i][0] = fmaf(av[i], fg.x, acc_g[i][0]);
+                acc_g[i][1] = fmaf(av[i], fg.y, acc_g[i][1]);
+                acc_u[i][0] = fmaf(av[i], fu.x, acc_u[i][0]);
+                acc_u[i][1] = fmaf(av[i], fu.y, acc_u[i][1]);
+            }
+        }
+
+        if (next_kt < total_kt) {
+            const uint32_t write_stage = read_stage ^ 1u;
+            store_ab(write_stage, ldg_v);
+            __syncthreads();
+            read_stage = write_stage;
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t row = block_m + m0 + uint32_t(i);
+        if (row >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint32_t col = block_h + h0 + uint32_t(j);
+            if (col >= H) continue;
+            float g = acc_g[i][j];
+            float u = acc_u[i][j];
+            hidden[size_t(row) * H + col] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 2) void fused_rms_fa_qkv_128_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wq, const float* __restrict__ bq,
+    const float* __restrict__ wk, const float* __restrict__ bk,
+    const float* __restrict__ wv, const float* __restrict__ bv,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    uint32_t B, uint32_t T, uint32_t C, uint32_t H,
+    uint32_t eps_bits, uint32_t q_bthd
+) {
+    constexpr uint32_t BM = 128u;
+    constexpr uint32_t BN = 128u;
+    constexpr uint32_t BK = 8u;
+    constexpr uint32_t PAD = 4u;
+
+    const uint32_t proj_id = blockIdx.z;
+    const uint32_t N = B * T;
+    if (proj_id >= 3u || H == 0u || C == 0u || (C % H) != 0u) return;
+
+    uint32_t pid_m, pid_n;
+    gemm_swizzle_cta<8u>(blockIdx.x, blockIdx.y, gridDim.x, gridDim.y, pid_m, pid_n);
+    const uint32_t block_m = pid_m * BM;
+    const uint32_t block_n = pid_n * BN;
+    if (block_m >= N || block_n >= C) return;
+
+    const uint32_t D = C / H;
+    const float eps = __uint_as_float(eps_bits);
+    const float* W = (proj_id == 0u) ? wq : ((proj_id == 1u) ? wk : wv);
+    const float* bias = (proj_id == 0u) ? bq : ((proj_id == 1u) ? bk : bv);
+    float* dst = (proj_id == 0u) ? q_out : ((proj_id == 1u) ? k_out : v_out);
+    const bool write_bhtd = (proj_id != 0u) || (q_bthd == 0u);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t m0 = (warp_id >> 2) * 64u + (lane >> 2) * 4u;
+    const uint32_t m1 = m0 + 32u;
+    const uint32_t n0 = (warp_id & 3u) * 32u + (lane & 3u) * 4u;
+    const uint32_t n1 = n0 + 16u;
+
+    __shared__ alignas(16) float As[2][BK][BM + PAD];
+    __shared__ alignas(16) float Bs[2][BK][BN + PAD];
+    __shared__ float inv_rms_s[BM];
+
+    const bool vec_x = ((C & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u);
+    const bool vec_w = ((C & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(W) & 15u) == 0u);
+
+    for (uint32_t r = warp_id; r < BM; r += 8u) {
+        const uint32_t gm = block_m + r;
+        float sum_sq = 0.0f;
+        if (gm < N) {
+            const float* x_row = x + size_t(gm) * C;
+            if (vec_x) {
+                const float4* x4 = reinterpret_cast<const float4*>(x_row);
+                const uint32_t c4 = C >> 2;
+                for (uint32_t i = lane; i < c4; i += 32u) {
+                    float4 v = x4[i];
+                    sum_sq = fmaf(v.x, v.x, sum_sq);
+                    sum_sq = fmaf(v.y, v.y, sum_sq);
+                    sum_sq = fmaf(v.z, v.z, sum_sq);
+                    sum_sq = fmaf(v.w, v.w, sum_sq);
+                }
+            } else {
+                for (uint32_t c = lane; c < C; c += 32u) {
+                    float v = x_row[c];
+                    sum_sq = fmaf(v, v, sum_sq);
+                }
+            }
+            sum_sq = warp_allreduce_sum(sum_sq);
+        }
+        if (lane == 0u) inv_rms_s[r] = (gm < N) ? rsqrtf(sum_sq / float(C) + eps) : 0.0f;
+    }
+    __syncthreads();
+
+    auto load_a = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        const uint32_t r = tid >> 1;
+        const uint32_t c = (tid & 1u) * 4u;
+        const uint32_t gm = block_m + r;
+        const uint32_t gk = k0 + c;
+        if (gm >= N) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float s = inv_rms_s[r];
+        const size_t base = size_t(gm) * C;
+        if (vec_x && gk + 4u <= C) {
+            float4 v = *reinterpret_cast<const float4*>(x + base + gk);
+            return make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+        }
+        return make_float4(
+            (gk + 0u < C) ? (x[base + gk + 0u] * s) : 0.0f,
+            (gk + 1u < C) ? (x[base + gk + 1u] * s) : 0.0f,
+            (gk + 2u < C) ? (x[base + gk + 2u] * s) : 0.0f,
+            (gk + 3u < C) ? (x[base + gk + 3u] * s) : 0.0f);
+    };
+
+    auto store_a = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+        const uint32_t r = tid >> 1;
+        const uint32_t c = (tid & 1u) * 4u;
+        As[stage][c + 0u][r] = v.x;
+        As[stage][c + 1u][r] = v.y;
+        As[stage][c + 2u][r] = v.z;
+        As[stage][c + 3u][r] = v.w;
+    };
+
+    auto load_b = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        const uint32_t r = tid >> 5;
+        const uint32_t c = (tid & 31u) * 4u;
+        const uint32_t gk = k0 + r;
+        const uint32_t gn = block_n + c;
+        if (gk >= C) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const size_t base = size_t(gk) * C;
+        if (vec_w && gn + 4u <= C) return *reinterpret_cast<const float4*>(W + base + gn);
+        return make_float4(
+            (gn + 0u < C) ? W[base + gn + 0u] : 0.0f,
+            (gn + 1u < C) ? W[base + gn + 1u] : 0.0f,
+            (gn + 2u < C) ? W[base + gn + 2u] : 0.0f,
+            (gn + 3u < C) ? W[base + gn + 3u] : 0.0f);
+    };
+
+    float acc[8][8] = {0.0f};
+    const uint32_t total_kt = (C + BK - 1u) / BK;
+
+    float4 ldg_a = load_a(0u);
+    float4 ldg_b = load_b(0u);
+    store_a(0u, ldg_a);
+    *reinterpret_cast<float4*>(&Bs[0][tid >> 5][(tid & 31u) * 4u]) = ldg_b;
+    __syncthreads();
+
+    uint32_t read_stage = 0u;
+    for (uint32_t kt = 0u; kt < total_kt; ++kt) {
+        const uint32_t next_kt = kt + 1u;
+        if (next_kt < total_kt) {
+            ldg_a = load_a(next_kt * BK);
+            ldg_b = load_b(next_kt * BK);
+        }
+
+        float4 fa0[2], fa1[2], fb0[2], fb1[2];
+        fa0[0] = *reinterpret_cast<const float4*>(&As[read_stage][0][m0]);
+        fa1[0] = *reinterpret_cast<const float4*>(&As[read_stage][0][m1]);
+        fb0[0] = *reinterpret_cast<const float4*>(&Bs[read_stage][0][n0]);
+        fb1[0] = *reinterpret_cast<const float4*>(&Bs[read_stage][0][n1]);
+
+        #pragma unroll
+        for (int kk = 0; kk < int(BK); ++kk) {
+            if (kk + 1 < int(BK)) {
+                const int rn = (kk + 1) & 1;
+                fa0[rn] = *reinterpret_cast<const float4*>(&As[read_stage][kk + 1][m0]);
+                fa1[rn] = *reinterpret_cast<const float4*>(&As[read_stage][kk + 1][m1]);
+                fb0[rn] = *reinterpret_cast<const float4*>(&Bs[read_stage][kk + 1][n0]);
+                fb1[rn] = *reinterpret_cast<const float4*>(&Bs[read_stage][kk + 1][n1]);
+            }
+            const int rc = kk & 1;
+            gemm_fma_8x8(acc, fa0[rc], fa1[rc], fb0[rc], fb1[rc]);
+        }
+
+        if (next_kt < total_kt) {
+            const uint32_t write_stage = read_stage ^ 1u;
+            store_a(write_stage, ldg_a);
+            *reinterpret_cast<float4*>(&Bs[write_stage][tid >> 5][(tid & 31u) * 4u]) = ldg_b;
+            __syncthreads();
+            read_stage = write_stage;
+        }
+    }
+
+    float bias_reg[8] = {0.0f};
+    if (bias) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t c0 = block_n + n0 + uint32_t(j);
+            uint32_t c1 = block_n + n1 + uint32_t(j);
+            bias_reg[j]     = (c0 < C) ? __ldg(&bias[c0]) : 0.0f;
+            bias_reg[j + 4] = (c1 < C) ? __ldg(&bias[c1]) : 0.0f;
+        }
+    }
+
+    const bool dst_aligned = ((reinterpret_cast<uintptr_t>(dst) & 15u) == 0u);
+    const bool vec_bhtd = dst_aligned && ((D & 3u) == 0u);
+    const bool vec_btc = dst_aligned && ((C & 3u) == 0u);
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t row = block_m + ((i < 4) ? (m0 + uint32_t(i)) : (m1 + uint32_t(i - 4)));
+        if (row >= N) continue;
+        const uint32_t b_idx = row / T;
+        const uint32_t t_idx = row - b_idx * T;
+
+        #pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const uint32_t col_base = block_n + ((q == 0) ? n0 : n1);
+            const int jb = q * 4;
+            float4 v4 = make_float4(
+                acc[i][jb]     + bias_reg[jb],
+                acc[i][jb + 1] + bias_reg[jb + 1],
+                acc[i][jb + 2] + bias_reg[jb + 2],
+                acc[i][jb + 3] + bias_reg[jb + 3]);
+
+            if (write_bhtd) {
+                if (vec_bhtd && col_base + 4u <= C) {
+                    const uint32_t h_idx = col_base / D;
+                    const uint32_t d_idx = col_base - h_idx * D;
+                    *reinterpret_cast<float4*>(
+                        dst + ((size_t(b_idx) * H + h_idx) * T + t_idx) * D + d_idx) = v4;
+                } else {
+                    const float vals[4] = {v4.x, v4.y, v4.z, v4.w};
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint32_t col = col_base + uint32_t(j);
+                        if (col < C) {
+                            const uint32_t h_idx = col / D;
+                            const uint32_t d_idx = col - h_idx * D;
+                            dst[((size_t(b_idx) * H + h_idx) * T + t_idx) * D + d_idx] = vals[j];
+                        }
+                    }
+                }
+            } else if (vec_btc && col_base + 4u <= C) {
+                *reinterpret_cast<float4*>(dst + size_t(row) * C + col_base) = v4;
+            } else {
+                const float vals[4] = {v4.x, v4.y, v4.z, v4.w};
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    if (col_base + uint32_t(j) < C) dst[size_t(row) * C + col_base + uint32_t(j)] = vals[j];
+                }
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(256, 3) void fused_rms_fa_qkv_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ wq, const float* __restrict__ bq,
+    const float* __restrict__ wk, const float* __restrict__ bk,
+    const float* __restrict__ wv, const float* __restrict__ bv,
+    float* __restrict__ q_out,
+    float* __restrict__ k_out,
+    float* __restrict__ v_out,
+    uint32_t B, uint32_t T, uint32_t C, uint32_t H,
+    uint32_t eps_bits, uint32_t q_bthd
+) {
+    constexpr uint32_t BM = 64u;
+    constexpr uint32_t BN = 64u;
+    constexpr uint32_t BK = 8u;
+    constexpr uint32_t PAD = 4u;
+
+    const uint32_t proj_id = blockIdx.z;
+    const uint32_t N = B * T;
+    if (proj_id >= 3u || H == 0u || C == 0u || (C % H) != 0u) return;
+
+    uint32_t pid_m, pid_n;
+    gemm_swizzle_cta<8u>(blockIdx.x, blockIdx.y, gridDim.x, gridDim.y, pid_m, pid_n);
+    const uint32_t block_m = pid_m * BM;
+    const uint32_t block_n = pid_n * BN;
+    if (block_m >= N || block_n >= C) return;
+
+    const uint32_t D = C / H;
+    const float eps = __uint_as_float(eps_bits);
+    const float* W = (proj_id == 0u) ? wq : ((proj_id == 1u) ? wk : wv);
+    const float* bias = (proj_id == 0u) ? bq : ((proj_id == 1u) ? bk : bv);
+    float* dst = (proj_id == 0u) ? q_out : ((proj_id == 1u) ? k_out : v_out);
+    const bool write_bhtd = (proj_id != 0u) || (q_bthd == 0u);
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t m0 = (warp_id >> 2) * 32u + (lane >> 2) * 4u;
+    const uint32_t n0 = (warp_id & 3u) * 16u + (lane & 3u) * 4u;
+
+    __shared__ alignas(16) float As[2][BK][BM + PAD];
+    __shared__ alignas(16) float Bs[2][BK][BN + PAD];
+    __shared__ float inv_rms_s[BM];
+
+    const bool vec_x = ((C & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(x) & 15u) == 0u);
+    const bool vec_w = ((C & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(W) & 15u) == 0u);
+
+    for (uint32_t r = warp_id; r < BM; r += 8u) {
+        const uint32_t gm = block_m + r;
+        float sum_sq = 0.0f;
+        if (gm < N) {
+            const float* x_row = x + size_t(gm) * C;
+            for (uint32_t c = lane; c < C; c += 32u) {
+                float v = x_row[c];
+                sum_sq = fmaf(v, v, sum_sq);
+            }
+            sum_sq = warp_allreduce_sum(sum_sq);
+        }
+        if (lane == 0u) inv_rms_s[r] = (gm < N) ? rsqrtf(sum_sq / float(C) + eps) : 0.0f;
+    }
+    __syncthreads();
+
+    auto load_ab = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+        if (tid < 128u) {
+            const uint32_t r = tid >> 1;
+            const uint32_t c = (tid & 1u) * 4u;
+            const uint32_t gm = block_m + r;
+            const uint32_t gk = k0 + c;
+            if (gm >= N) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const float s = inv_rms_s[r];
+            const size_t base = size_t(gm) * C;
+            if (vec_x && gk + 4u <= C) {
+                float4 v = *reinterpret_cast<const float4*>(x + base + gk);
+                return make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+            }
+            return make_float4(
+                (gk + 0u < C) ? (x[base + gk + 0u] * s) : 0.0f,
+                (gk + 1u < C) ? (x[base + gk + 1u] * s) : 0.0f,
+                (gk + 2u < C) ? (x[base + gk + 2u] * s) : 0.0f,
+                (gk + 3u < C) ? (x[base + gk + 3u] * s) : 0.0f);
+        } else {
+            const uint32_t ltid = tid - 128u;
+            const uint32_t r = ltid >> 4;
+            const uint32_t c = (ltid & 15u) * 4u;
+            const uint32_t gk = k0 + r;
+            const uint32_t gn = block_n + c;
+            if (gk >= C) return make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            const size_t base = size_t(gk) * C;
+            if (vec_w && gn + 4u <= C) return *reinterpret_cast<const float4*>(W + base + gn);
+            return make_float4(
+                (gn + 0u < C) ? W[base + gn + 0u] : 0.0f,
+                (gn + 1u < C) ? W[base + gn + 1u] : 0.0f,
+                (gn + 2u < C) ? W[base + gn + 2u] : 0.0f,
+                (gn + 3u < C) ? W[base + gn + 3u] : 0.0f);
+        }
+    };
+
+    auto store_ab = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+        if (tid < 128u) {
+            const uint32_t r = tid >> 1;
+            const uint32_t c = (tid & 1u) * 4u;
+            As[stage][c + 0u][r] = v.x;
+            As[stage][c + 1u][r] = v.y;
+            As[stage][c + 2u][r] = v.z;
+            As[stage][c + 3u][r] = v.w;
+        } else {
+            const uint32_t ltid = tid - 128u;
+            *reinterpret_cast<float4*>(&Bs[stage][ltid >> 4][(ltid & 15u) * 4u]) = v;
+        }
+    };
+
+    float acc[4][4] = {0.0f};
+    const uint32_t total_kt = (C + BK - 1u) / BK;
+
+    float4 ldg_v = load_ab(0u);
+    store_ab(0u, ldg_v);
+    __syncthreads();
+
+    uint32_t read_stage = 0u;
+    for (uint32_t kt = 0u; kt < total_kt; ++kt) {
+        const uint32_t next_kt = kt + 1u;
+        if (next_kt < total_kt) ldg_v = load_ab(next_kt * BK);
+
+        float4 fa[2], fb[2];
+        fa[0] = *reinterpret_cast<const float4*>(&As[read_stage][0][m0]);
+        fb[0] = *reinterpret_cast<const float4*>(&Bs[read_stage][0][n0]);
+
+        #pragma unroll
+        for (int kk = 0; kk < int(BK); ++kk) {
+            if (kk + 1 < int(BK)) {
+                const int rn = (kk + 1) & 1;
+                fa[rn] = *reinterpret_cast<const float4*>(&As[read_stage][kk + 1][m0]);
+                fb[rn] = *reinterpret_cast<const float4*>(&Bs[read_stage][kk + 1][n0]);
+            }
+            const int rc = kk & 1;
+            const float av[4] = {fa[rc].x, fa[rc].y, fa[rc].z, fa[rc].w};
+            const float bv[4] = {fb[rc].x, fb[rc].y, fb[rc].z, fb[rc].w};
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+                }
+            }
+        }
+
+        if (next_kt < total_kt) {
+            const uint32_t write_stage = read_stage ^ 1u;
+            store_ab(write_stage, ldg_v);
+            __syncthreads();
+            read_stage = write_stage;
+        }
+    }
+
+    float bias_reg[4] = {0.0f};
+    if (bias) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint32_t col = block_n + n0 + uint32_t(j);
+            bias_reg[j] = (col < C) ? __ldg(&bias[col]) : 0.0f;
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t row = block_m + m0 + uint32_t(i);
+        if (row >= N) continue;
+        const uint32_t b_idx = row / T;
+        const uint32_t t_idx = row - b_idx * T;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const uint32_t col = block_n + n0 + uint32_t(j);
+            if (col >= C) continue;
+            float val = acc[i][j] + bias_reg[j];
+            if (write_bhtd) {
+                const uint32_t h_idx = col / D;
+                const uint32_t d_idx = col - h_idx * D;
+                dst[((size_t(b_idx) * H + h_idx) * T + t_idx) * D + d_idx] = val;
+            } else {
+                dst[size_t(row) * C + col] = val;
+            }
+        }
     }
 }

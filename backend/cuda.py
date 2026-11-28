@@ -13,6 +13,7 @@ class CudaBackend(Backend):
 		super().__init__()
 		import cuda_ext
 		self.ctx = cuda_ext.get_ctx()
+		self._num_sms = int(self.ctx.num_sms())
 		self._rollout_cache = None
 		self._rollout_cache_dirty = True
 		self.forward_kernels = {
@@ -233,10 +234,10 @@ class CudaBackend(Backend):
 		N = w.shape[-1]
 		b_id = b.storage.ptr.buffer_id if b is not None else 0
 		b_off = b.storage.ptr.offset if b is not None else 0
-		self.ctx.dispatch("fused_linear_add_forward_kernel",
+		self.ctx.dispatch("fused_linear_add_128_kernel",
 			[x.storage.ptr.buffer_id, act.storage.ptr.buffer_id, w.storage.ptr.buffer_id, b_id, out.storage.ptr.buffer_id],
 			[x.storage.ptr.offset, act.storage.ptr.offset, w.storage.ptr.offset, b_off, out.storage.ptr.offset],
-			[M, N, K], (N+63) // 64, (M+63)//64, 1, 256)
+			[M, N, K], (N+127)//128, (M+127)//128, 1, 256)
 
 	def cuda_fused_linear_add_backward(self, inputs, outputs, scratch=None):
 		x, act, w, b = inputs
@@ -256,11 +257,12 @@ class CudaBackend(Backend):
 			else:
 				act_storage = act.storage
 			dw_bf16 = int(np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16))
-			self.ctx.dispatch("cuda_sgemm_tn_kernel",
+			dw_conf = scratch.gemm_configs["dw"]
+			self.ctx.dispatch(dw_conf["kernel"],
 				[act_storage.ptr.buffer_id, out.grad.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 				[act_storage.ptr.offset, out.grad.storage.ptr.offset, w.grad.storage.ptr.offset],
 				[K, N, M, accumulate, dw_bf16],
-				(N + 63) // 64, (K + 63) // 64, 1, 256)
+				(N + dw_conf["bn"] - 1) // dw_conf["bn"], (K + dw_conf["bm"] - 1) // dw_conf["bm"], dw_conf["split_k"], 256)
 
 		# 2. dx = dO
 		if x.requires_grad:
@@ -283,10 +285,14 @@ class CudaBackend(Backend):
 		# 3. dAct = dO[M, N] @ W^T[N, K]
 		if act.requires_grad:
 			accum_act = int(act.op is None and bool(accumulate))
-			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+			dact_conf = scratch.gemm_configs["dact"]
+			if dact_conf["split_k"] > 1 and not accum_act:
+				self.ctx.memset_zero(act.grad.storage.ptr.buffer_id, act.grad.storage.ptr.offset, M * K * 4)
+			self.ctx.dispatch(dact_conf["kernel"],
 				[out.grad.storage.ptr.buffer_id, w.storage.ptr.buffer_id, act.grad.storage.ptr.buffer_id],
 				[out.grad.storage.ptr.offset, w.storage.ptr.offset, act.grad.storage.ptr.offset],
-				[M, K, N, accum_act], (K + 63) // 64, (M + 63) // 64, 1, 256)
+				[M, K, N, accum_act],
+				(K + dact_conf["bn"] - 1) // dact_conf["bn"], (M + dact_conf["bm"] - 1) // dact_conf["bm"], dact_conf["split_k"], 256) 
 
 		# 4. db = sum(dO, axis=0)
 		if b is not None and b.requires_grad:
@@ -321,16 +327,20 @@ class CudaBackend(Backend):
 			[N, C, eps_bits], (N+3)//4, 1, 1, 128)
 
 		# 2. HIDDEN = SiLU(X_norm @ W_gate) * (X_norm @ W_up) -> hidden
-		self.ctx.dispatch("fused_wgu_swiglu_forward_kernel",
+		self.ctx.dispatch("fused_wgu_swiglu_128_kernel",
 			[out.storage.ptr.buffer_id, wgu.storage.ptr.buffer_id, hidden.ptr.buffer_id],
 			[out.storage.ptr.offset, wgu.storage.ptr.offset, hidden.ptr.offset],
-			[N, H, C], (H + 31) // 32, (N + 63) // 64, 1, 256)
+			[N, H, C], (H+63)//64, (N + 127) // 128, 1, 256)
 
 		# 3. OUT = HIDDEN @ Wdown -> out.storage
-		self.ctx.dispatch("cuda_sgemm_nn_kernel",
+		out_conf = scratch.gemm_configs["out"]
+		if out_conf["split_k"] > 1:
+			self.ctx.memset_zero(out.storage.ptr.buffer_id, out.storage.ptr.offset, N * C * 4)
+		self.ctx.dispatch(out_conf["kernel"],
 			[hidden.ptr.buffer_id, wdown.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
 			[hidden.ptr.offset, wdown.storage.ptr.offset, out.storage.ptr.offset],
-			[N, C, H, 0], (C + 63) // 64, (N + 63) // 64, 1, 256)
+			[N, C, H, 0],
+			(C + out_conf["bn"] - 1) // out_conf["bn"], (N + out_conf["bm"] - 1) // out_conf["bm"], out_conf["split_k"], 256)
 
 	def cuda_fused_rmsnorm_mlp_backward(self, inputs, outputs, scratch=None):
 		if len(inputs) == 3:
@@ -381,10 +391,10 @@ class CudaBackend(Backend):
 			x_id, x_off = hidden.ptr.buffer_id, hidden.ptr.offset
 			work_id, work_off = hidden.ptr.buffer_id, hidden.ptr.offset + x_nbytes
 			work_floats = N * (H - C)
-			self.ctx.dispatch("fused_linear_add_forward_kernel",
+			self.ctx.dispatch("fused_linear_add_128_kernel",
 				[x_in.storage.ptr.buffer_id, gu.ptr.buffer_id, proj_w.storage.ptr.buffer_id, b_id, x_id],
 				[x_in.storage.ptr.offset, gu.ptr.offset, proj_w.storage.ptr.offset, b_off, x_off],
-				[N, C, C], (C + 63) // 64, (N + 63) // 64, 1, 256)
+				[N, C, C], (C + 127) // 128, (N + 127) // 128, 1, 256)
 		else:
 			x_id, x_off = x.storage.ptr.buffer_id, x.storage.ptr.offset
 			work_id, work_off = hidden.ptr.buffer_id, hidden.ptr.offset
@@ -397,10 +407,14 @@ class CudaBackend(Backend):
 			[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
 
 		# 2. 重算 GU = X_norm @ Wgu -> gu [N, 2H]
-		self.ctx.dispatch("cuda_sgemm_nn_kernel",
+		gu_conf = scratch.gemm_configs["gu"]
+		if gu_conf["split_k"] > 1:
+			self.ctx.memset_zero(gu.ptr.buffer_id, gu.ptr.offset, N * H2 * 4) 
+		self.ctx.dispatch(gu_conf["kernel"],
 			[work_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
 			[work_off, wgu.storage.ptr.offset, gu.ptr.offset],
-			[N, H2, C, 0], (H2 + 63) // 64, (N + 63) // 64, 1, 256)
+			[N, H2, C, 0],
+			(H2 + gu_conf["bn"] - 1) // gu_conf["bn"], (N + gu_conf["bm"] - 1) // gu_conf["bm"], gu_conf["split_k"], 256)
 
 		# 3. dWdown = HIDDEN^T @ dOUT（支持 FP32/BF16 直接累加写出）
 		if wdown.requires_grad:
@@ -413,11 +427,12 @@ class CudaBackend(Backend):
 					[gu.ptr.buffer_id, work_id],
 					[gu.ptr.offset + h0 * 4, work_off],
 					[N, H, h_sub], (h_sub + 255) // 256, min(N, 65535), 1, 256)
-				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				dw_conf = scratch.gemm_configs[("dwdown", h_sub)]
+				self.ctx.dispatch(dw_conf["kernel"],
 					[work_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
 					[work_off, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset + h0 * C * dwdown_itemsize],
 					[h_sub, C, N, accumulate, dwdown_bf16],
-					(C + 63) // 64, (h_sub + 63) // 64, 1, 256)
+					(C + dw_conf["bn"] - 1) // dw_conf["bn"], (h_sub + dw_conf["bm"] - 1) // dw_conf["bm"], dw_conf["split_k"], 256)
 
 		if not (wgu.requires_grad or x.requires_grad or need_dgamma):
 			return
@@ -426,10 +441,14 @@ class CudaBackend(Backend):
 		chunk_rows = max(1, work_floats // H)
 		for r0 in range(0, N, chunk_rows):
 			rows = min(chunk_rows, N - r0)
-			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+			dh_conf = scratch.gemm_configs[("dhidden", rows)]
+			if dh_conf["split_k"] > 1:
+				self.ctx.memset_zero(work_id, work_off, rows * H * 4)
+			self.ctx.dispatch(dh_conf["kernel"],
 				[out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, work_id],
 				[out.grad.storage.ptr.offset + r0 * C * 4, wdown.storage.ptr.offset, work_off],
-				[rows, H, C, 0], (H + 63) // 64, (rows + 63) // 64, 1, 256)
+				[rows, H, C, 0],
+				(H + dh_conf["bn"] - 1) // dh_conf["bn"], (rows + dh_conf["bm"] - 1) // dh_conf["bm"], dh_conf["split_k"], 256)
 			self.ctx.dispatch("swiglu_backward_inplace_kernel",
 				[gu.ptr.buffer_id, work_id],
 				[gu.ptr.offset + r0 * H2 * 4, work_off],
@@ -442,18 +461,23 @@ class CudaBackend(Backend):
 				[x_off, gamma_off, work_off],
 				[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
 			dwgu_bf16 = int(np.dtype(wgu.grad.storage.dtype) == np.dtype(np.uint16))
-			self.ctx.dispatch("cuda_sgemm_tn_kernel",
+			dwgu_conf = scratch.gemm_configs["dwgu"]
+			self.ctx.dispatch(dwgu_conf["kernel"],
 				[work_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
 				[work_off, gu.ptr.offset, wgu.grad.storage.ptr.offset],
 				[C, H2, N, accumulate, dwgu_bf16],
-				(H2 + 63) // 64, (C + 63) // 64, 1, 256)
+				(H2 + dwgu_conf["bn"] - 1) // dwgu_conf["bn"], (C + dwgu_conf["bm"] - 1) // dwgu_conf["bm"], dwgu_conf["split_k"], 256)
 
 		# 7. dX_norm = dGU @ Wgu^T -> work_buf [N, C]，随后执行 RMSNorm 反向累加至 x.grad
 		if x.requires_grad or need_dgamma:
-			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+			dx_conf = scratch.gemm_configs["dx_norm"]
+			if dx_conf["split_k"] > 1:
+				self.ctx.memset_zero(work_id, work_off, N * C * 4)
+			self.ctx.dispatch(dx_conf["kernel"],
 				[gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, work_id],
 				[gu.ptr.offset, wgu.storage.ptr.offset, work_off],
-				[N, C, H2, 0], (C + 63) // 64, (N + 63) // 64, 1, 256)
+				[N, C, H2, 0],
+				(C + dx_conf["bn"] - 1) // dx_conf["bn"], (N + dx_conf["bm"] - 1) // dx_conf["bm"], dx_conf["split_k"], 256)
 
 			dx_id = x.grad.storage.ptr.buffer_id if x.requires_grad else 0
 			dx_off = x.grad.storage.ptr.offset if x.requires_grad else 0
@@ -486,14 +510,14 @@ class CudaBackend(Backend):
 		k_id, k_off = k_buf if isinstance(k_buf, tuple) else (k_buf.ptr.buffer_id, k_buf.ptr.offset)
 		v_id, v_off = v_buf if isinstance(v_buf, tuple) else (v_buf.ptr.buffer_id, v_buf.ptr.offset)
 
-		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+		self.ctx.dispatch("fused_rms_fa_qkv_128_kernel",
 			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
 			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
 			 out_id, k_id, v_id],
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 			 out_off, k_off, v_off],
-			[B, T, C, H, eps_bits, 1], (C + 63) // 64, (N + 63) // 64, 3, 256)
+			[B, T, C, H, eps_bits, 1], (C + 127) // 128, (N + 127) // 128, 3, 256)
 
 		self.ctx.dispatch("rope_qk_inplace_kernel",
 			[out_id, k_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -517,14 +541,14 @@ class CudaBackend(Backend):
 		total_pairs = N*H*(D//2)
 		q, k, v = scratch["q"], scratch["k"], scratch["v"]
 
-		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+		self.ctx.dispatch("fused_rms_fa_qkv_128_kernel",
 			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
 			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
 			 q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 			 q.ptr.offset, k.ptr.offset, v.ptr.offset],
-			[B, T, C, H, eps_bits, 0], (C + 63) // 64, (N + 63) // 64, 3, 256)
+			[B, T, C, H, eps_bits, 0], (C + 127) // 128, (N + 127) // 128, 3, 256)
 
 		self.ctx.dispatch("rope_qk_inplace_kernel",
 			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -558,14 +582,14 @@ class CudaBackend(Backend):
 		lse, d_val = scratch["lse"], scratch["d_val"]
 
 		# 1. 重算 Q, K, V 及前向 RoPE
-		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
+		self.ctx.dispatch("fused_rms_fa_qkv_128_kernel",
 			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
 			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
 			 q.ptr.buffer_id, k.ptr.buffer_id, v.ptr.buffer_id],
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
 			 q.ptr.offset, k.ptr.offset, v.ptr.offset],
-			[B, T, C, H, eps_bits, 0], (C + 63) // 64, (N + 63) // 64, 3, 256)
+			[B, T, C, H, eps_bits, 0], (C + 127) // 128, (N + 127) // 128, 3, 256)
 
 		self.ctx.dispatch("rope_qk_inplace_kernel",
 			[q.ptr.buffer_id, k.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
@@ -602,13 +626,15 @@ class CudaBackend(Backend):
 				[x.storage.ptr.buffer_id, 0, q.ptr.buffer_id],
 				[x.storage.ptr.offset, 0, q.ptr.offset],
 				[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
+			dw_conf = scratch.gemm_configs["dw"]
 			for weight, dproj in ((wq, dq), (wk, dk), (wv, dv)):
 				if weight.requires_grad:
 					dw_bf16 = int(np.dtype(weight.grad.storage.dtype) == np.dtype(np.uint16))
-					self.ctx.dispatch("cuda_sgemm_tn_kernel",
+					self.ctx.dispatch(dw_conf["kernel"],
 						[q.ptr.buffer_id, dproj.ptr.buffer_id, weight.grad.storage.ptr.buffer_id],
 						[q.ptr.offset, dproj.ptr.offset, weight.grad.storage.ptr.offset],
-						[C, C, N, accumulate, dw_bf16], (C + 63) // 64, (C + 63) // 64, 1, 256)
+						[C, C, N, accumulate, dw_bf16],
+						(C + dw_conf["bn"] - 1) // dw_conf["bn"], (C + dw_conf["bm"] - 1) // dw_conf["bm"], dw_conf["split_k"], 256)
 
 		# 5. 直接复用 bias_grad_reduce_kernel 计算 FP32/BF16 dbq, dbk, dbv
 		for bias, dproj in ((bq, dq), (bk, dk), (bv, dv)):
@@ -622,11 +648,15 @@ class CudaBackend(Backend):
 
 		# 6. 复用 k 累加 dX_norm = dQ@Wq^T + dK@Wk^T + dV@Wv^T，并经 rmsnorm_backward_kernel 写入 x.grad
 		if x.requires_grad:
+			dx_conf = scratch.gemm_configs["dx_norm"]
+			if dx_conf["split_k"] > 1:
+				self.ctx.memset_zero(k.ptr.buffer_id, k.ptr.offset, N * C * 4)
 			for accum_flag, (dproj, weight) in enumerate(((dq, wq), (dk, wk), (dv, wv))):
-				self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				self.ctx.dispatch(dx_conf["kernel"],
 					[dproj.ptr.buffer_id, weight.storage.ptr.buffer_id, k.ptr.buffer_id],
 					[dproj.ptr.offset, weight.storage.ptr.offset, k.ptr.offset],
-					[N, C, C, int(accum_flag > 0)], (C + 63) // 64, (N + 63) // 64, 1, 256)
+					[N, C, C, int(accum_flag > 0)], 
+					(C + dx_conf["bn"] - 1) // dx_conf["bn"], (N + dx_conf["bm"] - 1) // dx_conf["bm"], dx_conf["split_k"], 256)
 			accum_x = int(x.op is not None or bool(accumulate))
 			self.ctx.dispatch("rmsnorm_backward_kernel",
 				[x.storage.ptr.buffer_id, k.ptr.buffer_id, 0, x.grad.storage.ptr.buffer_id, 0],
@@ -666,10 +696,11 @@ class CudaBackend(Backend):
 			x_off = x.storage.ptr.offset + row_base * C * itemsize
 
 			# 1. logits = X_chunk [rows, C] @ W^T [V, C]
-			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+			logits_conf = scratch.gemm_configs[("logits", rows)]
+			self.ctx.dispatch(logits_conf["kernel"],
 				[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
 				[x_off, w.storage.ptr.offset, logits.ptr.offset],
-				[rows, V, C, 0], (V+63)//64, (rows+63)//64, 1, 256)
+				[rows, V, C, 0], (V+logits_conf["bn"]-1)//logits_conf["bn"], (rows+logits_conf["bm"]-1)//logits_conf["bm"], logits_conf["split_k"], 256)
 
 			# 2. 单趟在线归约 row_loss / lse，并在需要梯度时原地覆写 dlogits
 			self.ctx.dispatch("fused_linear_ce_logits_to_dlogits_kernel",
@@ -685,22 +716,27 @@ class CudaBackend(Backend):
 			if x.requires_grad:
 				dx_off = x.grad.storage.ptr.offset + row_base * C * itemsize
 				accum_x = int(x.op is None and accumulate)
-				self.ctx.dispatch("cuda_sgemm_nn_kernel",
+				dx_conf = scratch.gemm_configs[("dx", rows)]
+				if dx_conf["split_k"] > 1 and not accum_x:
+					self.ctx.memset_zero(x.grad.storage.ptr.buffer_id, dx_off, rows * C * 4)
+				self.ctx.dispatch(dx_conf["kernel"],
 					[logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
 					[logits.ptr.offset, w.storage.ptr.offset, dx_off],
-					[rows, C, V, accum_x], (C + 63) // 64, (rows + 63) // 64, 1, 256)
+					[rows, C, V, accum_x],
+					(C + dx_conf["bn"] - 1) // dx_conf["bn"], (rows + dx_conf["bm"] - 1) // dx_conf["bm"], dx_conf["split_k"], 256)
 
 			# 4. dW += dlogits^T [V, rows] @ X_chunk [rows, C]
 			# FP32 或单分块 BF16 直接寄存器级一次写出；仅多分块 BF16 延迟至二阶段保证全 N 行 FP32 累加精度
 			if w.requires_grad and not defer_dw_bf16:
 				accum_w = int(accumulate or row_base != 0)
-				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				dw_conf = scratch.gemm_configs[("dw", rows)]
+				self.ctx.dispatch(dw_conf["kernel"],
 					[logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
 					[logits.ptr.offset, x_off, w.grad.storage.ptr.offset],
 					[V, C, rows, accum_w, int(dw_bf16)],
-					(C + 63) // 64, (V + 63) // 64, 1, 256)
+					(C + dw_conf["bn"] - 1) // dw_conf["bn"], (V + dw_conf["bm"] - 1) // dw_conf["bm"], dw_conf["split_k"], 256)
 
-# 5. 归约所有 token 的 row_loss 输出标量 loss
+		# 5. 归约所有 token 的 row_loss 输出标量 loss
 		self.ctx.dispatch("fused_linear_ce_reduce_kernel",
 			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
 			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
@@ -710,9 +746,7 @@ class CudaBackend(Backend):
 			return
 
 		# 6. 多分块 BF16 权重梯度：复用 logits 缓冲区前部存 dlogits_tile、后部存 FP32 dw_tile，全 N 行累加后单次转 BF16
-		capacity = logits.nbytes // 4
-		tile_rows = min(chunk_rows, max(1, capacity - C))
-		tile_v = max(1, min(V, capacity // (tile_rows + C)))
+		tile_rows, tile_v = scratch.gemm_configs["ce_tile_shape"]
 		dw_off = logits.ptr.offset + tile_rows * tile_v * 4
 
 		for vocab_base in range(0, V, tile_v):
@@ -722,10 +756,14 @@ class CudaBackend(Backend):
 				rows = min(tile_rows, N - row_base)
 				x_off = x.storage.ptr.offset + row_base * C * 4
 
-				self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				lt_conf = scratch.gemm_configs[("logits_tile", rows, cols)]
+				if lt_conf["split_k"] > 1:
+					self.ctx.memset_zero(logits.ptr.buffer_id, logits.ptr.offset, rows * cols * 4)
+				self.ctx.dispatch(lt_conf["kernel"],
 					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
 					[x_off, w_off, logits.ptr.offset],
-					[rows, cols, C, 0], (cols + 63) // 64, (rows + 63) // 64, 1, 256)
+					[rows, cols, C, 0],
+					(cols + lt_conf["bn"] - 1) // lt_conf["bn"], (rows + lt_conf["bm"] - 1) // lt_conf["bm"], lt_conf["split_k"], 256)
 
 				count = rows * cols
 				self.ctx.dispatch("ce_tile_logits_to_dlogits_kernel",
@@ -734,11 +772,12 @@ class CudaBackend(Backend):
 					[rows, cols, vocab_base, V, row_base, scale_bits, ignore_bits],
 					(count + 255) // 256, 1, 1, 256)
 
-				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+				dt_conf = scratch.gemm_configs[("dw_tile", cols, rows)]
+				self.ctx.dispatch(dt_conf["kernel"],
 					[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
 					[logits.ptr.offset, x_off, dw_off],
 					[cols, C, rows, int(row_base != 0), 0],
-					(C + 63) // 64, (cols + 63) // 64, 1, 256)
+					(C + dt_conf["bn"] - 1) // dt_conf["bn"], (cols + dt_conf["bm"] - 1) // dt_conf["bm"], dt_conf["split_k"], 256)
 
 			dw_count = cols * C
 			self.ctx.dispatch("fp32_to_bf16_accum_kernel",

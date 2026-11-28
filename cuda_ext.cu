@@ -28,6 +28,7 @@ class CudaContext {
 	private:
 		cudaStream_t stream_ = nullptr;
 		size_t max_buf_len_ = 0;
+		int num_sms_ = 1;
 		std::unordered_map<std::string, const void*> kernels_;
 
 	public:
@@ -37,6 +38,7 @@ class CudaContext {
 			cudaDeviceProp props{};
 			CUDA_CHECK(cudaGetDeviceProperties(&props, dev));
 			max_buf_len_ = props.totalGlobalMem;
+			num_sms_ = std::max(1, props.multiProcessorCount);
 			CUDA_CHECK(cudaStreamCreate(&stream_));
 
 			kernels_ = {
@@ -71,11 +73,21 @@ class CudaContext {
 	            {"adamw8bit_step_kernel",                     (const void*)&adamw8bit_step_kernel},
 	            {"mini_update_v_kernel",                      (const void*)&mini_update_v_kernel},
 	            {"adamw_mini8bit_step_kernel",                (const void*)&adamw_mini8bit_step_kernel},
+	            {"cuda_sgemm_nn_128_kernel",                  (const void*)&cuda_sgemm_nn_128_kernel},
+	            {"cuda_sgemm_nt_128_kernel",                  (const void*)&cuda_sgemm_nt_128_kernel},
+	            {"cuda_sgemm_tn_128_kernel",                  (const void*)&cuda_sgemm_tn_128_kernel},
+	            {"fused_linear_add_128_kernel",               (const void*)&fused_linear_add_128_kernel},
+	            {"fused_wgu_swiglu_128_kernel",               (const void*)&fused_wgu_swiglu_128_kernel},
+	            {"fused_rms_fa_qkv_128_kernel",               (const void*)&fused_rms_fa_qkv_128_kernel},
 	        };
 	    }
 
         size_t max_buffer_length() const {
         	return max_buf_len_;
+        }
+
+        int num_sms() const {
+        	return num_sms_;
         }
 
         uintptr_t alloc(size_t nbytes) {
@@ -177,6 +189,7 @@ static CudaContext& get_ctx() {
 PYBIND11_MODULE(cuda_ext, m) {
     py::class_<CudaContext>(m, "CudaContext")
         .def("max_buffer_length", &CudaContext::max_buffer_length)
+        .def("num_sms", &CudaContext::num_sms)
         .def("alloc", &CudaContext::alloc)
         .def("free", &CudaContext::free)
         .def("memset_zero", &CudaContext::memset_zero)

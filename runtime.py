@@ -82,6 +82,7 @@ class Runtime:
 		self.accumulate_parameter_grads = False
 		self.use_fp16_gemm = use_fp16_gemm
 		self.backend.use_fp16_gemm = self.use_fp16_gemm
+		self.num_sms = getattr(self.backend, "_num_sms", 1)
 
 		self.memory_plan = None
 		self.arena_bytes = 0
@@ -93,6 +94,7 @@ class Runtime:
 		self.backend.accumulate_parameter_grads = self.accumulate_parameter_grads
 		self.backend.grad_scale = self.grad_scale
 		self.backend.use_fp16_gemm = self.use_fp16_gemm
+		self.backend.num_sms = self.num_sms
 		if not self.is_compiled:
 			self.build_topo(loss)
 			self.bind_memory()
@@ -241,7 +243,7 @@ class Runtime:
 		for node in self.topo:
 			node.forward = self.backend.get_forward_kernel(node.op)
 			node.backward = self.backend.get_backward_kernel(node.op)
-			fwd, bwd = plan_node_scratch(node, self.use_fp16_gemm)
+			fwd, bwd = plan_node_scratch(node, self.use_fp16_gemm, self.num_sms)
 			if fwd is not None: node.scratch_fwd_layout = fwd
 			if bwd is not None: node.scratch_bwd_layout = bwd
 

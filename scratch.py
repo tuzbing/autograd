@@ -5,7 +5,7 @@ from math import prod
 from op import AddOp, MulOp, RsqrtOp, SoftmaxOp, GELUOp, LayerNormOp, MatMulOp, PermuteOp, TransposeOp, CrossEntropyLossOp
 from op import ScaledDotProductAttenOp, FusedLinearCrossEntropyOp, FusedMLPOp, FusedQKVProjOp, FlashAttentionOp
 from op import FusedRMSNormLinearCrossEntropyOp
-from gemm import FP16_QUANT_BUDGET_BYTES, get_fp16_gemm_config, fp16_gemm_k_tile, build_fp16_k_tile_configs
+from gemm import FP16_QUANT_BUDGET_BYTES, get_fp16_gemm_config, fp16_gemm_k_tile, build_fp16_k_tile_configs, get_cuda_gemm_config
 
 def align_up(n, align=64):
 	return (n + align - 1) // align * align
@@ -60,7 +60,7 @@ class ScratchArena:
 		views = {}
 		for name, (off, shape, dtype) in layout.slots.items():
 			views[name] = allocator.view(self.storage, off, shape, dtype)
-		return ScratchViews(views)
+		return ScratchViews(views, layout.gemm_configs)
 
 def pack_slots(slot_specs, align=64):
 	offset = 0
@@ -91,7 +91,7 @@ def fp16_gemm_quant_size(*tiled_cfgs, reuse_bytes=0):
 def fp16_quant_bytes(rows, cols, scale_len):
 	return align_up(rows * cols * 2, 16) + align_up(scale_len * 4, 16)
 
-def plan_node_scratch(node, use_f16_gemm=False):
+def plan_node_scratch(node, use_f16_gemm=False, num_sms=1):
 	op = node.op 
 	inputs, outputs = node.inputs, node.outputs
 	fwd, bwd = None, None 
@@ -193,7 +193,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		logits_budget_elements = max(V, 8*N*C)
 		logits_rows = max(1, min(512, logits_budget_elements//V, N))
 
-		if x.device in ("mps", "cuda"):
+		if x.device == "mps":
 			vocab_blocks = (V+95)//96
 			slots = [
 				('row_loss', (N, 1), x.dtype),
@@ -235,6 +235,37 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				sdl_len = max(2, logits_rows, V) if (x.requires_grad or w.requires_grad) else 2
 				quant_bytes = align_up(N*C*2, 16) + align_up(V*C*2, 16) + align_up(max(logits_rows, C)*4, 16) + align_up(max(V, C)*4, 16) + align_up(sdl_len*4, 16)
 				slots.append(("gemm_quant", (quant_bytes,), np.uint8))
+
+			fwd = pack_slots(slots)
+			fwd.gemm_configs = configs
+			bwd = None
+		elif x.device == "cuda":
+			slots = [
+				('row_loss', (N, 1), x.dtype),
+				('lse',      (N, 1), x.dtype),
+				('logits',   (logits_rows, V), x.dtype),
+			]
+			configs = {}
+			row_sizes = [logits_rows] + ([N % logits_rows] if N % logits_rows else [])
+			for rows in row_sizes:
+				configs[("logits", rows)] = get_cuda_gemm_config(M=rows, N=V, K=C, b_transpose=True, num_sms=num_sms)
+				if x.requires_grad:
+					configs[("dx", rows)] = get_cuda_gemm_config(M=rows, N=C, K=V, b_transpose=False, num_sms=num_sms)
+				if w.requires_grad:
+					configs[("dw", rows)] = get_cuda_gemm_config(M=V, N=C, K=rows, a_transpose=True, num_sms=num_sms)
+
+			if w.requires_grad and N > logits_rows:
+				capacity = logits_rows * V
+				tile_rows = min(logits_rows, max(1, capacity - C))
+				raw_tv = max(1, min(V, capacity // (tile_rows + C)))
+				tile_v = (raw_tv // 128) * 128 if raw_tv >= 128 else ((raw_tv // 4) * 4 or raw_tv)
+				configs["ce_tile_shape"] = (tile_rows, tile_v)
+				tile_row_sizes = [tile_rows] + ([N % tile_rows] if N % tile_rows else [])
+				tile_col_sizes = [tile_v] + ([V % tile_v] if V % tile_v else [])
+				for rows in tile_row_sizes:
+					for cols in tile_col_sizes:
+						configs[("logits_tile", rows, cols)] = get_cuda_gemm_config(M=rows, N=cols, K=C, b_transpose=True, num_sms=num_sms)
+						configs[("dw_tile", cols, rows)] = get_cuda_gemm_config(M=cols, N=C, K=rows, a_transpose=True, num_sms=num_sms)
 
 			fwd = pack_slots(slots)
 			fwd.gemm_configs = configs
@@ -338,7 +369,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 		gu_shape = x.shape[:-1] + (2*H,)
 		hidden_shape = x.shape[:-1] + (H,)
 
-		if x.device in ("mps", "cuda"):
+		if x.device == "mps":
 			fwd_slots = [
 				('gu', gu_shape, x.dtype),
 				('hidden', hidden_shape, x.dtype),
@@ -436,6 +467,44 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				bwd.gemm_configs = bwd_configs
 			else:
 				bwd = pack_slots(bwd_slots)
+		elif x.device == "cuda":
+			N = prod(x.shape[:-1])
+			C = x.shape[-1]
+			H2 = wgu.shape[-1]
+
+			fwd = pack_slots([
+				('gu', gu_shape, x.dtype),
+				('hidden', hidden_shape, x.dtype),
+			])
+			fwd.gemm_configs = {
+				"out": get_cuda_gemm_config(M=N, N=C, K=H, num_sms=num_sms),
+			}
+
+			bwd = pack_slots([
+				('gu', gu_shape, x.dtype),
+				('hidden', hidden_shape, x.dtype),
+			])
+			bwd_configs = {
+				"gu": get_cuda_gemm_config(M=N, N=H2, K=C, num_sms=num_sms),
+			}
+			fla_node = x.op
+			recompute_fla = (fla_node is not None and fla_node.op.op_name == "FusedLinearAdd" and len(fla_node.inputs) == 4                                               # <--- 新增
+				and fla_node.inputs[1].op is not None and fla_node.inputs[1].op.op_name == "FusedRMSNormFlashAttention")                                                                               # <--- 新增
+			work_floats = N * (H - C) if recompute_fla else N * H
+			h_tile = min(H, work_floats // N)
+			chunk_rows = max(1, work_floats // H)
+			h_sizes = sorted({min(h_tile, H - h0) for h0 in range(0, H, h_tile)})
+			r_sizes = sorted({min(chunk_rows, N - r0) for r0 in range(0, N, chunk_rows)})
+			if wdown.requires_grad:
+				for h_sub in h_sizes:
+					bwd_configs[("dwdown", h_sub)] = get_cuda_gemm_config(M=h_sub, N=C, K=N, a_transpose=True, num_sms=num_sms)
+			for rows in r_sizes:
+				bwd_configs[("dhidden", rows)] = get_cuda_gemm_config(M=rows, N=H, K=C, b_transpose=True, num_sms=num_sms)
+			if wgu.requires_grad:
+				bwd_configs["dwgu"] = get_cuda_gemm_config(M=C, N=H2, K=N, a_transpose=True, num_sms=num_sms)
+			if x.requires_grad or (len(inputs) == 4 and inputs[1].requires_grad):
+				bwd_configs["dx_norm"] = get_cuda_gemm_config(M=N, N=C, K=H2, b_transpose=True, num_sms=num_sms)
+			bwd.gemm_configs = bwd_configs
 		else:
 			fwd = pack_slots([
 				# RMSNorm
@@ -525,6 +594,14 @@ def plan_node_scratch(node, use_f16_gemm=False):
 				('dk', (B, H, T, D), x.dtype),
 				('dv', (B, H, T, D), x.dtype),
 			])
+			if x.device == "cuda":
+				N_tok = B * T
+				bwd_configs = {}
+				if inputs[1].requires_grad or inputs[3].requires_grad or inputs[5].requires_grad:
+					bwd_configs["dw"] = get_cuda_gemm_config(M=C, N=C, K=N_tok, a_transpose=True, num_sms=num_sms)
+				if x.requires_grad:
+					bwd_configs["dx_norm"] = get_cuda_gemm_config(M=N_tok, N=C, K=C, b_transpose=True, num_sms=num_sms)
+				bwd.gemm_configs = bwd_configs
 		else:
 			fwd = pack_slots([
 				('inv_rms', (B, T, 1), x.dtype),
@@ -634,6 +711,16 @@ def plan_node_scratch(node, use_f16_gemm=False):
 					('fa_v', (B, HKV, T, D), x.dtype),
 					('fa_out', act.shape, act.dtype),
 				])
+			if x.device == "cuda":
+				M_fla = prod(x.shape[:-1])
+				K_fla = act.shape[-1]
+				N_fla = w.shape[-1]
+				bwd_configs = {}
+				if w.requires_grad:
+					bwd_configs["dw"] = get_cuda_gemm_config(M=K_fla, N=N_fla, K=M_fla, a_transpose=True, num_sms=num_sms)
+				if act.requires_grad:
+					bwd_configs["dact"] = get_cuda_gemm_config(M=M_fla, N=K_fla, K=N_fla, b_transpose=True, num_sms=num_sms)
+				bwd.gemm_configs = bwd_configs
 		else:
 			if act.op is not None and type(act.op.op).__name__ == "FusedRMSNormFlashAttentionOp":
 				B, T, C = x.shape 
@@ -658,6 +745,7 @@ def plan_node_scratch(node, use_f16_gemm=False):
 					('tmp_dw', w.shape, w.dtype),
 					('tmp_db', b.shape, b.dtype),
 				])
+				
 			elif act.op is not None and type(act.op.op).__name__ == "FusedRMSNormGQAOp":
 				B, T, C = x.shape
 				H, HKV = act.op.op.n_head, act.op.op.n_kv_head
