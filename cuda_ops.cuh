@@ -1513,3 +1513,465 @@ __global__ void fp32_to_bf16_accum_kernel(
     if (accumulate) val += bf16_to_float(dst[id]);
     dst[id] = float_to_bf16_rne(val);
 }
+
+__global__ void grad_norm_sq_kernel(
+    const void* g,
+    float* __restrict__ partial,
+    uint32_t numel, uint32_t grad_bf16
+) {
+    const size_t tid = size_t(blockIdx.x) * 256u + threadIdx.x;
+    const uint32_t warp_id = threadIdx.x >> 5;
+    const uint32_t lane = threadIdx.x & 31u;
+
+    float val = 0.0f;
+    if (tid < numel) {
+        float x = grad_bf16
+            ? bf16_to_float(static_cast<const uint16_t*>(g)[tid])
+            : static_cast<const float*>(g)[tid];
+        val = x * x;
+    }
+
+    __shared__ float smem[8];
+    val = warp_allreduce_sum(val);
+    if (lane == 0u) smem[warp_id] = val;
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float total = (lane < 8u) ? smem[lane] : 0.0f;
+        total = warp_allreduce_sum(total);
+        if (lane == 0u) partial[blockIdx.x] = total;
+    }
+}
+
+__global__ void adamw_step_kernel(
+    float* __restrict__ p,
+    const void* g,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    uint32_t decay_bits, uint32_t update_lr_bits,
+    uint32_t b1_bits, uint32_t b2_bits, uint32_t eps_bits,
+    uint32_t numel, uint32_t decay_numel,
+    uint32_t grad_scale_bits, uint32_t inv_sqrt_bc2_bits,
+    uint32_t grad_bf16, uint32_t vec4
+) {
+    const size_t base = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 4u;
+    if (base >= numel) return;
+
+    const float decay = __uint_as_float(decay_bits);
+    const float update_lr = __uint_as_float(update_lr_bits);
+    const float one_minus_b1 = 1.0f - __uint_as_float(b1_bits);
+    const float one_minus_b2 = 1.0f - __uint_as_float(b2_bits);
+    const float eps = __uint_as_float(eps_bits);
+    const float grad_scale = __uint_as_float(grad_scale_bits);
+    const float inv_sqrt_bc2 = __uint_as_float(inv_sqrt_bc2_bits);
+
+    if (vec4 && base + 4u <= numel) {
+        const size_t idx4 = base >> 2;
+        float4 pv = reinterpret_cast<const float4*>(p)[idx4];
+        float4 mv = reinterpret_cast<const float4*>(m)[idx4];
+        float4 vv = reinterpret_cast<const float4*>(v)[idx4];
+        float gv[4];
+        if (grad_bf16) {
+            uint2 gb = reinterpret_cast<const uint2*>(g)[idx4];
+            gv[0] = bf16_to_float(uint16_t(gb.x & 0xffffu)) * grad_scale;
+            gv[1] = bf16_to_float(uint16_t(gb.x >> 16)) * grad_scale;
+            gv[2] = bf16_to_float(uint16_t(gb.y & 0xffffu)) * grad_scale;
+            gv[3] = bf16_to_float(uint16_t(gb.y >> 16)) * grad_scale;
+        } else {
+            float4 gf = reinterpret_cast<const float4*>(g)[idx4];
+            gv[0] = gf.x * grad_scale;
+            gv[1] = gf.y * grad_scale;
+            gv[2] = gf.z * grad_scale;
+            gv[3] = gf.w * grad_scale;
+        }
+
+        float pa[4] = {pv.x, pv.y, pv.z, pv.w};
+        float ma[4] = {mv.x, mv.y, mv.z, mv.w};
+        float va[4] = {vv.x, vv.y, vv.z, vv.w};
+        #pragma unroll
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            if (base + k < decay_numel) pa[k] *= decay;
+            ma[k] = fmaf(gv[k] - ma[k], one_minus_b1, ma[k]);
+            va[k] = fmaf(gv[k] * gv[k] - va[k], one_minus_b2, va[k]);
+            float denom = sqrtf(fmaxf(va[k], 0.0f)) * inv_sqrt_bc2 + eps;
+            pa[k] -= update_lr * (ma[k] / denom);
+        }
+        reinterpret_cast<float4*>(p)[idx4] = make_float4(pa[0], pa[1], pa[2], pa[3]);
+        reinterpret_cast<float4*>(m)[idx4] = make_float4(ma[0], ma[1], ma[2], ma[3]);
+        reinterpret_cast<float4*>(v)[idx4] = make_float4(va[0], va[1], va[2], va[3]);
+        return;
+    }
+
+    const size_t limit = (base + 4u < numel) ? (base + 4u) : size_t(numel);
+    for (size_t i = base; i < limit; ++i) {
+        float p_val = p[i];
+        float m_val = m[i];
+        float v_val = v[i];
+        float g_val = (grad_bf16
+            ? bf16_to_float(static_cast<const uint16_t*>(g)[i])
+            : static_cast<const float*>(g)[i]) * grad_scale;
+
+        if (i < decay_numel) p_val *= decay;
+        m_val = fmaf(g_val - m_val, one_minus_b1, m_val);
+        v_val = fmaf(g_val * g_val - v_val, one_minus_b2, v_val);
+        float denom = sqrtf(fmaxf(v_val, 0.0f)) * inv_sqrt_bc2 + eps;
+        p[i] = p_val - update_lr * (m_val / denom);
+        m[i] = m_val;
+        v[i] = v_val;
+    }
+}
+
+__global__ void adamw8bit_step_kernel(
+    float* __restrict__ p,
+    const void* g,
+    uint8_t* __restrict__ qm,
+    uint8_t* __restrict__ qv,
+    float* __restrict__ absmax_m,
+    float* __restrict__ absmax_v,
+    const float* __restrict__ qmap_m,
+    const float* __restrict__ qmap_v,
+    uint32_t decay_bits, uint32_t lr_bc1_bits,
+    uint32_t b1_bits, uint32_t b2_bits, uint32_t eps_bits,
+    uint32_t numel, uint32_t decay_numel, uint32_t first_step,
+    uint32_t inv_sqrt_bc2_bits, uint32_t grad_bf16, uint32_t grad_scale_bits
+) {
+    const uint32_t block = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const size_t i = size_t(block) * 256u + tid;
+    const bool valid = i < numel;
+
+    __shared__ float s_qmap_m[256];
+    __shared__ float s_qmap_v[256];
+    __shared__ float smem_m[8];
+    __shared__ float smem_v[8];
+    __shared__ float s_scales[2];
+
+    s_qmap_m[tid] = __ldg(&qmap_m[tid]);
+    s_qmap_v[tid] = __ldg(&qmap_v[tid]);
+    __syncthreads();
+
+    float m = 0.0f;
+    float v = 0.0f;
+    if (valid && !first_step) {
+        m = absmax_m[block] * s_qmap_m[qm[i]];
+        v = absmax_v[block] * s_qmap_v[qv[i]];
+    }
+
+    if (valid) {
+        const float decay = __uint_as_float(decay_bits);
+        const float lr_bc1 = __uint_as_float(lr_bc1_bits);
+        const float one_minus_b1 = 1.0f - __uint_as_float(b1_bits);
+        const float one_minus_b2 = 1.0f - __uint_as_float(b2_bits);
+        const float eps = __uint_as_float(eps_bits);
+        const float inv_sqrt_bc2 = __uint_as_float(inv_sqrt_bc2_bits);
+        const float grad_scale = __uint_as_float(grad_scale_bits);
+
+        float p_val = p[i];
+        float g_val = (grad_bf16
+            ? bf16_to_float(static_cast<const uint16_t*>(g)[i])
+            : static_cast<const float*>(g)[i]) * grad_scale;
+
+        if (i < decay_numel) p_val *= decay;
+        m = fmaf(g_val - m, one_minus_b1, m);
+        v = fmaf(g_val * g_val - v, one_minus_b2, v);
+        float denom = sqrtf(fmaxf(v, 0.0f)) * inv_sqrt_bc2 + eps;
+        p[i] = p_val - lr_bc1 * (m / denom);
+    }
+
+    float wmax_m = warp_allreduce_max(valid ? fabsf(m) : 0.0f);
+    float wmax_v = warp_allreduce_max(valid ? fmaxf(v, 0.0f) : 0.0f);
+    if (lane == 0u) {
+        smem_m[warp_id] = wmax_m;
+        smem_v[warp_id] = wmax_v;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float bmax_m = warp_allreduce_max((lane < 8u) ? smem_m[lane] : 0.0f);
+        float bmax_v = warp_allreduce_max((lane < 8u) ? smem_v[lane] : 0.0f);
+        if (lane == 0u) {
+            float scale_m = fmaxf(bmax_m, 1.0e-30f);
+            float scale_v = fmaxf(bmax_v, 1.0e-30f);
+            absmax_m[block] = scale_m;
+            absmax_v[block] = scale_v;
+            s_scales[0] = scale_m;
+            s_scales[1] = scale_v;
+        }
+    }
+    __syncthreads();
+
+    if (!valid) return;
+
+    const float m_norm = fminf(fmaxf(m / s_scales[0], -1.0f), 1.0f);
+    const float v_norm = fminf(fmaxf(fmaxf(v, 0.0f) / s_scales[1], 0.0f), 1.0f);
+
+    uint32_t lo_m = 0u, hi_m = 255u;
+    #pragma unroll
+    for (int iter = 0; iter < 8; ++iter) {
+        uint32_t mid = (lo_m + hi_m) >> 1;
+        if (s_qmap_m[mid] < m_norm) lo_m = mid + 1u;
+        else hi_m = mid;
+    }
+    uint32_t up_m = lo_m < 255u ? lo_m : 255u;
+    uint32_t dn_m = up_m > 0u ? (up_m - 1u) : 0u;
+    qm[i] = static_cast<uint8_t>(
+        fabsf(s_qmap_m[up_m] - m_norm) < fabsf(s_qmap_m[dn_m] - m_norm) ? up_m : dn_m
+    );
+
+    uint32_t lo_v = 0u, hi_v = 255u;
+    #pragma unroll
+    for (int iter = 0; iter < 8; ++iter) {
+        uint32_t mid = (lo_v + hi_v) >> 1;
+        if (s_qmap_v[mid] < v_norm) lo_v = mid + 1u;
+        else hi_v = mid;
+    }
+    uint32_t up_v = lo_v < 255u ? lo_v : 255u;
+    uint32_t dn_v = up_v > 0u ? (up_v - 1u) : 0u;
+    qv[i] = static_cast<uint8_t>(
+        fabsf(s_qmap_v[up_v] - v_norm) < fabsf(s_qmap_v[dn_v] - v_norm) ? up_v : dn_v
+    );
+}
+
+__global__ void mini_update_v_kernel(
+    const void* g,
+    float* __restrict__ v,
+    uint32_t b2_bits, uint32_t grad_scale_bits,
+    uint32_t numel, uint32_t block_elems,
+    uint32_t cols, uint32_t head_cols,
+    uint32_t first_step, uint32_t grad_bf16
+) {
+    const float one_minus_b2 = 1.0f - __uint_as_float(b2_bits);
+    const float grad_scale = __uint_as_float(grad_scale_bits);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+
+    // 1. 1D 向量快速路径 (block_elems == 1, head_cols == 0)：单线程单元素合并读写
+    if (head_cols == 0u && block_elems == 1u) {
+        size_t idx = size_t(blockIdx.x) * 256u + tid;
+        if (idx >= numel) return;
+        float g_val = (grad_bf16
+            ? bf16_to_float(static_cast<const uint16_t*>(g)[idx])
+            : static_cast<const float*>(g)[idx]) * grad_scale;
+        float old_v = first_step ? 0.0f : v[idx];
+        v[idx] = fmaf(g_val * g_val - old_v, one_minus_b2, old_v);
+        return;
+    }
+
+    __shared__ float smem[8][8];
+
+    // 2. MLP/Proj 列分组矩阵快速路径 (head_cols == 1)：8列 x 32行二维合并访存归约
+    if (head_cols == 1u) {
+        const uint32_t rows = block_elems;
+        const uint32_t tx = tid & 7u;
+        const uint32_t ty = tid >> 3;
+        const uint32_t col = blockIdx.x * 8u + tx;
+        float sum_sq = 0.0f;
+        if (col < cols) {
+            if (grad_bf16) {
+                const uint16_t* gb = static_cast<const uint16_t*>(g);
+                for (uint32_t row = ty; row < rows; row += 32u) {
+                    float val = bf16_to_float(gb[size_t(row) * cols + col]) * grad_scale;
+                    sum_sq = fmaf(val, val, sum_sq);
+                }
+            } else {
+                const float* gf = static_cast<const float*>(g);
+                for (uint32_t row = ty; row < rows; row += 32u) {
+                    float val = gf[size_t(row) * cols + col] * grad_scale;
+                    sum_sq = fmaf(val, val, sum_sq);
+                }
+            }
+        }
+        sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, 16);
+        sum_sq += __shfl_down_sync(0xffffffffu, sum_sq, 8);
+        if (lane < 8u) smem[warp_id][lane] = sum_sq;
+        __syncthreads();
+
+        uint32_t out_col = blockIdx.x * 8u + tid;
+        if (tid < 8u && out_col < cols) {
+            float total = 0.0f;
+            #pragma unroll
+            for (uint32_t w = 0u; w < 8u; ++w) total += smem[w][tid];
+            float mean_sq = total / float(rows);
+            float old_v = first_step ? 0.0f : v[out_col];
+            v[out_col] = fmaf(mean_sq - old_v, one_minus_b2, old_v);
+        }
+        return;
+    }
+
+    // 3. Attention Q/K/V 按头分组 (head_cols > 1) 与 Embedding/LM Head 按行分组 (head_cols == 0)
+    const uint32_t block = blockIdx.x;
+    const bool by_head = (head_cols != 0u);
+    const uint32_t group_count = by_head ? (cols / head_cols) : ((numel + block_elems - 1u) / block_elems);
+    if (block >= group_count) return;
+
+    float sum_sq = 0.0f;
+    uint32_t count = block_elems;
+    if (by_head) {
+        const uint32_t col_begin = block * head_cols;
+        if (grad_bf16) {
+            const uint16_t* gb = static_cast<const uint16_t*>(g);
+            for (uint32_t j = tid; j < count; j += 256u) {
+                uint32_t row = j / head_cols;
+                uint32_t col_in_head = j - row * head_cols;
+                float val = bf16_to_float(gb[size_t(row) * cols + col_begin + col_in_head]) * grad_scale;
+                sum_sq = fmaf(val, val, sum_sq);
+            }
+        } else {
+            const float* gf = static_cast<const float*>(g);
+            for (uint32_t j = tid; j < count; j += 256u) {
+                uint32_t row = j / head_cols;
+                uint32_t col_in_head = j - row * head_cols;
+                float val = gf[size_t(row) * cols + col_begin + col_in_head] * grad_scale;
+                sum_sq = fmaf(val, val, sum_sq);
+            }
+        }
+    } else {
+        const size_t start = size_t(block) * block_elems;
+        count = (numel - start < size_t(block_elems)) ? uint32_t(numel - start) : block_elems;
+        if (grad_bf16) {
+            const uint16_t* gb = static_cast<const uint16_t*>(g);
+            for (uint32_t j = tid; j < count; j += 256u) {
+                float val = bf16_to_float(gb[start + j]) * grad_scale;
+                sum_sq = fmaf(val, val, sum_sq);
+            }
+        } else {
+            const float* gf = static_cast<const float*>(g);
+            for (uint32_t j = tid; j < count; j += 256u) {
+                float val = gf[start + j] * grad_scale;
+                sum_sq = fmaf(val, val, sum_sq);
+            }
+        }
+    }
+
+    sum_sq = warp_allreduce_sum(sum_sq);
+    if (lane == 0u) smem[0][warp_id] = sum_sq;
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float total = warp_allreduce_sum((lane < 8u) ? smem[0][lane] : 0.0f);
+        if (lane == 0u) {
+            float mean_sq = total / float(count);
+            float old_v = first_step ? 0.0f : v[block];
+            v[block] = fmaf(mean_sq - old_v, one_minus_b2, old_v);
+        }
+    }
+}
+
+__device__ __forceinline__ float warp_allreduce_min(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val = fminf(val, __shfl_xor_sync(0xffffffffu, val, mask));
+    }
+    return val;
+}
+
+__device__ __forceinline__ float pcg_hash_unit_float(uint32_t value) {
+    const uint32_t state = value * 747796405u + 2891336453u;
+    const uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    const uint32_t result = (word >> 22u) ^ word;
+    return float(result >> 8u) * (1.0f / 16777216.0f);
+}
+
+__global__ void adamw_mini8bit_step_kernel(
+    float* __restrict__ p,
+    const void* g,
+    uint8_t* __restrict__ m_state,
+    float* __restrict__ meta,
+    const float* __restrict__ v,
+    uint32_t decay_bits, uint32_t lr_bc1_bits, uint32_t inv_sqrt_bc2_bits,
+    uint32_t b1_bits, uint32_t eps_bits, uint32_t grad_scale_bits,
+    uint32_t n, uint32_t decay_n, uint32_t block_elems,
+    uint32_t cols, uint32_t head_cols,
+    uint32_t first, uint32_t seed, uint32_t stochastic,
+    uint32_t transposed, uint32_t quantized, uint32_t grad_bf16
+) {
+    const uint32_t block = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const size_t j = size_t(block) * 256u + tid;
+    const bool valid = j < n;
+    const uint32_t rows = n / cols;
+    const size_t i = transposed ? ((j % rows) * size_t(cols) + (j / rows)) : j;
+
+    float old_scale = 0.0f;
+    float old_zero = 0.0f;
+    if (!first && quantized) {
+        old_scale = meta[size_t(block) * 2u];
+        old_zero = meta[size_t(block) * 2u + 1u];
+    }
+
+    float m = 0.0f;
+    if (valid) {
+        if (!first) {
+            m = quantized
+                ? ((float(m_state[j]) - old_zero) * old_scale)
+                : reinterpret_cast<const float*>(m_state)[j];
+        }
+        const float decay = __uint_as_float(decay_bits);
+        const float lr_bc1 = __uint_as_float(lr_bc1_bits);
+        const float inv_sqrt_bc2 = __uint_as_float(inv_sqrt_bc2_bits);
+        const float one_minus_b1 = 1.0f - __uint_as_float(b1_bits);
+        const float eps = __uint_as_float(eps_bits);
+        const float grad_scale = __uint_as_float(grad_scale_bits);
+
+        float grad = (grad_bf16
+            ? bf16_to_float(__ldg(&static_cast<const uint16_t*>(g)[i]))
+            : __ldg(&static_cast<const float*>(g)[i])) * grad_scale;
+        m = fmaf(grad - m, one_minus_b1, m);
+
+        uint32_t vg = head_cols ? (uint32_t(i % cols) / head_cols) : uint32_t(i / block_elems);
+        float denom = sqrtf(fmaxf(__ldg(&v[vg]), 0.0f)) * inv_sqrt_bc2 + eps;
+        float decayed = (i < decay_n) ? (p[i] * decay) : p[i];
+        p[i] = decayed - lr_bc1 * (m / denom);
+    }
+
+    if (!quantized) {
+        if (valid) {
+            reinterpret_cast<float*>(m_state)[j] = m;
+        }
+        return;
+    }
+
+    __shared__ float smem_low[8];
+    __shared__ float smem_high[8];
+    __shared__ float smem_meta[2];
+
+    float w_low = warp_allreduce_min(valid ? m : INFINITY);
+    float w_high = warp_allreduce_max(valid ? m : -INFINITY);
+    if (lane == 0u) {
+        smem_low[warp_id] = w_low;
+        smem_high[warp_id] = w_high;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float b_low = warp_allreduce_min((lane < 8u) ? smem_low[lane] : INFINITY);
+        float b_high = warp_allreduce_max((lane < 8u) ? smem_high[lane] : -INFINITY);
+        if (lane == 0u) {
+            float scale = fmaxf(b_high - b_low, 1.0e-5f) / 255.0f;
+            float zero = fminf(fmaxf(-rintf(b_low / scale), 0.0f), 255.0f);
+            meta[size_t(block) * 2u] = scale;
+            meta[size_t(block) * 2u + 1u] = zero;
+            smem_meta[0] = scale;
+            smem_meta[1] = zero;
+        }
+    }
+    __syncthreads();
+
+    if (valid) {
+        float scale = smem_meta[0];
+        float zero = smem_meta[1];
+        float x = m / scale;
+        float rounded = rintf(x);
+        if (stochastic) {
+            float down = floorf(x);
+            float u = pcg_hash_unit_float(seed ^ (uint32_t(j) * 0x9E3779B9u) ^ (uint32_t(j) >> 15u));
+            rounded = down + float(u < (x - down));
+        }
+        m_state[j] = static_cast<uint8_t>(fminf(fmaxf(rounded + zero, 0.0f), 255.0f));
+    }
+}

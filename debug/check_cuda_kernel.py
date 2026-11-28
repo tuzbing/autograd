@@ -47,6 +47,7 @@ from module import GPT2  # noqa: E402
 from op import (
     FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp, FusedLinearCrossEntropyOp
 )
+from optimizer import AdamW
 from tensor import Tensor  # noqa: E402
 from utils import f32_bits
 
@@ -115,6 +116,7 @@ def parse_args():
     parser.add_argument("--kernel-block", type=int, default=0)
     parser.add_argument("--skip-internal-kernels", action="store_true")
     parser.add_argument("--skip-gradient-accumulation", action="store_true")
+    parser.add_argument("--skip-optimizer", action="store_true")
     parser.add_argument("--compact", action="store_true")
     parser.add_argument("--grad-dtype", choices=("fp32", "bf16"), default="fp32")
     args = parser.parse_args()
@@ -1131,6 +1133,310 @@ def probe_gpt2_grad_accumulation(cfg, arrays, seed, grad_dtype=np.float32):
                 rtol=rtol_g,
             )
 
+def read_storage_u8(rt, storage):
+    raw = rt.backend.ctx.copy_bytes_to_host(storage.ptr.buffer_id, storage.ptr.offset, int(np.prod(storage.shape)))
+    return np.frombuffer(raw, dtype=np.uint8).copy().reshape(-1)
+
+def _optimizer_tolerances(state_mode, value_kind, *, quantized=False, stochastic=False):
+    if state_mode in ("fp32", "8bit") or not quantized:
+        return (3e-5, 2e-7) if value_kind == "parameter" else (3e-5, 2e-10)
+    if value_kind == "parameter":
+        return (5e-3, 1e-4) if stochastic else (3e-3, 5e-5)
+    if value_kind == "m":
+        return (5e-3, 2e-5) if stochastic else (3e-3, 1e-5)
+    return 3e-5, 2e-10
+
+def _check_optimizer_value(name, got, ref, *, state_mode, value_kind, quantized=False, stochastic=False, fail_fast=True):
+    rtol, atol = _optimizer_tolerances(state_mode, value_kind, quantized=quantized, stochastic=stochastic)
+    return check(name, got, ref, fail_fast=fail_fast, atol=atol, rtol=rtol)
+
+def _mini_group_ids_map(rt):
+    stochastic_ids, column_ids, head_counts = set(), set(), {}
+    for node in rt.topo:
+        name = op_name(node)
+        if name in ("Gather", "FusedLinearCrossEntropy"):
+            stochastic_ids.add(id(node.inputs[1]))
+        elif name == "FusedRMSNormMLP":
+            wgu = node.inputs[1] if len(node.inputs) == 3 else node.inputs[2]
+            wdn = node.inputs[2] if len(node.inputs) == 3 else node.inputs[3]
+            column_ids.update((id(wgu), id(wdn)))
+        elif name == "FusedLinearAdd":
+            column_ids.add(id(node.inputs[2]))
+        elif name == "FusedRMSNormFlashAttention":
+            for p in (node.inputs[1], node.inputs[3], node.inputs[5]):
+                head_counts[id(p)] = int(node.op.n_head)
+
+    def get_ids(p):
+        cols = int(p.shape[-1]) if p.ndim else 1
+        idx = np.arange(p.numel, dtype=np.int64)
+        if id(p) in head_counts:
+            head_cols = cols // head_counts[id(p)]
+            return (idx % cols) // head_cols
+        if id(p) in column_ids:
+            return idx % cols
+        if id(p) in stochastic_ids:
+            return idx // cols
+        return idx
+
+    return get_ids
+
+def read_adamw_state(rt, optimizer, index):
+    p = optimizer.params[index]
+    if optimizer.state_mode == "mini":
+        item = optimizer.dispatches[index]
+        m_st, meta_st, v_st, quantized = item[3], item[4], item[5], bool(item[13])
+        if quantized:
+            codes = read_storage_u8(rt, m_st)
+            meta = read_storage_f32(rt, meta_st).reshape(-1, 2)
+            blocks = np.arange(p.numel, dtype=np.int64) // optimizer.BLOCK_SIZE
+            decoded = (codes.astype(np.float32) - meta[blocks, 1]) * meta[blocks, 0]
+            if bool(item[12]):
+                cols = int(item[9])
+                rows = p.numel // cols
+                j = np.arange(p.numel, dtype=np.int64)
+                logical = np.empty_like(decoded)
+                logical[(j % rows) * cols + j // rows] = decoded
+                m = logical
+            else:
+                m = decoded
+        else:
+            m = read_storage_f32(rt, m_st).reshape(-1)
+        return m.reshape(p.shape), read_storage_f32(rt, v_st).reshape(-1)
+
+    if optimizer.state_mode == "8bit" and optimizer.dispatches[index][0] == "q8":
+        item = optimizer.dispatches[index]
+        blocks = np.arange(p.numel, dtype=np.int64) // optimizer.BLOCK_SIZE
+        qm = read_storage_u8(rt, item[3])
+        qv = read_storage_u8(rt, item[4])
+        sm = read_storage_f32(rt, item[5]).reshape(-1)
+        sv = read_storage_f32(rt, item[6]).reshape(-1)
+        tm = read_storage_f32(rt, optimizer.qmap_m, (256,))
+        tv = read_storage_f32(rt, optimizer.qmap_v, (256,))
+        return (tm[qm] * sm[blocks]).reshape(p.shape), (tv[qv] * sv[blocks]).reshape(p.shape)
+
+    return read_storage_f32(rt, optimizer.m[index], p.shape), read_storage_f32(rt, optimizer.v[index], p.shape)
+
+def _adamw_reference_step(p, g, m, v, step, optimizer, group_ids=None, grad_scale=1.0, apply_decay=True):
+    b1, b2 = optimizer.betas
+    gs = (np.asarray(g, dtype=np.float32).reshape(-1) * np.float32(grad_scale)).astype(np.float32)
+    decay = np.float32(1.0 - optimizer.lr * (optimizer.weight_decay if apply_decay else 0.0))
+    p_dec = (np.asarray(p, dtype=np.float32).reshape(-1) * decay).astype(np.float32)
+
+    if group_ids is None:
+        target_v = (gs * gs).astype(np.float32)
+        v_indices = slice(None)
+    else:
+        counts = np.bincount(group_ids)
+        target_v = (np.bincount(group_ids, weights=gs.astype(np.float64) ** 2) / counts).astype(np.float32)
+        v_indices = group_ids
+
+    old_m = np.asarray(m, dtype=np.float32).reshape(-1)
+    old_v = np.asarray(v, dtype=np.float32).reshape(-1)
+    new_m = (old_m + (gs - old_m) * np.float32(1.0 - b1)).astype(np.float32)
+    new_v = (old_v + (target_v - old_v) * np.float32(1.0 - b2)).astype(np.float32)
+
+    lr_bc1 = np.float32(optimizer.lr / (1.0 - b1 ** step))
+    inv_sqrt_bc2 = np.float32(1.0 / math.sqrt(1.0 - b2 ** step))
+    denom = np.sqrt(np.maximum(new_v[v_indices], np.float32(0.0))) * inv_sqrt_bc2 + np.float32(optimizer.eps)
+    new_p = (p_dec - lr_bc1 * (new_m / denom)).astype(np.float32)
+    return new_p, new_m, new_v
+
+def _check_quant_encoding(rt, label, optimizer, index, ref_m, ref_v):
+    if optimizer.state_mode == "fp32":
+        return
+    item = optimizer.dispatches[index]
+    if optimizer.state_mode == "8bit" and item[0] == "q8":
+        for tag, q_st, s_st, t_st, ref in (
+            ("m", item[3], item[5], optimizer.qmap_m, ref_m),
+            ("v", item[4], item[6], optimizer.qmap_v, ref_v),
+        ):
+            codes = read_storage_u8(rt, q_st)
+            table = read_storage_f32(rt, t_st, (256,))
+            exp_s = np.maximum(np.maximum.reduceat(np.abs(ref), np.arange(0, ref.size, 256)), np.float32(1e-30))
+            got_s = read_storage_f32(rt, s_st).reshape(-1)
+            np.testing.assert_allclose(got_s, exp_s, rtol=3e-5, atol=1e-30, err_msg=f"{label}/{tag}/scale")
+            norm = np.clip(ref / exp_s[np.arange(ref.size) // 256], table[0], table[-1])
+            up = np.clip(np.searchsorted(table, norm, side="left"), 0, 255)
+            dn = np.maximum(up - 1, 0)
+            best = np.minimum(np.abs(table[up] - norm), np.abs(table[dn] - norm))
+            assert np.all(np.abs(table[codes] - norm) <= best + 3e-6), f"{label}/{tag}/nearest-code"
+    elif optimizer.state_mode == "mini" and bool(item[13]):
+        codes = read_storage_u8(rt, item[3])
+        meta = read_storage_f32(rt, item[4]).reshape(-1, 2)
+        if bool(item[12]):
+            cols = int(item[9])
+            rows = ref_m.size // cols
+            j = np.arange(ref_m.size, dtype=np.int64)
+            exp_q = ref_m[(j % rows) * cols + j // rows]
+        else:
+            exp_q = ref_m
+        bmin = np.minimum.reduceat(exp_q, np.arange(0, exp_q.size, 256))
+        bmax = np.maximum.reduceat(exp_q, np.arange(0, exp_q.size, 256))
+        exp_s = np.maximum(bmax - bmin, np.float32(1e-5)) / np.float32(255.0)
+        np.testing.assert_allclose(meta[:, 0], exp_s, rtol=3e-5, atol=1e-12, err_msg=f"{label}/mini/scale")
+        blocks = np.arange(exp_q.size, dtype=np.int64) // 256
+        decoded = (codes.astype(np.float32) - meta[blocks, 1]) * meta[blocks, 0]
+        assert np.all(np.abs(decoded - exp_q) <= meta[blocks, 0] + 3e-6), f"{label}/mini/decoded"
+
+def _make_optimizer_leaf(rt, array, grad_dtype=np.float32):
+    t = Tensor(array.shape, np.float32, device="cuda", requires_grad=True, grad_dtype=grad_dtype, init_val=array.copy())
+    t.storage = rt.allocator.alloc(t.shape, np.float32)
+    rt.backend.init(t)
+    t.grad = Tensor(t.shape, np.float32, device="cuda", requires_grad=False, grad_dtype=grad_dtype)
+    g_st_dtype = np.uint16 if str(grad_dtype).lower() in ("bf16", "bfloat16") else np.float32
+    t.grad.storage = rt.allocator.alloc(t.shape, g_st_dtype)
+    rt.backend.fill_storage2(t.grad.storage, 0.0)
+    return t
+
+def probe_grad_clip_and_adamw(cfg, arrays, seed, grad_dtype=np.float32):
+    # 1. 内核级校验：覆盖 fp32 / 8bit / mini 三种模式、非对齐尾部尺寸、grad_norm_sq 裁剪与多步状态延续
+    opt_cfg = Config(B=1, T=8, V=128, C=128, H=2, D=64, L=1)
+    opt_arrays = build_parameter_arrays(opt_cfg, seed + 701)
+    opt_inputs = build_inputs(opt_cfg, seed + 702)
+
+    for state_mode in ("fp32", "8bit", "mini"):
+        print(f"\n=== grad_norm_sq & AdamW state_mode={state_mode} (CUDA vs NumPy) ===")
+        state = build_gpt2_graph("cuda", opt_cfg, opt_arrays, *opt_inputs, grad_dtype=grad_dtype)
+        rt = state.rt
+        rng = np.random.default_rng(seed + 703)
+
+        cases = list(state.param_by_name.items())
+        cases.append(("extra_vector_4101", _make_optimizer_leaf(rt, (rng.standard_normal((4101,)) * 0.02).astype(np.float32), grad_dtype)))
+        if state_mode != "mini":
+            cases.append(("small_matrix_17x13", _make_optimizer_leaf(rt, (rng.standard_normal((17, 13)) * 0.02).astype(np.float32), grad_dtype)))
+
+        optimizer = AdamW([p for _, p in cases], lr=0.002, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.2, state_mode=state_mode)
+        clip_fn = optimizer.build_grad_clip()
+        get_mini_ids = _mini_group_ids_map(rt) if state_mode == "mini" else None
+        group_ids_list = [get_mini_ids(p) if state_mode == "mini" else None for _, p in cases]
+
+        for step, (wd, max_norm) in enumerate(((0.2, 1.0), (0.0, 0.05), (0.07, 100.0), (0.13, 1.0)), 1):
+            optimizer.lr = 0.002 / step
+            optimizer.weight_decay = wd
+            realized_grads = []
+            prev_states = []
+
+            for i, (_, p) in enumerate(cases):
+                if step == 1:
+                    ids = group_ids_list[i]
+                    prev_states.append((
+                        np.zeros(p.numel, np.float32),
+                        np.zeros(p.numel if ids is None else int(ids.max()) + 1, np.float32),
+                    ))
+                else:
+                    prev_states.append(read_adamw_state(rt, optimizer, i))
+
+                g = (rng.standard_normal(p.shape) * 0.03).astype(np.float32)
+                if p.ndim > 1:
+                    g *= np.linspace(0.2, 2.0, p.shape[-1], dtype=np.float32)
+                if step in (1, 4):
+                    g.fill(0.0)
+                rt.backend.copy_from_host(p.grad, g)
+                realized_grads.append(copy_to_host(rt, p.grad))
+
+            ref_norm = math.sqrt(sum(float(np.sum(rg.astype(np.float64) ** 2)) for rg in realized_grads))
+            ref_coef = min(1.0, float(max_norm) / (ref_norm + 1e-6))
+            got_norm, got_coef = clip_fn(max_norm)
+            check(f"grad_norm_sq/{state_mode}/step{step}/norm", np.float32(got_norm), np.float32(ref_norm), atol=1e-5, rtol=1e-5, fail_fast=True)
+            check(f"grad_norm_sq/{state_mode}/step{step}/clip_coef", np.float32(got_coef), np.float32(ref_coef), atol=1e-5, rtol=1e-5, fail_fast=True)
+
+            expected = [
+                _adamw_reference_step(
+                    copy_to_host(rt, p), realized_grads[i], prev_states[i][0], prev_states[i][1],
+                    step, optimizer, group_ids=group_ids_list[i], grad_scale=got_coef, apply_decay=(p.ndim > 1),
+                )
+                for i, (_, p) in enumerate(cases)
+            ]
+
+            optimizer.step(grad_scale=got_coef)
+            rt.backend.synchronize()
+
+            for i, (name, p) in enumerate(cases):
+                ref_p, ref_m, ref_v = expected[i]
+                label = f"AdamW/{state_mode}/{name}/step{step}"
+                quantized = (
+                    (state_mode == "mini" and bool(optimizer.dispatches[i][13]))
+                    or (state_mode == "8bit" and optimizer.dispatches[i][0] == "q8")
+                )
+                stochastic = (state_mode == "mini" and bool(optimizer.dispatches[i][11]))
+                _check_optimizer_value(label + "/p", copy_to_host(rt, p).reshape(-1), ref_p,
+                                       state_mode=state_mode, value_kind="parameter",
+                                       quantized=quantized, stochastic=stochastic, fail_fast=True)
+                got_m, got_v = read_adamw_state(rt, optimizer, i)
+                _check_quant_encoding(rt, label, optimizer, i, ref_m, ref_v)
+                if not quantized:
+                    _check_optimizer_value(label + "/m", got_m.reshape(-1), ref_m,
+                                           state_mode=state_mode, value_kind="m", fail_fast=True)
+                if not (state_mode == "8bit" and quantized):
+                    _check_optimizer_value(label + "/v", got_v.reshape(-1), ref_v,
+                                           state_mode=state_mode, value_kind="v",
+                                           quantized=quantized, stochastic=stochastic, fail_fast=True)
+
+    # 2. 完整多层 GPT2 端到端单步参数更新校验 (forward + backward + clip_grad_norm + AdamW.step + 更新后 loss 下降验证)
+    print("\n=== Full Multi-Layer GPT2 Single-Step Parameter Update (grad_norm_sq + AdamW) ===")
+    batch_ids, batch_labels = build_inputs(cfg, seed + 901)
+    cpu_eval = build_gpt2_graph("cpu", cfg, arrays, batch_ids, batch_labels)
+
+    for state_mode in ("fp32", "8bit", "mini"):
+        cuda_state = build_gpt2_graph("cuda", cfg, arrays, batch_ids, batch_labels, grad_dtype=grad_dtype)
+        rt = cuda_state.rt
+        optimizer = AdamW(cuda_state.model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.1, state_mode=state_mode)
+        clip_fn = optimizer.build_grad_clip()
+        get_mini_ids = _mini_group_ids_map(rt) if state_mode == "mini" else None
+
+        params_before = {n: copy_to_host(rt, p) for n, p in cuda_state.param_by_name.items()}
+        cuda_state.loss.backward(grad_scale=1.0, accumulate_parameter_grads=False)
+        rt.backend.synchronize()
+        loss_before = float(copy_to_host(rt, cuda_state.loss).reshape(-1)[0])
+        grads_realized = {n: copy_to_host(rt, p.grad) for n, p in cuda_state.param_by_name.items()}
+
+        ref_norm = math.sqrt(sum(float(np.sum(g.astype(np.float64) ** 2)) for g in grads_realized.values()))
+        max_norm = max(1e-4, 0.5 * ref_norm)
+        got_norm, got_coef = clip_fn(max_norm)
+        ref_coef = min(1.0, max_norm / (ref_norm + 1e-6))
+        check(f"GPT2_step/{state_mode}/grad_norm", np.float32(got_norm), np.float32(ref_norm), atol=1e-5, rtol=1e-5, fail_fast=True)
+        check(f"GPT2_step/{state_mode}/clip_coef", np.float32(got_coef), np.float32(ref_coef), atol=1e-5, rtol=1e-5, fail_fast=True)
+
+        optimizer.step(grad_scale=got_coef)
+        rt.backend.synchronize()
+
+        max_delta = 0.0
+        for idx, p in enumerate(optimizer.params):
+            name = cuda_state.param_name_by_id[id(p)]
+            ids = get_mini_ids(p) if state_mode == "mini" else None
+            m0 = np.zeros(p.numel, np.float32)
+            v0 = np.zeros(p.numel if ids is None else int(ids.max()) + 1, np.float32)
+            ref_p, ref_m, ref_v = _adamw_reference_step(
+                params_before[name], grads_realized[name], m0, v0,
+                1, optimizer, group_ids=ids, grad_scale=got_coef, apply_decay=(p.ndim > 1),
+            )
+            got_p = copy_to_host(rt, p)
+            max_delta = max(max_delta, float(np.max(np.abs(got_p - params_before[name]))))
+            quantized = (
+                (state_mode == "mini" and bool(optimizer.dispatches[idx][13]))
+                or (state_mode == "8bit" and optimizer.dispatches[idx][0] == "q8")
+            )
+            stochastic = (state_mode == "mini" and bool(optimizer.dispatches[idx][11]))
+            _check_optimizer_value(
+                f"GPT2_step/{state_mode}/{name}/p", got_p.reshape(-1), ref_p,
+                state_mode=state_mode, value_kind="parameter",
+                quantized=quantized, stochastic=stochastic, fail_fast=True,
+            )
+            _check_quant_encoding(rt, f"GPT2_step/{state_mode}/{name}", optimizer, idx, ref_m, ref_v)
+            cpu_eval.rt.backend.copy_from_host(cpu_eval.param_by_name[name], ref_p.reshape(p.shape))
+
+        assert max_delta > 0.0, f"GPT2_step/{state_mode}: parameters did not update"
+        rt.forward()
+        rt.backend.synchronize()
+        cpu_eval.rt.forward()
+        loss_after_cuda = copy_to_host(rt, cuda_state.loss)
+        loss_after_cpu = copy_to_host(cpu_eval.rt, cpu_eval.loss)
+        check(f"GPT2_step/{state_mode}/post_step_loss_vs_cpu_ref", loss_after_cuda, loss_after_cpu, atol=1e-5, rtol=1e-5, fail_fast=True)
+        loss_after_val = float(loss_after_cuda.reshape(-1)[0])
+        print(f"  PASS GPT2_step/{state_mode}: loss {loss_before:.6f} -> {loss_after_val:.6f} (max_dp={max_delta:.4e})")
+        if not (loss_after_val < loss_before):
+            raise AssertionError(f"GPT2_step/{state_mode}: loss did not decrease ({loss_before} -> {loss_after_val})")
+
 def apply_rope_reference(q, k, cos, sin):
     d2 = q.shape[-1] // 2
     q1, q2 = q[..., :d2].copy(), q[..., d2:].copy()
@@ -1784,6 +2090,9 @@ def main():
             cpu_trace["backward"][f"Add[{args.kernel_block}]"]["output_grads"][0],
             grad_dtype=grad_dtype,
         )
+
+    if not args.skip_optimizer:
+        probe_grad_clip_and_adamw(cfg, arrays, args.seed, grad_dtype=grad_dtype)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")

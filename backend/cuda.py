@@ -748,3 +748,129 @@ class CudaBackend(Backend):
 
 	def cuda_fused_linear_ce_backward(self, inputs, outputs, scratch=None):
 		return
+
+	def grad_norm_sq(self, g_storage, partial, numel):
+		numel = int(numel)
+		if numel <= 0:
+			return
+		grad_bf16 = int(np.dtype(g_storage.dtype) == np.dtype(np.uint16))
+		n_groups = (numel + 255) // 256
+		self.ctx.dispatch("grad_norm_sq_kernel",
+			[g_storage.ptr.buffer_id, partial.ptr.buffer_id],
+			[g_storage.ptr.offset, partial.ptr.offset],
+			[numel, grad_bf16], n_groups, 1, 1, 256)
+
+	def adamw_step(self, p_storage, g_storage, m_storage, v_storage, tmp_storage,
+				   lr, lr_t, b1, b2, eps, weight_decay, numel=None, decay_numel=None,
+				   grad_scale=1.0, lr_bc1=None, inv_sqrt_bc2=1.0):
+		self._rollout_cache_dirty = True
+		if numel is None:
+			numel = prod(p_storage.shape)
+		if decay_numel is None:
+			decay_numel = numel if weight_decay != 0.0 else 0
+		numel = int(numel)
+		decay_numel = int(decay_numel)
+		if numel <= 0:
+			return
+
+		decay_factor = 1.0 - float(lr) * float(weight_decay)
+		update_lr = lr_t if lr_bc1 is None else lr_bc1
+		grad_bf16 = int(np.dtype(g_storage.dtype) == np.dtype(np.uint16))
+		g_align = 8 if grad_bf16 else 16
+		vec4 = int(
+			p_storage.ptr.offset % 16 == 0
+			and m_storage.ptr.offset % 16 == 0
+			and v_storage.ptr.offset % 16 == 0
+			and g_storage.ptr.offset % g_align == 0
+		)
+		n_vec = (numel + 3) // 4
+		self.ctx.dispatch("adamw_step_kernel",
+			[p_storage.ptr.buffer_id, g_storage.ptr.buffer_id, m_storage.ptr.buffer_id, v_storage.ptr.buffer_id],
+			[p_storage.ptr.offset, g_storage.ptr.offset, m_storage.ptr.offset, v_storage.ptr.offset],
+			[f32_bits(decay_factor), f32_bits(update_lr), f32_bits(b1), f32_bits(b2), f32_bits(eps),
+			 numel, decay_numel, f32_bits(grad_scale), f32_bits(inv_sqrt_bc2), grad_bf16, vec4],
+			(n_vec + 255) // 256, 1, 1, 256)
+
+	def adamw8bit_step(self, p, g, qm, qv, absmax_m, absmax_v, qmap_m, qmap_v,
+					   lr, lr_bc1, inv_sqrt_bc2, b1, b2, eps, weight_decay,
+					   numel, decay_numel, first_step, grad_scale=1.0):
+		self._rollout_cache_dirty = True
+		numel = int(numel)
+		if numel <= 0:
+			return
+		grad_bf16 = int(np.dtype(g.dtype) == np.dtype(np.uint16))
+		self.ctx.dispatch("adamw8bit_step_kernel",
+			[p.ptr.buffer_id, g.ptr.buffer_id, qm.ptr.buffer_id, qv.ptr.buffer_id,
+			 absmax_m.ptr.buffer_id, absmax_v.ptr.buffer_id, qmap_m.ptr.buffer_id, qmap_v.ptr.buffer_id],
+			[p.ptr.offset, g.ptr.offset, qm.ptr.offset, qv.ptr.offset,
+			 absmax_m.ptr.offset, absmax_v.ptr.offset, qmap_m.ptr.offset, qmap_v.ptr.offset],
+			[f32_bits(1.0 - float(lr) * float(weight_decay)), f32_bits(lr_bc1),
+			 f32_bits(b1), f32_bits(b2), f32_bits(eps),
+			 numel, int(decay_numel), int(bool(first_step)),
+			 f32_bits(inv_sqrt_bc2), grad_bf16, f32_bits(grad_scale)],
+			(numel + 255) // 256, 1, 1, 256)
+
+	@staticmethod
+	def _mini_v_group_count(numel, block_elems, cols, head_cols):
+		import operator
+		try:
+			numel, block_elems, cols, head_cols = (operator.index(x) for x in (numel, block_elems, cols, head_cols))
+		except TypeError as exc:
+			raise TypeError("AdamW-mini dimensions must be integers") from exc
+		if not 0 < numel <= 0xFFFFFF00:
+			raise ValueError("invalid AdamW-mini numel")
+		if not 0 < block_elems <= numel:
+			raise ValueError("invalid AdamW-mini block_elems")
+		if not 0 < cols <= numel:
+			raise ValueError("invalid AdamW-mini cols")
+		if not 0 <= head_cols <= cols:
+			raise ValueError("invalid AdamW-mini head_cols")
+		if head_cols:
+			if numel % cols or cols % head_cols or block_elems != (numel // cols) * head_cols:
+				raise ValueError("invalid AdamW-mini head grouping")
+			return cols // head_cols
+		return (numel + block_elems - 1) // block_elems
+
+	def mini_update_v(self, g, v, b2, numel, block_elems, *, cols, head_cols, first_step, grad_scale=1.0):
+		n_v_blocks = self._mini_v_group_count(numel, block_elems, cols, head_cols)
+		grad_dtype = np.dtype(g.dtype)
+		grad_bf16 = int(grad_dtype == np.dtype(np.uint16))
+		if g.nbytes < numel * grad_dtype.itemsize or v.nbytes < n_v_blocks * 4:
+			raise ValueError("AdamW-mini gradient/v storage is too small")
+		if head_cols == 0 and block_elems == 1:
+			grid_x = (numel + 255) // 256
+		elif head_cols == 1:
+			grid_x = (cols + 7) // 8
+		else:
+			grid_x = n_v_blocks
+		self.ctx.dispatch("mini_update_v_kernel",
+			[g.ptr.buffer_id, v.ptr.buffer_id],
+			[g.ptr.offset, v.ptr.offset],
+			[f32_bits(b2), f32_bits(grad_scale), int(numel), int(block_elems),
+			 int(cols), int(head_cols), int(bool(first_step)), grad_bf16],
+			grid_x, 1, 1, 256)
+
+	def adamw_mini8bit_step(self, p, g, m, meta, v, lr, lr_bc1, inv_sqrt_bc2, b1, eps, weight_decay,
+							numel, decay_numel, block_elems, *, cols, head_cols, first_step, seed,
+							stochastic_round, transpose_m, quantized, grad_scale=1.0):
+		self._rollout_cache_dirty = True
+		self._mini_v_group_count(numel, block_elems, cols, head_cols)
+		if not 0 <= decay_numel <= numel:
+			raise ValueError("invalid decay_numel")
+		if transpose_m and numel % cols:
+			raise ValueError("Invalid transposed matrix shape")
+		if quantized and meta is None:
+			raise ValueError("quantized AdamW-mini requires metadata storage")
+
+		grad_bf16 = int(np.dtype(g.dtype) == np.dtype(np.uint16))
+		meta_id = meta.ptr.buffer_id if meta is not None else 0
+		meta_off = meta.ptr.offset if meta is not None else 0
+		self.ctx.dispatch("adamw_mini8bit_step_kernel",
+			[p.ptr.buffer_id, g.ptr.buffer_id, m.ptr.buffer_id, meta_id, v.ptr.buffer_id],
+			[p.ptr.offset, g.ptr.offset, m.ptr.offset, meta_off, v.ptr.offset],
+			[f32_bits(1.0 - float(lr) * float(weight_decay)), f32_bits(lr_bc1), f32_bits(inv_sqrt_bc2),
+			 f32_bits(b1), f32_bits(eps), f32_bits(grad_scale),
+			 int(numel), int(decay_numel), int(block_elems), int(cols), int(head_cols),
+			 int(bool(first_step)), int(seed) & 0xFFFFFFFF, int(bool(stochastic_round)),
+			 int(bool(transpose_m)), int(bool(quantized)), grad_bf16],
+			(int(numel) + 255) // 256, 1, 1, 256)
