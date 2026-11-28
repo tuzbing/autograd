@@ -83,7 +83,7 @@ __device__ __forceinline__ void cuda_sgemm_128x128x8_impl(
         ? (((K & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(B) & 15u) == 0u))
         : (((N & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(B) & 15u) == 0u));
 
-    auto load_a = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_a = [&](uint32_t k0) -> float4 {
         if constexpr (!kTransA) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
@@ -113,7 +113,7 @@ __device__ __forceinline__ void cuda_sgemm_128x128x8_impl(
         }
     };
 
-    auto store_a = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_a = [&](uint32_t stage, const float4& v) {
         if constexpr (!kTransA) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
@@ -126,7 +126,7 @@ __device__ __forceinline__ void cuda_sgemm_128x128x8_impl(
         }
     };
 
-    auto load_b = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_b = [&](uint32_t k0) -> float4 {
         if constexpr (!kTransB) {
             const uint32_t r = tid >> 5;
             const uint32_t c = (tid & 31u) * 4u;
@@ -156,7 +156,7 @@ __device__ __forceinline__ void cuda_sgemm_128x128x8_impl(
         }
     };
 
-    auto store_b = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_b = [&](uint32_t stage, const float4& v) {
         if constexpr (!kTransB) {
             *reinterpret_cast<float4*>(&Bs[stage][tid >> 5][(tid & 31u) * 4u]) = v;
         } else {
@@ -326,7 +326,7 @@ __device__ __forceinline__ void cuda_sgemm_64x64x8_impl(
         ? (((K & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(B) & 15u) == 0u))
         : (((N & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(B) & 15u) == 0u));
 
-    auto load_ab = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_ab = [&](uint32_t k0) -> float4 {
         if (tid < 128u) {
             if constexpr (!kTransA) {
                 const uint32_t r = tid >> 1;
@@ -387,7 +387,7 @@ __device__ __forceinline__ void cuda_sgemm_64x64x8_impl(
         }
     };
 
-    auto store_ab = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_ab = [&](uint32_t stage, const float4& v) {
         if (tid < 128u) {
             if constexpr (!kTransA) {
                 const uint32_t r = tid >> 1;

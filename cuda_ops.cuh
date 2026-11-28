@@ -1682,7 +1682,7 @@ __global__ __launch_bounds__(256, 2) void fused_wgu_swiglu_128_kernel(
     const bool vec_b = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(wgu) & 15u) == 0u);
     const bool vec_h = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(hidden) & 15u) == 0u);
 
-    auto load_a = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_a = [&](uint32_t k0) -> float4 {
         const uint32_t r = tid >> 1;
         const uint32_t c = (tid & 1u) * 4u;
         const uint32_t gm = block_m + r;
@@ -1697,7 +1697,7 @@ __global__ __launch_bounds__(256, 2) void fused_wgu_swiglu_128_kernel(
             (gk + 3u < K) ? x_norm[base + gk + 3u] : 0.0f);
     };
 
-    auto store_a = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_a = [&](uint32_t stage, const float4& v) {
         const uint32_t r = tid >> 1;
         const uint32_t c = (tid & 1u) * 4u;
         As[stage][c + 0u][r] = v.x;
@@ -1706,7 +1706,7 @@ __global__ __launch_bounds__(256, 2) void fused_wgu_swiglu_128_kernel(
         As[stage][c + 3u][r] = v.w;
     };
 
-    auto load_b = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_b = [&](uint32_t k0) -> float4 {
         const uint32_t b_k = tid >> 5;
         const uint32_t b_slot = (tid & 31u) * 4u;
         const uint32_t gk = k0 + b_k;
@@ -1821,7 +1821,7 @@ __global__ __launch_bounds__(256, 3) void fused_wgu_swiglu_forward_kernel(
     const bool vec_a = ((K & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(x_norm) & 15u) == 0u);
     const bool vec_b = ((H & 3u) == 0u) && ((reinterpret_cast<uintptr_t>(wgu) & 15u) == 0u);
 
-    auto load_ab = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_ab = [&](uint32_t k0) -> float4 {
         if (tid < 128u) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
@@ -1853,7 +1853,7 @@ __global__ __launch_bounds__(256, 3) void fused_wgu_swiglu_forward_kernel(
         }
     };
 
-    auto store_ab = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_ab = [&](uint32_t stage, const float4& v) {
         if (tid < 128u) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
@@ -1993,7 +1993,7 @@ __global__ __launch_bounds__(256, 2) void fused_rms_fa_qkv_128_kernel(
     }
     __syncthreads();
 
-    auto load_a = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_a = [&](uint32_t k0) -> float4 {
         const uint32_t r = tid >> 1;
         const uint32_t c = (tid & 1u) * 4u;
         const uint32_t gm = block_m + r;
@@ -2012,7 +2012,7 @@ __global__ __launch_bounds__(256, 2) void fused_rms_fa_qkv_128_kernel(
             (gk + 3u < C) ? (x[base + gk + 3u] * s) : 0.0f);
     };
 
-    auto store_a = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_a = [&](uint32_t stage, const float4& v) {
         const uint32_t r = tid >> 1;
         const uint32_t c = (tid & 1u) * 4u;
         As[stage][c + 0u][r] = v.x;
@@ -2021,7 +2021,7 @@ __global__ __launch_bounds__(256, 2) void fused_rms_fa_qkv_128_kernel(
         As[stage][c + 3u][r] = v.w;
     };
 
-    auto load_b = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_b = [&](uint32_t k0) -> float4 {
         const uint32_t r = tid >> 5;
         const uint32_t c = (tid & 31u) * 4u;
         const uint32_t gk = k0 + r;
@@ -2205,7 +2205,7 @@ __global__ __launch_bounds__(256, 3) void fused_rms_fa_qkv_kernel(
     }
     __syncthreads();
 
-    auto load_ab = [&](uint32_t k0) __device__ __forceinline__ -> float4 {
+    auto load_ab = [&](uint32_t k0) -> float4 {
         if (tid < 128u) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
@@ -2240,7 +2240,7 @@ __global__ __launch_bounds__(256, 3) void fused_rms_fa_qkv_kernel(
         }
     };
 
-    auto store_ab = [&](uint32_t stage, const float4& v) __device__ __forceinline__ {
+    auto store_ab = [&](uint32_t stage, const float4& v) {
         if (tid < 128u) {
             const uint32_t r = tid >> 1;
             const uint32_t c = (tid & 1u) * 4u;
