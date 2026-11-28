@@ -55,11 +55,15 @@ class CudaContext {
 	            {"swiglu_backward_inplace_kernel",  (const void*)&swiglu_backward_inplace_kernel},
 	            {"rmsnorm_backward_kernel",         (const void*)&rmsnorm_backward_kernel},
 	            {"rmsnorm_dgamma_kernel",           (const void*)&rmsnorm_dgamma_kernel},
-	            {"fused_rms_fa_qkv_kernel",         (const void*)&fused_rms_fa_qkv_kernel},
-	            {"rope_qk_inplace_kernel",          (const void*)&rope_qk_inplace_kernel},
-	            {"flash_attn_fwd_kernel",           (const void*)&flash_attn_fwd_kernel},
-	            {"flash_attn_bwd_prepare_kernel",   (const void*)&flash_attn_bwd_prepare_kernel},
-	            {"flash_attn_bwd_kernel",           (const void*)&flash_attn_bwd_kernel},
+	            {"fused_rms_fa_qkv_kernel",                   (const void*)&fused_rms_fa_qkv_kernel},
+	            {"rope_qk_inplace_kernel",                    (const void*)&rope_qk_inplace_kernel},
+	            {"flash_attn_fwd_kernel",                     (const void*)&flash_attn_fwd_kernel},
+	            {"flash_attn_bwd_prepare_kernel",             (const void*)&flash_attn_bwd_prepare_kernel},
+	            {"flash_attn_bwd_kernel",                     (const void*)&flash_attn_bwd_kernel},
+	            {"fused_linear_ce_logits_to_dlogits_kernel",  (const void*)&fused_linear_ce_logits_to_dlogits_kernel},
+	            {"fused_linear_ce_reduce_kernel",             (const void*)&fused_linear_ce_reduce_kernel},
+	            {"ce_tile_logits_to_dlogits_kernel",          (const void*)&ce_tile_logits_to_dlogits_kernel},
+	            {"fp32_to_bf16_accum_kernel",                 (const void*)&fp32_to_bf16_accum_kernel},
 	        };
 	    }
 

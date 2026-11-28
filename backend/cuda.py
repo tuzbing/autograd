@@ -3,7 +3,7 @@ import numpy as np
 from math import prod
 from .base import Backend
 from op import (
-	GatherOp, FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp
+	GatherOp, FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp, FusedLinearCrossEntropyOp
 )
 from utils import f32_bits, bf16_bits
 
@@ -20,12 +20,14 @@ class CudaBackend(Backend):
 			FusedLinearAddOp: self.cuda_fused_linear_add_forward,
 			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_forward,
 			FusedRMSNormFlashAttentionOp: self.cuda_fused_rms_fa_forward,
+			FusedLinearCrossEntropyOp: self.cuda_fused_linear_ce_forward,
 		}
 		self.backward_kernels = {
 			GatherOp: self.cuda_gather_backward,
 			FusedLinearAddOp: self.cuda_fused_linear_add_backward,
 			FusedRMSNormMLPOp: self.cuda_fused_rmsnorm_mlp_backward,
 			FusedRMSNormFlashAttentionOp: self.cuda_fused_rms_fa_backward,
+			FusedLinearCrossEntropyOp: self.cuda_fused_linear_ce_backward,
 		}
 
 	def copy_from_host(self, tensor, host_np):
@@ -486,3 +488,119 @@ class CudaBackend(Backend):
 				[x.storage.ptr.buffer_id, k.ptr.buffer_id, 0, x.grad.storage.ptr.buffer_id, 0],
 				[x.storage.ptr.offset, k.ptr.offset, 0, x.grad.storage.ptr.offset, 0],
 				[N, C, eps_bits, accum_x], (N + 3) // 4, 1, 1, 128)
+
+	def cuda_fused_linear_ce_forward(self, inputs, outputs, scratch=None):
+		x, w, targets = inputs[0], inputs[1], inputs[2]
+		row_scale = inputs[3] if len(inputs) > 3 else None
+		out_loss = outputs[0]
+
+		N = prod(x.shape[:-1])
+		C = x.shape[-1]
+		V = w.shape[0]
+		row_loss = scratch["row_loss"]
+		lse = scratch["lse"]
+		logits = scratch["logits"]
+		chunk_rows = min(logits.shape[0], N)
+		itemsize = np.dtype(x.dtype).itemsize
+
+		accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
+		grad_scale = float(getattr(self, "grad_scale", 1.0))
+		need_grad = (out_loss.grad is not None) and (x.requires_grad or w.requires_grad)
+		dw_bf16 = need_grad and w.requires_grad and np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+		defer_dw_bf16 = dw_bf16 and (N > chunk_rows)
+
+		if row_scale is None:
+			scale_bits = f32_bits(grad_scale / float(N))
+			rs_id, rs_off = 0, 0
+		else:
+			scale_bits = f32_bits(grad_scale)
+			rs_id, rs_off = row_scale.storage.ptr.buffer_id, row_scale.storage.ptr.offset
+		ignore_bits = int(out_loss.op.op.ignore_index) & 0xFFFFFFFF
+
+		for row_base in range(0, N, chunk_rows):
+			rows = min(chunk_rows, N - row_base)
+			x_off = x.storage.ptr.offset + row_base * C * itemsize
+
+			# 1. logits = X_chunk [rows, C] @ W^T [V, C]
+			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+				[x_off, w.storage.ptr.offset, logits.ptr.offset],
+				[rows, V, C, 0], (V+63)//64, (rows+63)//64, 1, 256)
+
+			# 2. 单趟在线归约 row_loss / lse，并在需要梯度时原地覆写 dlogits
+			self.ctx.dispatch("fused_linear_ce_logits_to_dlogits_kernel",
+				[logits.ptr.buffer_id, targets.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id, rs_id],
+				[logits.ptr.offset, targets.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset, rs_off],
+				[rows, V, row_base, N, scale_bits, int(need_grad), ignore_bits],
+				rows, 1, 1, 256)
+
+			if not need_grad:
+				continue
+
+			# 3. dX_chunk = dlogits [rows, V] @ W [V, C]
+			if x.requires_grad:
+				dx_off = x.grad.storage.ptr.offset + row_base * C * itemsize
+				accum_x = int(x.op is None and accumulate)
+				self.ctx.dispatch("cuda_sgemm_nn_kernel",
+					[logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+					[logits.ptr.offset, w.storage.ptr.offset, dx_off],
+					[rows, C, V, accum_x], (C + 63) // 64, (rows + 63) // 64, 1, 256)
+
+			# 4. dW += dlogits^T [V, rows] @ X_chunk [rows, C]
+			# FP32 或单分块 BF16 直接寄存器级一次写出；仅多分块 BF16 延迟至二阶段保证全 N 行 FP32 累加精度
+			if w.requires_grad and not defer_dw_bf16:
+				accum_w = int(accumulate or row_base != 0)
+				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+					[logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+					[logits.ptr.offset, x_off, w.grad.storage.ptr.offset],
+					[V, C, rows, accum_w, int(dw_bf16)],
+					(C + 63) // 64, (V + 63) // 64, 1, 256)
+
+# 5. 归约所有 token 的 row_loss 输出标量 loss
+		self.ctx.dispatch("fused_linear_ce_reduce_kernel",
+			[row_loss.ptr.buffer_id, out_loss.storage.ptr.buffer_id],
+			[row_loss.ptr.offset, out_loss.storage.ptr.offset],
+			[N], 1, 1, 1, 256)
+
+		if not defer_dw_bf16:
+			return
+
+		# 6. 多分块 BF16 权重梯度：复用 logits 缓冲区前部存 dlogits_tile、后部存 FP32 dw_tile，全 N 行累加后单次转 BF16
+		capacity = logits.nbytes // 4
+		tile_rows = min(chunk_rows, max(1, capacity - C))
+		tile_v = max(1, min(V, capacity // (tile_rows + C)))
+		dw_off = logits.ptr.offset + tile_rows * tile_v * 4
+
+		for vocab_base in range(0, V, tile_v):
+			cols = min(tile_v, V - vocab_base)
+			w_off = w.storage.ptr.offset + vocab_base * C * 4
+			for row_base in range(0, N, tile_rows):
+				rows = min(tile_rows, N - row_base)
+				x_off = x.storage.ptr.offset + row_base * C * 4
+
+				self.ctx.dispatch("cuda_sgemm_nt_kernel",
+					[x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[x_off, w_off, logits.ptr.offset],
+					[rows, cols, C, 0], (cols + 63) // 64, (rows + 63) // 64, 1, 256)
+
+				count = rows * cols
+				self.ctx.dispatch("ce_tile_logits_to_dlogits_kernel",
+					[logits.ptr.buffer_id, lse.ptr.buffer_id, targets.storage.ptr.buffer_id, rs_id],
+					[logits.ptr.offset, lse.ptr.offset, targets.storage.ptr.offset, rs_off],
+					[rows, cols, vocab_base, V, row_base, scale_bits, ignore_bits],
+					(count + 255) // 256, 1, 1, 256)
+
+				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+					[logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
+					[logits.ptr.offset, x_off, dw_off],
+					[cols, C, rows, int(row_base != 0), 0],
+					(C + 63) // 64, (cols + 63) // 64, 1, 256)
+
+			dw_count = cols * C
+			self.ctx.dispatch("fp32_to_bf16_accum_kernel",
+				[logits.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+				[dw_off, w.grad.storage.ptr.offset + vocab_base * C * 2],
+				[dw_count, int(accumulate)], (dw_count + 255) // 256, 1, 1, 256)
+
+	def cuda_fused_linear_ce_backward(self, inputs, outputs, scratch=None):
+		return

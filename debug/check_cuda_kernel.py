@@ -44,7 +44,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import runtime  # noqa: E402
 from module import GPT2  # noqa: E402
-from op import FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp  # noqa: E402
+from op import (
+    FusedLinearAddOp, FusedRMSNormMLPOp, FusedRMSNormFlashAttentionOp, FusedLinearCrossEntropyOp
+)
 from tensor import Tensor  # noqa: E402
 from utils import f32_bits
 
@@ -143,6 +145,8 @@ def reset_runtime(device):
     Runtime._default_runtime = None
     gc.collect()
     rt = Runtime(device=device, use_fp16_gemm=False)
+    rt.backend.accumulate_parameter_grads = False
+    rt.backend.grad_scale = 1.0
     Runtime._default_runtime = rt
     return rt
 
@@ -389,6 +393,9 @@ def _run_op_graph(device, build_fn, upstream_np, grad_dtype=np.float32, accum_st
     rt.is_compiled = True
 
     rng = np.random.default_rng(seed)
+    scaled_upstream = np.asarray(upstream_np, dtype=np.float32) / np.float32(accum_steps)
+    scalar_grad_scale = float(scaled_upstream.reshape(-1)[0]) if out.numel == 1 else 1.0
+
     for step in range(accum_steps):
         if step > 0:
             if "ids" in tracked:
@@ -404,9 +411,18 @@ def _run_op_graph(device, build_fn, upstream_np, grad_dtype=np.float32, accum_st
             if "fa_x" in tracked:
                 new_fa_x = (rng.standard_normal(tracked["fa_x"].shape).astype(np.float32) * 0.02).copy()
                 rt.backend.copy_from_host(tracked["fa_x"], new_fa_x)
+            if "ce_x" in tracked:
+                new_ce_x = (rng.standard_normal(tracked["ce_x"].shape).astype(np.float32) * 0.02).copy()
+                rt.backend.copy_from_host(tracked["ce_x"], new_ce_x)
+            if "ce_labels" in tracked:
+                v_size = tracked["lm_head.weight"].shape[0]
+                new_labels = rng.integers(0, v_size, tracked["ce_labels"].shape, dtype=np.int32)
+                rt.backend.copy_from_host(tracked["ce_labels"], new_labels)
 
         rt.accumulate_parameter_grads = step > 0
         rt.backend.accumulate_parameter_grads = step > 0
+        rt.grad_scale = scalar_grad_scale
+        rt.backend.grad_scale = scalar_grad_scale
         if device == "cpu" and step == 0:
             rt.zero_grad()
 
@@ -1154,8 +1170,192 @@ def probe_fa_internal(cfg, x_np, arrays, block, upstream, grad_dtype=np.float32)
     ))
     check("rmsnorm_backward_kernel/x.grad", copy_to_host(rt, x.grad), oracle["dx_local"])
 
+def ce_oracle(x, w, labels):
+    x = np.asarray(x, dtype=np.float32)
+    w = np.asarray(w, dtype=np.float32)
+    labels = np.asarray(labels, dtype=np.int32)
+    B, T, C = x.shape
+    N, V = B * T, w.shape[0]
+
+    X = x.reshape(N, C)
+    y = labels.reshape(N)
+    logits = (X @ w.T).astype(np.float32)
+
+    row_max = np.max(logits, axis=1, keepdims=True)
+    exp_logits = np.exp(logits - row_max)
+    sums = np.sum(exp_logits, axis=1, keepdims=True)
+    lse = (row_max + np.log(sums)).astype(np.float32)
+    row_loss = (lse[:, 0] - logits[np.arange(N), y]).astype(np.float32)
+
+    probs = exp_logits / sums
+    probs[np.arange(N), y] -= 1.0
+    dlogits = (probs / np.float32(N)).astype(np.float32)
+
+    return {
+        "logits": logits,
+        "row_loss": row_loss.reshape(N, 1),
+        "loss": np.asarray([np.mean(row_loss)], dtype=np.float32),
+        "lse": lse,
+        "dlogits": dlogits,
+        "dx": (dlogits @ w).reshape(B, T, C).astype(np.float32),
+        "dw": (dlogits.T @ X).astype(np.float32),
+    }
+
+def probe_ce_internal(cfg, x_np, w_np, labels_np, grad_dtype=np.float32):
+    """对齐 check_tiny_gpt2_kernel.py 的 probe_ce_internal，逐级验证 FusedLinearCrossEntropy 各 CUDA 内核。"""
+    print("\n=== Internal kernels: Optimized FusedLinearCrossEntropy ===")
+    oracle = ce_oracle(x_np, w_np, labels_np)
+
+    rt = reset_runtime("cuda")
+    x = make_tensor(x_np.shape, np.float32, "cuda", True, x_np)
+    w = make_tensor(w_np.shape, np.float32, "cuda", True, w_np, grad_dtype=grad_dtype)
+    labels = make_tensor(labels_np.shape, np.int32, "cuda", False, labels_np)
+    loss = FusedLinearCrossEntropyOp()(x, w, labels)
+
+    rt.loss = loss
+    rt.build_topo(loss)
+    rt.bind_memory()
+
+    node = rt.topo[-1]
+    sf = node.forward.keywords["scratch"]
+    assert not isinstance(node.backward, functools.partial), (
+        "fused CE backward should not carry scratch anymore"
+    )
+
+    N, C, V = cfg.B * cfg.T, cfg.C, cfg.V
+    itemsize = np.dtype(x.dtype).itemsize
+    logits, row_loss, lse = sf["logits"], sf["row_loss"], sf["lse"]
+    chunk_rows = min(logits.shape[0], N)
+    scale_bits = f32_bits(1.0 / float(N))
+    ignore_bits = (-1) & 0xFFFFFFFF
+    dw_bf16 = np.dtype(w.grad.storage.dtype) == np.dtype(np.uint16)
+    defer_dw_bf16 = dw_bf16 and (N > chunk_rows)
+
+    rt.backend.fill(x.grad, 0.0)
+    rt.backend.fill(w.grad, 0.0)
+
+    for row_base in range(0, N, chunk_rows):
+        rows = min(chunk_rows, N - row_base)
+        x_off = x.storage.ptr.offset + row_base * C * itemsize
+        dx_off = x.grad.storage.ptr.offset + row_base * C * itemsize
+
+        _dispatch(rt, lambda rows=rows, x_off=x_off: rt.backend.ctx.dispatch(
+            "cuda_sgemm_nt_kernel",
+            [x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+            [x_off, w.storage.ptr.offset, logits.ptr.offset],
+            [rows, V, C, 0], (V + 63) // 64, (rows + 63) // 64, 1, 256,
+        ))
+        check(
+            f"fused_ce/logits[{row_base}:{row_base + rows}]",
+            read_storage_f32(rt, logits, (rows, V)),
+            oracle["logits"][row_base:row_base + rows],
+        )
+
+        def submit_grads(rows=rows, row_base=row_base, x_off=x_off, dx_off=dx_off):
+            rt.backend.ctx.dispatch(
+                "fused_linear_ce_logits_to_dlogits_kernel",
+                [logits.ptr.buffer_id, labels.storage.ptr.buffer_id, row_loss.ptr.buffer_id, lse.ptr.buffer_id, 0],
+                [logits.ptr.offset, labels.storage.ptr.offset, row_loss.ptr.offset, lse.ptr.offset, 0],
+                [rows, V, row_base, N, scale_bits, 1, ignore_bits],
+                rows, 1, 1, 256,
+            )
+            rt.backend.ctx.dispatch(
+                "cuda_sgemm_nn_kernel",
+                [logits.ptr.buffer_id, w.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id],
+                [logits.ptr.offset, w.storage.ptr.offset, dx_off],
+                [rows, C, V, 0], (C + 63) // 64, (rows + 63) // 64, 1, 256,
+            )
+            if not defer_dw_bf16:
+                rt.backend.ctx.dispatch(
+                    "cuda_sgemm_tn_kernel",
+                    [logits.ptr.buffer_id, x.storage.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+                    [logits.ptr.offset, x_off, w.grad.storage.ptr.offset],
+                    [V, C, rows, int(row_base != 0), int(dw_bf16)],
+                    (C + 63) // 64, (V + 63) // 64, 1, 256,
+                )
+
+        _dispatch(rt, submit_grads)
+        rl_view = rt.allocator.view(row_loss, row_base * itemsize, (rows, 1), np.float32)
+        dx_view = rt.allocator.view(x.grad.storage, dx_off - x.grad.storage.ptr.offset, (rows, C), np.float32)
+        check(f"fused_ce/row_loss[{row_base}:{row_base + rows}]", read_storage_f32(rt, rl_view, (rows, 1)), oracle["row_loss"][row_base:row_base + rows])
+        check(f"fused_ce/dlogits[{row_base}:{row_base + rows}]", read_storage_f32(rt, logits, (rows, V)), oracle["dlogits"][row_base:row_base + rows])
+        check(f"fused_ce/x.grad[{row_base}:{row_base + rows}]", read_storage_f32(rt, dx_view, (rows, C)), oracle["dx"].reshape(N, C)[row_base:row_base + rows])
+
+    _dispatch(rt, lambda: rt.backend.ctx.dispatch(
+        "fused_linear_ce_reduce_kernel",
+        [row_loss.ptr.buffer_id, loss.storage.ptr.buffer_id],
+        [row_loss.ptr.offset, loss.storage.ptr.offset],
+        [N], 1, 1, 1, 256,
+    ))
+
+    if defer_dw_bf16:
+        capacity = logits.nbytes // 4
+        tile_rows = min(chunk_rows, max(1, capacity - C))
+        tile_v = max(1, min(V, capacity // (tile_rows + C)))
+        dw_off = logits.ptr.offset + tile_rows * tile_v * 4
+        for vocab_base in range(0, V, tile_v):
+            cols = min(tile_v, V - vocab_base)
+            w_off = w.storage.ptr.offset + vocab_base * C * 4
+            for row_base in range(0, N, tile_rows):
+                rows = min(tile_rows, N - row_base)
+                x_off = x.storage.ptr.offset + row_base * C * 4
+                count = rows * cols
+                _dispatch(rt, lambda rows=rows, cols=cols, vocab_base=vocab_base, row_base=row_base, x_off=x_off, w_off=w_off, count=count: (
+                    rt.backend.ctx.dispatch(
+                        "cuda_sgemm_nt_kernel",
+                        [x.storage.ptr.buffer_id, w.storage.ptr.buffer_id, logits.ptr.buffer_id],
+                        [x_off, w_off, logits.ptr.offset],
+                        [rows, cols, C, 0], (cols + 63) // 64, (rows + 63) // 64, 1, 256,
+                    ),
+                    rt.backend.ctx.dispatch(
+                        "ce_tile_logits_to_dlogits_kernel",
+                        [logits.ptr.buffer_id, lse.ptr.buffer_id, labels.storage.ptr.buffer_id, 0],
+                        [logits.ptr.offset, lse.ptr.offset, labels.storage.ptr.offset, 0],
+                        [rows, cols, vocab_base, V, row_base, scale_bits, ignore_bits],
+                        (count + 255) // 256, 1, 1, 256,
+                    ),
+                    rt.backend.ctx.dispatch(
+                        "cuda_sgemm_tn_kernel",
+                        [logits.ptr.buffer_id, x.storage.ptr.buffer_id, logits.ptr.buffer_id],
+                        [logits.ptr.offset, x_off, dw_off],
+                        [cols, C, rows, int(row_base != 0), 0],
+                        (C + 63) // 64, (cols + 63) // 64, 1, 256,
+                    ),
+                ))
+            dw_count = cols * C
+            _dispatch(rt, lambda cols=cols, vocab_base=vocab_base, dw_count=dw_count: rt.backend.ctx.dispatch(
+                "fp32_to_bf16_accum_kernel",
+                [logits.ptr.buffer_id, w.grad.storage.ptr.buffer_id],
+                [dw_off, w.grad.storage.ptr.offset + vocab_base * C * 2],
+                [dw_count, 0], (dw_count + 255) // 256, 1, 1, 256,
+            ))
+
+    check("fused_ce/loss", copy_to_host(rt, loss), oracle["loss"])
+    check("fused_ce/lse", read_storage_f32(rt, lse, (N, 1)), oracle["lse"])
+    check("fused_ce/x.grad", copy_to_host(rt, x.grad), oracle["dx"])
+    check_parameter_gradient("fused_ce/w.grad", copy_to_host(rt, w.grad), oracle["dw"], grad_dtype)
+
+    # 若默认小尺寸 N <= 512 但开启了 bf16，额外覆盖一次 N=520 > 512 的多分块 BF16 二阶段路径
+    if dw_bf16 and N <= 512:
+        rng = np.random.default_rng(SEED + 999)
+        mc_x_np = (rng.standard_normal((2, 260, 64)).astype(np.float32) * 0.02).copy()
+        mc_w_np = (rng.standard_normal((129, 64)).astype(np.float32) * 0.02).copy()
+        mc_y_np = rng.integers(0, 129, (2, 260), dtype=np.int32)
+        mc_ref = ce_oracle(mc_x_np, mc_w_np, mc_y_np)
+        mc_rt = reset_runtime("cuda")
+        mc_x = make_tensor(mc_x_np.shape, np.float32, "cuda", True, mc_x_np)
+        mc_w = make_tensor(mc_w_np.shape, np.float32, "cuda", True, mc_w_np, grad_dtype=grad_dtype)
+        mc_y = make_tensor(mc_y_np.shape, np.int32, "cuda", False, mc_y_np)
+        mc_loss = FusedLinearCrossEntropyOp()(mc_x, mc_w, mc_y)
+        mc_rt.backward(mc_loss, grad_scale=1.0, accumulate_parameter_grads=False)
+        mc_rt.backend.synchronize()
+        check("fused_ce/multichunk_bf16_v129/loss", copy_to_host(mc_rt, mc_loss), mc_ref["loss"])
+        check("fused_ce/multichunk_bf16_v129/x.grad", copy_to_host(mc_rt, mc_x.grad), mc_ref["dx"])
+        check_parameter_gradient("fused_ce/multichunk_bf16_v129/w.grad", copy_to_host(mc_rt, mc_w.grad), mc_ref["dw"], grad_dtype)
+
 def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.float32, check_accum=True):
     act_atol, act_rtol = tolerances_for_grad_dtype(grad_dtype, "activation")
+    loss_atol, loss_rtol = tolerances_for_grad_dtype(grad_dtype, "loss")
     act_grad_atol, act_grad_rtol = tolerances_for_grad_dtype(grad_dtype, "activation_grad")
 
     print("\n=== Per-operator exact training path: Gather[0] & FusedLinearAdd ===")
@@ -1244,6 +1444,23 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
     check_parameter_gradient(f"{mlp_label}/backward/{p}.mlp.fc1.weight.grad", cuda_mlp["grads"][f"{p}.mlp.fc1.weight"], cpu_mlp_bwd[1], grad_dtype)
     check_parameter_gradient(f"{mlp_label}/backward/{p}.mlp.fc2.weight.grad", cuda_mlp["grads"][f"{p}.mlp.fc2.weight"], cpu_mlp_bwd[2], grad_dtype)
 
+    ce_label = "FusedLinearCrossEntropy[0]"
+    ce_x_np, lm_w_np, ce_labels_np = cpu_trace["forward_inputs"][ce_label]
+    ce_upstream = cpu_trace["backward"][ce_label]["output_grads"][0]
+    cpu_ce_bwd = {item["index"]: item["grad"] for item in cpu_trace["backward"][ce_label]["inputs"]}
+
+    def build_ce(dev, gdtype):
+        cx = make_tensor(ce_x_np.shape, np.float32, dev, True, ce_x_np)
+        cw = make_tensor(lm_w_np.shape, np.float32, dev, True, lm_w_np, grad_dtype=gdtype)
+        cy = make_tensor(ce_labels_np.shape, np.int32, dev, False, ce_labels_np)
+        out = FusedLinearCrossEntropyOp()(cx, cw, cy)
+        return out, {"ce_x": cx, "lm_head.weight": cw, "ce_labels": cy}
+
+    cuda_ce = _run_op_graph("cuda", build_ce, ce_upstream, grad_dtype=grad_dtype)
+    check(f"{ce_label}/forward/output[0]", cuda_ce["out"], cpu_trace["forward"][ce_label][0], atol=loss_atol, rtol=loss_rtol)
+    check(f"{ce_label}/backward/input[0].grad", cuda_ce["grads"]["ce_x"], cpu_ce_bwd[0], atol=act_grad_atol, rtol=act_grad_rtol)
+    check_parameter_gradient(f"{ce_label}/backward/lm_head.weight.grad", cuda_ce["grads"]["lm_head.weight"], cpu_ce_bwd[1], grad_dtype)
+
     if check_accum:
         print("\n=== No-extra-buffer parameter gradient accumulation ===")
         for k_steps in (1, 2, 4):
@@ -1270,6 +1487,15 @@ def probe_staged_ops_and_accumulation(cpu_trace, block, seed, grad_dtype=np.floa
             for suffix in ("q_proj.weight", "q_proj.bias", "k_proj.weight", "k_proj.bias", "v_proj.weight", "v_proj.bias"):
                 pname = f"{p}.attn.{suffix}"
                 check(f"grad_accum[{k_steps}]/{pname}.grad", cuda_fa_acc["grads"][pname], cpu_fa_acc["grads"][pname], atol=atol_g, rtol=rtol_g)
+
+            cpu_ce_acc = _run_op_graph("cpu", build_ce, ce_upstream, accum_steps=k_steps, seed=seed + 900 + k_steps)
+            cuda_ce_acc = _run_op_graph("cuda", build_ce, ce_upstream, grad_dtype=grad_dtype, accum_steps=k_steps, seed=seed + 900 + k_steps)
+            check(
+                f"grad_accum[{k_steps}]/lm_head.weight.grad",
+                cuda_ce_acc["grads"]["lm_head.weight"],
+                cpu_ce_acc["grads"]["lm_head.weight"],
+                atol=atol_g, rtol=rtol_g,
+            )
 
 def main():
     global PRINT_PASSES
@@ -1329,6 +1555,8 @@ def main():
         fa_upstream = cpu_trace["backward"][fa_label]["output_grads"][0]
         probe_fa_internal(cfg, fa_x_np, arrays, args.kernel_block, fa_upstream, grad_dtype=grad_dtype)
 
+        ce_x_np, lm_w_np, ce_labels_np = cpu_trace["forward_inputs"]["FusedLinearCrossEntropy[0]"]
+        probe_ce_internal(cfg, ce_x_np, lm_w_np, ce_labels_np, grad_dtype=grad_dtype)
 
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")

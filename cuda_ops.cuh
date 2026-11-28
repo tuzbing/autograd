@@ -1195,3 +1195,243 @@ __global__ void flash_attn_bwd_kernel(
         }
     }
 }
+
+__device__ __forceinline__ float warp_allreduce_max(float val) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        val = fmaxf(val, __shfl_xor_sync(0xffffffffu, val, mask));
+    }
+    return val;
+}
+
+__global__ void fused_linear_ce_logits_to_dlogits_kernel(
+    float* __restrict__ logits,
+    const int32_t* __restrict__ targets,
+    float* __restrict__ row_loss,
+    float* __restrict__ lse,
+    const float* __restrict__ row_scale,
+    uint32_t rows, uint32_t V, uint32_t row_base,
+    uint32_t total_rows, uint32_t scale_bits,
+    uint32_t need_grad, uint32_t ignore_index_bits
+) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows || V == 0u) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+    const uint32_t global_row = row_base + r;
+    float* row_ptr = logits + size_t(r) * V;
+
+    const int32_t target = __ldg(&targets[global_row]);
+    const int32_t ignore_idx = static_cast<int32_t>(ignore_index_bits);
+    const bool valid = (target != ignore_idx) && (target >= 0) && (static_cast<uint32_t>(target) < V);
+    const bool vec4 = ((reinterpret_cast<uintptr_t>(row_ptr) & 15u) == 0u);
+
+    if (!valid) {
+        if (tid == 0u) {
+            row_loss[global_row] = 0.0f;
+            lse[global_row] = 0.0f;
+        }
+        if (need_grad) {
+            if (vec4) {
+                uint32_t v4 = V >> 2;
+                float4* row4 = reinterpret_cast<float4*>(row_ptr);
+                const float4 zero4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                for (uint32_t i = tid; i < v4; i += 256u) row4[i] = zero4;
+                for (uint32_t c = (v4 << 2) + tid; c < V; c += 256u) row_ptr[c] = 0.0f;
+            } else {
+                for (uint32_t c = tid; c < V; c += 256u) row_ptr[c] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    float local_max = -INFINITY;
+    float local_sum = 0.0f;
+    if (vec4) {
+        uint32_t v4 = V >> 2;
+        const float4* row4 = reinterpret_cast<const float4*>(row_ptr);
+        for (uint32_t i = tid; i < v4; i += 256u) {
+            float4 v = row4[i];
+            float vals[4] = {v.x, v.y, v.z, v.w};
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                float x = vals[k];
+                if (x > local_max) {
+                    local_sum = local_sum * expf(local_max - x) + 1.0f;
+                    local_max = x;
+                } else if (isfinite(x)) {
+                    local_sum += expf(x - local_max);
+                }
+            }
+        }
+        for (uint32_t c = (v4 << 2) + tid; c < V; c += 256u) {
+            float x = row_ptr[c];
+            if (x > local_max) {
+                local_sum = local_sum * expf(local_max - x) + 1.0f;
+                local_max = x;
+            } else if (isfinite(x)) {
+                local_sum += expf(x - local_max);
+            }
+        }
+    } else {
+        for (uint32_t c = tid; c < V; c += 256u) {
+            float x = row_ptr[c];
+            if (x > local_max) {
+                local_sum = local_sum * expf(local_max - x) + 1.0f;
+                local_max = x;
+            } else if (isfinite(x)) {
+                local_sum += expf(x - local_max);
+            }
+        }
+    }
+
+    __shared__ float smem_max[8];
+    __shared__ float smem_sum[8];
+    __shared__ float smem_stats[3];
+
+    float warp_max = warp_allreduce_max(local_max);
+    if (lane == 0u) smem_max[warp_id] = warp_max;
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float bmax = (lane < 8u) ? smem_max[lane] : -INFINITY;
+        bmax = warp_allreduce_max(bmax);
+        if (lane == 0u) smem_stats[0] = bmax;
+    }
+    __syncthreads();
+
+    const float row_max = smem_stats[0];
+    float adj_sum = (local_sum > 0.0f) ? (local_sum * expf(local_max - row_max)) : 0.0f;
+    float warp_sum = warp_allreduce_sum(adj_sum);
+    if (lane == 0u) smem_sum[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float bsum = (lane < 8u) ? smem_sum[lane] : 0.0f;
+        bsum = warp_allreduce_sum(bsum);
+        if (lane == 0u) {
+            float lse_val = row_max + logf(bsum);
+            float ce = lse_val - row_ptr[target];
+            float host_scale = __uint_as_float(scale_bits);
+            if (row_scale) {
+                float rs = __ldg(&row_scale[global_row]);
+                row_loss[global_row] = ce * rs * float(total_rows);
+                smem_stats[2] = host_scale * rs;
+            } else {
+                row_loss[global_row] = ce;
+                smem_stats[2] = host_scale;
+            }
+            lse[global_row] = lse_val;
+            smem_stats[1] = 1.0f / bsum;
+        }
+    }
+    if (!need_grad) return;
+    __syncthreads();
+
+    const float inv_sum = smem_stats[1];
+    const float d_scale = smem_stats[2];
+    const uint32_t u_target = static_cast<uint32_t>(target);
+
+    if (vec4) {
+        uint32_t v4 = V >> 2;
+        uint32_t target_i4 = u_target >> 2;
+        uint32_t target_lane4 = u_target & 3u;
+        float4* row4 = reinterpret_cast<float4*>(row_ptr);
+        for (uint32_t i = tid; i < v4; i += 256u) {
+            float4 v = row4[i];
+            float p0 = expf(v.x - row_max) * inv_sum;
+            float p1 = expf(v.y - row_max) * inv_sum;
+            float p2 = expf(v.z - row_max) * inv_sum;
+            float p3 = expf(v.w - row_max) * inv_sum;
+            if (i == target_i4) {
+                if (target_lane4 == 0u) p0 -= 1.0f;
+                else if (target_lane4 == 1u) p1 -= 1.0f;
+                else if (target_lane4 == 2u) p2 -= 1.0f;
+                else p3 -= 1.0f;
+            }
+            row4[i] = make_float4(p0 * d_scale, p1 * d_scale, p2 * d_scale, p3 * d_scale);
+        }
+        for (uint32_t c = (v4 << 2) + tid; c < V; c += 256u) {
+            float p = expf(row_ptr[c] - row_max) * inv_sum;
+            if (c == u_target) p -= 1.0f;
+            row_ptr[c] = p * d_scale;
+        }
+    } else {
+        for (uint32_t c = tid; c < V; c += 256u) {
+            float p = expf(row_ptr[c] - row_max) * inv_sum;
+            if (c == u_target) p -= 1.0f;
+            row_ptr[c] = p * d_scale;
+        }
+    }
+}
+
+__global__ void fused_linear_ce_reduce_kernel(
+    const float* __restrict__ row_loss,
+    float* __restrict__ out_loss,
+    uint32_t N
+) {
+    const uint32_t tid = threadIdx.x;
+    const uint32_t warp_id = tid >> 5;
+    const uint32_t lane = tid & 31u;
+
+    float sum = 0.0f;
+    for (uint32_t i = tid; i < N; i += 256u) {
+        sum += row_loss[i];
+    }
+
+    __shared__ float smem[8];
+    sum = warp_allreduce_sum(sum);
+    if (lane == 0u) smem[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0u) {
+        float total = (lane < 8u) ? smem[lane] : 0.0f;
+        total = warp_allreduce_sum(total);
+        if (lane == 0u) {
+            out_loss[0] = (N > 0u) ? (total / float(N)) : 0.0f;
+        }
+    }
+}
+
+__global__ void ce_tile_logits_to_dlogits_kernel(
+    float* __restrict__ logits_tile,
+    const float* __restrict__ lse,
+    const int32_t* __restrict__ targets,
+    const float* __restrict__ row_scale,
+    uint32_t rows, uint32_t cols, uint32_t vocab_base,
+    uint32_t V, uint32_t row_base, uint32_t scale_bits, uint32_t ignore_index_bits
+) {
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t total = rows * cols;
+    if (idx >= total) return;
+
+    uint32_t r = idx / cols;
+    uint32_t c = idx - r * cols;
+    uint32_t global_row = row_base + r;
+    int32_t target = __ldg(&targets[global_row]);
+    int32_t ignore_idx = static_cast<int32_t>(ignore_index_bits);
+    if (target == ignore_idx || target < 0 || static_cast<uint32_t>(target) >= V) {
+        logits_tile[idx] = 0.0f;
+        return;
+    }
+
+    float d_scale = __uint_as_float(scale_bits);
+    if (row_scale) d_scale *= __ldg(&row_scale[global_row]);
+    float p = expf(logits_tile[idx] - __ldg(&lse[global_row]));
+    if (vocab_base + c == static_cast<uint32_t>(target)) p -= 1.0f;
+    logits_tile[idx] = p * d_scale;
+}
+
+__global__ void fp32_to_bf16_accum_kernel(
+    const float* __restrict__ src,
+    uint16_t* __restrict__ dst,
+    uint32_t count, uint32_t accumulate
+) {
+    uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= count) return;
+    float val = src[id];
+    if (accumulate) val += bf16_to_float(dst[id]);
+    dst[id] = float_to_bf16_rne(val);
+}
