@@ -64,6 +64,8 @@ class CudaContext {
 	            {"fused_linear_ce_reduce_kernel",             (const void*)&fused_linear_ce_reduce_kernel},
 	            {"ce_tile_logits_to_dlogits_kernel",          (const void*)&ce_tile_logits_to_dlogits_kernel},
 	            {"fp32_to_bf16_accum_kernel",                 (const void*)&fp32_to_bf16_accum_kernel},
+	            {"add_forward_kernel",                        (const void*)&add_forward_kernel},
+	            {"add_residual_backward_kernel",              (const void*)&add_residual_backward_kernel},
 	        };
 	    }
 

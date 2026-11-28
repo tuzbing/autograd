@@ -94,6 +94,84 @@ __global__ void gather_backward_kernel(
     }
 }
 
+__global__ void add_forward_kernel(
+    const float* x,
+    const float* y,
+    float* out,
+    uint32_t numel, uint32_t mod_y, uint32_t vec4
+) {
+    uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec4) {
+        uint32_t n4 = numel >> 2;
+        if (id >= n4) return;
+        uint32_t iy4 = mod_y ? (id % (mod_y >> 2)) : id;
+        float4 vx = reinterpret_cast<const float4*>(x)[id];
+        float4 vy = reinterpret_cast<const float4*>(y)[iy4];
+        reinterpret_cast<float4*>(out)[id] = make_float4(
+            vx.x + vy.x, vx.y + vy.y, vx.z + vy.z, vx.w + vy.w
+        );
+    } else {
+        if (id >= numel) return;
+        uint32_t iy = mod_y ? (id % mod_y) : id;
+        out[id] = x[id] + y[iy];
+    }
+}
+
+__global__ void add_residual_backward_kernel(
+    const float* grad_out,
+    void* grad_x,
+    void* grad_y,
+    uint32_t numel, uint32_t vec4,
+    uint32_t accum_x, uint32_t accum_y,
+    uint32_t dx_bf16, uint32_t dy_bf16
+) {
+    uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec4) {
+        uint32_t n4 = numel >> 2;
+        if (id >= n4) return;
+        float4 g = reinterpret_cast<const float4*>(grad_out)[id];
+        if (grad_x) {
+            float4* dx4 = reinterpret_cast<float4*>(grad_x);
+            if (accum_x) {
+                float4 p = dx4[id];
+                dx4[id] = make_float4(p.x + g.x, p.y + g.y, p.z + g.z, p.w + g.w);
+            } else {
+                dx4[id] = g;
+            }
+        }
+        if (grad_y) {
+            float4* dy4 = reinterpret_cast<float4*>(grad_y);
+            if (accum_y) {
+                float4 p = dy4[id];
+                dy4[id] = make_float4(p.x + g.x, p.y + g.y, p.z + g.z, p.w + g.w);
+            } else {
+                dy4[id] = g;
+            }
+        }
+        return;
+    }
+    if (id >= numel) return;
+    float g = grad_out[id];
+    if (grad_x) {
+        if (dx_bf16) {
+            uint16_t* dx = static_cast<uint16_t*>(grad_x);
+            dx[id] = float_to_bf16_rne(accum_x ? (bf16_to_float(dx[id]) + g) : g);
+        } else {
+            float* dx = static_cast<float*>(grad_x);
+            dx[id] = accum_x ? (dx[id] + g) : g;
+        }
+    }
+    if (grad_y) {
+        if (dy_bf16) {
+            uint16_t* dy = static_cast<uint16_t*>(grad_y);
+            dy[id] = float_to_bf16_rne(accum_y ? (bf16_to_float(dy[id]) + g) : g);
+        } else {
+            float* dy = static_cast<float*>(grad_y);
+            dy[id] = accum_y ? (dy[id] + g) : g;
+        }
+    }
+}
+
 template <bool kTransA, bool kTransB, bool kFusedLinearAdd>
 __device__ __forceinline__ void cuda_sgemm_64x64x16_impl(
     const float* __restrict__ A,
@@ -482,17 +560,17 @@ __global__ void fused_wgu_swiglu_forward_kernel(
 __global__ void swiglu_forward_kernel(
     const float* __restrict__ gu,
     float* __restrict__ hidden,
-    uint32_t N, uint32_t H
+    uint32_t N, uint32_t H, uint32_t h_sub
 ) {
     uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= H) return;
+    if (col >= h_sub) return;
     const size_t H2 = size_t(H) * 2u;
     for (uint32_t row = blockIdx.y; row < N; row += gridDim.y) {
         size_t gu_base = size_t(row) * H2;
         float g = gu[gu_base + col];
         float u = gu[gu_base + H + col];
         float sig = 1.0f / (1.0f + expf(-g));
-        hidden[size_t(row) * H + col] = (g * sig) * u;
+        hidden[size_t(row) * h_sub + col] = (g * sig) * u;
     }
 }
 

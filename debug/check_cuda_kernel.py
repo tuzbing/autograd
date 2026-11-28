@@ -308,18 +308,21 @@ class GraphState:
     labels_by_node: dict
 
 
-def build_cpu_gpt2_graph(cfg, arrays, input_ids, labels):
-    rt = reset_runtime("cpu")
-    model = GPT2(cfg.V, cfg.C, cfg.T, cfg.H, cfg.B, cfg.L, cfg.dtype, "cpu")
+def build_gpt2_graph(device, cfg, arrays, input_ids, labels, grad_dtype=np.float32):
+    rt = reset_runtime(device)
+    model = GPT2(cfg.V, cfg.C, cfg.T, cfg.H, cfg.B, cfg.L, cfg.dtype, device)
+    for parameter in model.parameters():
+        parameter.grad_dtype = grad_dtype if device == "cuda" else np.float32
     initialize_model(model, arrays)
-    input_t = make_tensor(input_ids.shape, np.int32, "cpu", False, input_ids)
-    labels_t = make_tensor(labels.shape, np.int32, "cpu", False, labels)
+    input_t = make_tensor(input_ids.shape, np.int32, device, False, input_ids)
+    labels_t = make_tensor(labels.shape, np.int32, device, False, labels)
     loss = model(input_t, targets=labels_t)
     rt.loss = loss
     rt.build_topo(loss)
     verify_training_topology(rt.topo, cfg)
     rt.bind_memory()
-    isolate_cpu_reference_memory(rt)
+    if device == "cpu":
+        isolate_cpu_reference_memory(rt)
     rt.is_compiled = True
     param_by_name = dict(iter_gpt2_named_tensors(model))
     return GraphState(
@@ -333,8 +336,39 @@ def build_cpu_gpt2_graph(cfg, arrays, input_ids, labels):
         labels_by_node={id(node): label for node, label in zip(rt.topo, topology_labels(rt.topo))},
     )
 
+def build_cpu_gpt2_graph(cfg, arrays, input_ids, labels):
+    return build_gpt2_graph("cpu", cfg, arrays, input_ids, labels)
 
-def run_staged_cpu_graph(state):
+def run_exact_training_graph(state, repeats=2):
+    results = []
+    for _ in range(repeats):
+        state.rt.execute()
+        state.rt.backend.synchronize()
+        results.append({
+            "loss": copy_to_host(state.rt, state.loss),
+            "parameter_grads": {
+                name: copy_to_host(state.rt, tensor.grad)
+                for name, tensor in state.param_by_name.items()
+            },
+        })
+    return results
+
+
+def compare_exact_graph(cpu, cuda, cuda_grad_dtype=np.float32):
+    print("\n=== Exact Runtime.execute() training path (Full Multi-Layer GPT2) ===")
+    loss_atol, loss_rtol = tolerances_for_grad_dtype(cuda_grad_dtype, "loss")
+    for repeat, (cpu_result, cuda_result) in enumerate(zip(cpu, cuda), 1):
+        print(f"  [training execution {repeat}]")
+        check(f"repeat[{repeat}]/loss", cuda_result["loss"], cpu_result["loss"], atol=loss_atol, rtol=loss_rtol)
+        for name in sorted(cpu_result["parameter_grads"]):
+            check_parameter_gradient(
+                f"repeat[{repeat}]/parameter.grad/{name}",
+                cuda_result["parameter_grads"][name],
+                cpu_result["parameter_grads"][name],
+                cuda_grad_dtype,
+            )
+
+def run_staged_graph(state, reference_inputs=None):
     rt = state.rt
     forward = {}
     forward_inputs = {}
@@ -343,6 +377,9 @@ def run_staged_cpu_graph(state):
     rt.backend.begin_pass()
     for node in rt.topo:
         label = state.labels_by_node[id(node)]
+        if reference_inputs is not None:
+            for tensor, value in zip(node.inputs, reference_inputs[label]):
+                rt.backend.copy_from_host(tensor, np.asarray(value, dtype=tensor.dtype))
         forward_inputs[label] = [copy_to_host(rt, tensor) for tensor in node.inputs]
         node.forward(node.inputs, node.outputs)
         rt.backend.end_pass()
@@ -351,9 +388,10 @@ def run_staged_cpu_graph(state):
         rt.backend.begin_pass()
     rt.backend.end_pass()
 
-    for tensor in all_graph_tensors(rt):
-        if tensor.grad is not None:
-            rt.backend.fill(tensor.grad, 0.0)
+    if rt.allocator.device == "cpu":  # <--- 修改：CUDA 的 FusedLinearCE 在前向已完成梯度写出，不能在此清零
+        for tensor in all_graph_tensors(rt):
+            if tensor.grad is not None:
+                rt.backend.fill(tensor.grad, 0.0)
 
     rt.backend.fill(state.loss.grad, 1.0)
     rt.backend.begin_pass()
@@ -374,13 +412,44 @@ def run_staged_cpu_graph(state):
                 "parameter": state.param_name_by_id.get(id(tensor)),
                 "grad": copy_to_host(rt, tensor.grad),
             })
-        backward[label] = {"output_grads": output_grads, 
-                           "input_grads_before": input_grads_before,
-                           "inputs": inputs}
+        backward[label] = {
+            "output_grads": output_grads,
+            "input_grads_before": input_grads_before,
+            "inputs": inputs,
+        }
         rt.backend.begin_pass()
     rt.backend.end_pass()
     return {"forward": forward, "forward_inputs": forward_inputs, "backward": backward}
 
+def run_staged_cpu_graph(state):
+    return run_staged_graph(state)
+
+def compare_staged_graph(cpu, cuda, cuda_grad_dtype=np.float32):
+    print("\n=== Per-operator exact training path (Full Multi-Layer GPT2) ===")
+    if list(cpu["forward"]) != list(cuda["forward"]):
+        raise AssertionError("CPU/CUDA forward topology labels differ")
+
+    act_atol, act_rtol = tolerances_for_grad_dtype(cuda_grad_dtype, "activation")
+    loss_atol, loss_rtol = tolerances_for_grad_dtype(cuda_grad_dtype, "loss")
+    act_grad_atol, act_grad_rtol = tolerances_for_grad_dtype(cuda_grad_dtype, "activation_grad")
+
+    for label in cpu["forward"]:
+        fwd_atol, fwd_rtol = (loss_atol, loss_rtol) if label.startswith("FusedLinearCrossEntropy") else (act_atol, act_rtol)
+        for index, (cuda_val, cpu_val) in enumerate(zip(cuda["forward"][label], cpu["forward"][label])):
+            check(f"{label}/forward/output[{index}]", cuda_val, cpu_val, atol=fwd_atol, rtol=fwd_rtol)
+
+    for label in reversed(list(cpu["forward"])):
+        cpu_bwd = cpu["backward"][label]
+        cuda_bwd = cuda["backward"][label]
+        for index, (cuda_val, cpu_val) in enumerate(zip(cuda_bwd["output_grads"], cpu_bwd["output_grads"])):
+            if cpu_val is not None:
+                check(f"{label}/backward/output[{index}].grad", cuda_val, cpu_val, atol=act_grad_atol, rtol=act_grad_rtol)
+        for cpu_item, cuda_item in zip(cpu_bwd["inputs"], cuda_bwd["inputs"]):
+            pname = cpu_item["parameter"]
+            if pname is not None:
+                check_parameter_gradient(f"{label}/backward/{pname}.grad", cuda_item["grad"], cpu_item["grad"], cuda_grad_dtype)
+            else:
+                check(f"{label}/backward/input[{cpu_item['index']}].grad", cuda_item["grad"], cpu_item["grad"], atol=act_grad_atol, rtol=act_grad_rtol)
 
 def _run_op_graph(device, build_fn, upstream_np, grad_dtype=np.float32, accum_steps=1, seed=0):
     rt = reset_runtime(device)
@@ -864,7 +933,7 @@ def probe_mlp_internal(cfg, x_np, act_np, arrays, block, upstream, residual_grad
         "swiglu_forward_kernel",
         [sb["gu"].ptr.buffer_id, sb["hidden"].ptr.buffer_id],
         [sb["gu"].ptr.offset, sb["hidden"].ptr.offset],
-        [N, H], (H + 255) // 256, min(N, 65535), 1, 256,
+        [N, H, H], (H + 255) // 256, min(N, 65535), 1, 256,
     ))
     check("swiglu_forward_kernel/hidden", read_storage_f32(rt, sb["hidden"], (cfg.B, cfg.T, H)), oracle["hidden"])
 
@@ -923,6 +992,144 @@ def probe_mlp_internal(cfg, x_np, act_np, arrays, block, upstream, residual_grad
         [N, cfg.C, eps_bits, 1], (N + 3) // 4, 1, 1, 128,
     ))
     check("rmsnorm_backward_kernel/x.grad", copy_to_host(rt, x_t.grad), oracle["dx"])
+
+def probe_add_and_mlp_recompute(cfg, x_in_np, arrays, block, upstream, grad_dtype=np.float32):
+    print("\n=== Internal kernels: AddOp & FusedRMSNormMLP x_after_attn recompute ===")
+    rng = np.random.default_rng(SEED + 333)
+    a_np = (rng.standard_normal((cfg.B, cfg.T, cfg.C)).astype(np.float32) * 0.02).copy()
+    b_np = (rng.standard_normal((cfg.B, cfg.T, cfg.C)).astype(np.float32) * 0.02).copy()
+    pos_np = (rng.standard_normal((cfg.T, cfg.C)).astype(np.float32) * 0.02).copy()
+    bias_np = (rng.standard_normal((cfg.C,)).astype(np.float32) * 0.02).copy()
+    d_up = np.asarray(upstream, dtype=np.float32).copy()
+
+    # 1. AddOp 同形状残差（含脏激活梯度覆盖校验）+ [T, C] 广播 + [C] 广播
+    for tag, y_val, exp_dy in (
+        ("residual", b_np, d_up),
+        ("pos_2d", pos_np, np.sum(d_up, axis=0, dtype=np.float32)),
+        ("bias_1d", bias_np, np.sum(d_up.reshape(-1, cfg.C), axis=0, dtype=np.float32)),
+    ):
+        rt = reset_runtime("cuda")
+        tx = make_tensor(a_np.shape, np.float32, "cuda", True, a_np)
+        ty = make_tensor(y_val.shape, np.float32, "cuda", True, y_val, grad_dtype=(grad_dtype if y_val.ndim < 3 else None))
+        tout = tx + ty
+        rt.loss = tout
+        rt.build_topo(tout)
+        rt.bind_memory()
+
+        rt.forward()
+        rt.backend.synchronize()
+        check(f"AddOp/{tag}/forward", copy_to_host(rt, tout), (a_np + y_val).astype(np.float32))
+
+        # 预填非零脏值，确保激活梯度走覆盖写 (=) 而非错误累加
+        rt.backend.fill_storage(tx.grad.storage, -7.0)
+        rt.backend.fill_storage(ty.grad.storage, 0.0 if y_val.ndim < 3 else -7.0)
+        rt.backend.copy_from_host(tout.grad, d_up)
+        add_node = rt.topo[-1]
+        _dispatch(rt, lambda add_node=add_node: add_node.backward(add_node.inputs, add_node.outputs))
+        check(f"AddOp/{tag}/backward/x.grad", copy_to_host(rt, tx.grad), d_up)
+        if y_val.ndim < 3:
+            check_parameter_gradient(f"AddOp/{tag}/backward/y.grad", copy_to_host(rt, ty.grad), exp_dy, grad_dtype)
+        else:
+            check(f"AddOp/{tag}/backward/y.grad", copy_to_host(rt, ty.grad), exp_dy)
+
+    # 2. 完整 GPT2Block 拓扑 FA -> FLA -> MLP -> Add：显式将 x_after.storage 覆写为垃圾值后验证 MLP 反向重算
+    p = f"blocks[{block}]"
+    fa_params = {
+        "wq": arrays[f"{p}.attn.q_proj.weight"],
+        "bq": arrays[f"{p}.attn.q_proj.bias"],
+        "wk": arrays[f"{p}.attn.k_proj.weight"],
+        "bk": arrays[f"{p}.attn.k_proj.bias"],
+        "wv": arrays[f"{p}.attn.v_proj.weight"],
+        "bv": arrays[f"{p}.attn.v_proj.bias"],
+    }
+    fa_ref = attention_oracle(x_in_np, fa_params, np.zeros_like(x_in_np), cfg.H)
+    proj_w_np = arrays[f"{p}.attn.proj.weight"]
+    proj_b_np = arrays[f"{p}.attn.proj.bias"]
+    wgu_np = arrays[f"{p}.mlp.fc1.weight"]
+    wdown_np = arrays[f"{p}.mlp.fc2.weight"]
+    x_after_ref = (
+        np.asarray(x_in_np, dtype=np.float32).reshape(-1, cfg.C)
+        + fa_ref["out"].reshape(-1, cfg.C) @ proj_w_np
+        + proj_b_np
+    ).reshape(x_in_np.shape).astype(np.float32)
+    oracle = mlp_oracle(x_after_ref, wgu_np, wdown_np, d_up, d_up, eps=1e-6)
+
+    rt = reset_runtime("cuda")
+    x_in = make_tensor(x_in_np.shape, np.float32, "cuda", True, x_in_np)
+    names = ("wq", "bq", "wk", "bk", "wv", "bv")
+    fa_t = {n: make_tensor(fa_params[n].shape, np.float32, "cuda", True, fa_params[n], grad_dtype=grad_dtype) for n in names}
+    rcos = make_tensor(fa_ref["rope_cos"].shape, np.float32, "cuda", False, fa_ref["rope_cos"])
+    rsin = make_tensor(fa_ref["rope_sin"].shape, np.float32, "cuda", False, fa_ref["rope_sin"])
+    attn = FusedRMSNormFlashAttentionOp(n_head=cfg.H, eps=1e-6, is_causal=True)(
+        x_in, *(fa_t[n] for n in names), rcos, rsin
+    )
+    proj_w = make_tensor(proj_w_np.shape, np.float32, "cuda", True, proj_w_np, grad_dtype=grad_dtype)
+    proj_b = make_tensor(proj_b_np.shape, np.float32, "cuda", True, proj_b_np, grad_dtype=grad_dtype)
+    x_after = FusedLinearAddOp()(x_in, attn, proj_w, proj_b)
+    wgu = make_tensor(wgu_np.shape, np.float32, "cuda", True, wgu_np, grad_dtype=grad_dtype)
+    wdown = make_tensor(wdown_np.shape, np.float32, "cuda", True, wdown_np, grad_dtype=grad_dtype)
+    mlp_out = FusedRMSNormMLPOp(eps=1e-6)(x_after, wgu, wdown)
+    block_out = x_after + mlp_out
+
+    rt.loss = block_out
+    rt.build_topo(block_out)
+    rt.bind_memory()
+    rt.forward()
+    rt.backend.synchronize()
+    check("GPT2Block/Add_inplace/forward", copy_to_host(rt, block_out), (x_after_ref + oracle["out"]).astype(np.float32), fail_fast=True)
+
+    # 强制污染 x_after.storage，确保 cuda_fused_rmsnorm_mlp_backward 完全依赖重算而非残留激活
+    rt.backend.fill_storage(x_after.storage, 999.0)
+    rt.backend.copy_from_host(block_out.grad, d_up)
+    add_node = next(n for n in rt.topo if op_name(n) == "Add")
+    mlp_node = next(n for n in rt.topo if op_name(n) == "FusedRMSNormMLP")
+    _dispatch(rt, lambda: (
+        add_node.backward(add_node.inputs, add_node.outputs),
+        mlp_node.backward(mlp_node.inputs, mlp_node.outputs),
+    ))
+    check("GPT2Block/recompute_fla/x_after.grad", copy_to_host(rt, x_after.grad), oracle["dx"], fail_fast=True)
+    check_parameter_gradient("GPT2Block/recompute_fla/wgu.grad", copy_to_host(rt, wgu.grad), oracle["dw1"], grad_dtype, fail_fast=True)
+    check_parameter_gradient("GPT2Block/recompute_fla/wdown.grad", copy_to_host(rt, wdown.grad), oracle["dw2"], grad_dtype, fail_fast=True)
+
+def probe_gpt2_grad_accumulation(cfg, arrays, seed, grad_dtype=np.float32):
+    print("\n=== Full Multi-Layer GPT2 no-extra-buffer gradient accumulation ===")
+    for k_steps in (1, 2, 4):
+        atol_g, rtol_g = tolerances_for_grad_dtype(grad_dtype, "parameter_grad")
+        if str(grad_dtype).lower() in ("bf16", "bfloat16"):
+            atol_g *= k_steps
+            rtol_g *= k_steps
+
+        micro_batches = [build_inputs(cfg, seed + 2000 + k_steps * 31 + s) for s in range(k_steps)]
+        cpu_state = build_gpt2_graph("cpu", cfg, arrays, *micro_batches[0])
+        cuda_state = build_gpt2_graph("cuda", cfg, arrays, *micro_batches[0], grad_dtype=grad_dtype)
+        initial_layout = {
+            n: (t.grad.storage.ptr.buffer_id, t.grad.storage.ptr.offset, t.grad.storage.nbytes)
+            for n, t in cuda_state.param_by_name.items()
+        }
+
+        for step, (ids_mb, labels_mb) in enumerate(micro_batches):
+            for st in (cpu_state, cuda_state):
+                st.rt.backend.copy_from_host(st.input_ids, ids_mb)
+                st.rt.backend.copy_from_host(st.labels, labels_mb)
+                st.rt.backward(st.loss, grad_scale=1.0 / k_steps, accumulate_parameter_grads=(step > 0))
+                st.rt.backend.synchronize()
+
+        after_layout = {
+            n: (t.grad.storage.ptr.buffer_id, t.grad.storage.ptr.offset, t.grad.storage.nbytes)
+            for n, t in cuda_state.param_by_name.items()
+        }
+        if after_layout != initial_layout:
+            raise AssertionError("CUDA GPT2 gradient accumulation reallocated parameter gradient storage")
+
+        check(f"GPT2_grad_accum[{k_steps}]/last_loss", copy_to_host(cuda_state.rt, cuda_state.loss), copy_to_host(cpu_state.rt, cpu_state.loss))
+        for name in sorted(cpu_state.param_by_name):
+            check(
+                f"GPT2_grad_accum[{k_steps}]/{name}.grad",
+                copy_to_host(cuda_state.rt, cuda_state.param_by_name[name].grad),
+                copy_to_host(cpu_state.rt, cpu_state.param_by_name[name].grad),
+                atol=atol_g,
+                rtol=rtol_g,
+            )
 
 def apply_rope_reference(q, k, cos, sin):
     d2 = q.shape[-1] // 2
@@ -1514,9 +1721,17 @@ def main():
     arrays = build_parameter_arrays(cfg, args.seed)
     input_ids, labels = build_inputs(cfg, args.seed)
 
-    cpu_trace = run_staged_cpu_graph(
-        build_cpu_gpt2_graph(cfg, arrays, input_ids, labels)
+    cuda_exact = run_exact_training_graph(build_gpt2_graph("cuda", cfg, arrays, input_ids, labels, grad_dtype=grad_dtype))
+    cpu_exact = run_exact_training_graph(build_gpt2_graph("cpu", cfg, arrays, input_ids, labels))
+    compare_exact_graph(cpu_exact, cuda_exact, cuda_grad_dtype=grad_dtype)
+
+    cpu_trace = run_staged_graph(build_gpt2_graph("cpu", cfg, arrays, input_ids, labels))
+    cuda_trace = run_staged_graph(
+        build_gpt2_graph("cuda", cfg, arrays, input_ids, labels, grad_dtype=grad_dtype),
+        reference_inputs=cpu_trace["forward_inputs"],
     )
+    compare_staged_graph(cpu_trace, cuda_trace, cuda_grad_dtype=grad_dtype)
+
     probe_staged_ops_and_accumulation(
         cpu_trace,
         args.kernel_block,
@@ -1524,6 +1739,9 @@ def main():
         grad_dtype=grad_dtype,
         check_accum=not args.skip_gradient_accumulation,
     )
+
+    if not args.skip_gradient_accumulation:
+        probe_gpt2_grad_accumulation(cfg, arrays, args.seed, grad_dtype=grad_dtype)
 
     if not args.skip_internal_kernels:
         ids_np, tok_w_np = cpu_trace["forward_inputs"]["Gather[0]"]
@@ -1558,12 +1776,21 @@ def main():
         ce_x_np, lm_w_np, ce_labels_np = cpu_trace["forward_inputs"]["FusedLinearCrossEntropy[0]"]
         probe_ce_internal(cfg, ce_x_np, lm_w_np, ce_labels_np, grad_dtype=grad_dtype)
 
+        probe_add_and_mlp_recompute(
+            cfg,
+            fa_x_np,
+            arrays,
+            args.kernel_block,
+            cpu_trace["backward"][f"Add[{args.kernel_block}]"]["output_grads"][0],
+            grad_dtype=grad_dtype,
+        )
+
     if FAILURES:
         print(f"\n{len(FAILURES)} correctness check(s) failed:")
         for name, max_abs, max_rel in FAILURES:
             print(f"  {name}: max_abs={max_abs:.8e}, max_rel={max_rel:.8e}")
         raise AssertionError("real GPT2 training-path CUDA correctness validation failed")
-    print("\nAll GatherOp and FusedLinearAddOp CUDA checks passed.")
+    print("\nAll full multi-layer GPT2 CUDA training-path checks passed.")
 
 
 if __name__ == "__main__":

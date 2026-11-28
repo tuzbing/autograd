@@ -122,6 +122,109 @@ class CudaBackend(Backend):
 			buf_ids, offsets, [rows, C, out_bf16],
 			(C + 255) // 256, min(rows, 65535), 1, 256)
 
+	@staticmethod
+	def _add_broadcast_mod(x, y, out):
+		if x.shape == y.shape:
+			return 0
+		if x.shape == out.shape:
+			if len(y.shape) == 2 or (len(y.shape) == 3 and y.shape[0] == 1) or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1):
+				return out.shape[-2] * out.shape[-1]
+			if len(y.shape) == 1 or (len(y.shape) == 3 and y.shape[0] == 1 and y.shape[1] == 1) or (len(y.shape) == 4 and y.shape[0] == 1 and y.shape[1] == 1 and y.shape[2] == 1):
+				return out.shape[-1]
+		raise RuntimeError(f"Unsupported Add shape: x.shape={x.shape}, y.shape={y.shape}")
+
+	def bind_add_forward(self, node):
+		x0, y0 = node.inputs[0], node.inputs[1]
+		out0 = node.outputs[0]
+		numel = prod(out0.shape)
+		mod_y = self._add_broadcast_mod(x0, y0, out0)
+
+		def _fwd(inputs, outputs, scratch=None):
+			x, y, out = inputs[0], inputs[1], outputs[0]
+			vec4 = int(
+				numel % 4 == 0
+				and (mod_y == 0 or mod_y % 4 == 0)
+				and x.storage.ptr.offset % 16 == 0
+				and y.storage.ptr.offset % 16 == 0
+				and out.storage.ptr.offset % 16 == 0
+			)
+			n_work = (numel >> 2) if vec4 else numel
+			self.ctx.dispatch("add_forward_kernel",
+				[x.storage.ptr.buffer_id, y.storage.ptr.buffer_id, out.storage.ptr.buffer_id],
+				[x.storage.ptr.offset, y.storage.ptr.offset, out.storage.ptr.offset],
+				[numel, mod_y, vec4], (n_work + 255) // 256, 1, 1, 256)
+		return _fwd
+
+	def bind_add_backward(self, node):
+		x0, y0 = node.inputs[0], node.inputs[1]
+		out0 = node.outputs[0]
+		numel = prod(out0.shape)
+		mod_y = self._add_broadcast_mod(x0, y0, out0)
+
+		def _bwd(inputs, outputs, scratch=None):
+			out = outputs[0]
+			if out.grad is None:
+				return
+			x, y = inputs[0], inputs[1]
+			accumulate = bool(getattr(self, "accumulate_parameter_grads", False))
+
+			do_x = x.requires_grad
+			accum_x = int(x.op is None and accumulate)
+			dx_bf16 = int(do_x and np.dtype(x.grad.storage.dtype) == np.dtype(np.uint16))
+			if (do_x and not accum_x and not dx_bf16
+					and x.grad.storage.ptr.buffer_id == out.grad.storage.ptr.buffer_id
+					and x.grad.storage.ptr.offset == out.grad.storage.ptr.offset):
+				do_x = False
+
+			if mod_y == 0:
+				do_y = y.requires_grad
+				accum_y = int(y.op is None and accumulate)
+				dy_bf16 = int(do_y and np.dtype(y.grad.storage.dtype) == np.dtype(np.uint16))
+				if (do_y and not accum_y and not dy_bf16
+						and y.grad.storage.ptr.buffer_id == out.grad.storage.ptr.buffer_id
+						and y.grad.storage.ptr.offset == out.grad.storage.ptr.offset):
+					do_y = False
+				if not do_x and not do_y:
+					return
+				buf_dx = x.grad.storage.ptr.buffer_id if do_x else 0
+				off_dx = x.grad.storage.ptr.offset if do_x else 0
+				buf_dy = y.grad.storage.ptr.buffer_id if do_y else 0
+				off_dy = y.grad.storage.ptr.offset if do_y else 0
+				vec4 = int(
+					not dx_bf16 and not dy_bf16
+					and numel % 4 == 0
+					and out.grad.storage.ptr.offset % 16 == 0
+					and (off_dx % 16 == 0 if do_x else True)
+					and (off_dy % 16 == 0 if do_y else True)
+				)
+				n_work = (numel >> 2) if vec4 else numel
+				self.ctx.dispatch("add_residual_backward_kernel",
+					[out.grad.storage.ptr.buffer_id, buf_dx, buf_dy],
+					[out.grad.storage.ptr.offset, off_dx, off_dy],
+					[numel, vec4, accum_x, accum_y, dx_bf16, dy_bf16],
+					(n_work + 255) // 256, 1, 1, 256)
+				return
+
+			if do_x:
+				off_dx = x.grad.storage.ptr.offset
+				vec4 = int(not dx_bf16 and numel % 4 == 0 and out.grad.storage.ptr.offset % 16 == 0 and off_dx % 16 == 0)
+				n_work = (numel >> 2) if vec4 else numel
+				self.ctx.dispatch("add_residual_backward_kernel",
+					[out.grad.storage.ptr.buffer_id, x.grad.storage.ptr.buffer_id, 0],
+					[out.grad.storage.ptr.offset, off_dx, 0],
+					[numel, vec4, accum_x, 0, dx_bf16, 0],
+					(n_work + 255) // 256, 1, 1, 256)
+
+			if y.requires_grad:
+				rows_y = numel // mod_y
+				accum_y = int(y.op is None and accumulate)
+				dy_bf16 = int(np.dtype(y.grad.storage.dtype) == np.dtype(np.uint16))
+				self.ctx.dispatch("bias_grad_reduce_kernel",
+					[out.grad.storage.ptr.buffer_id, y.grad.storage.ptr.buffer_id],
+					[out.grad.storage.ptr.offset, y.grad.storage.ptr.offset],
+					[rows_y, mod_y, accum_y, dy_bf16], (mod_y + 7) // 8, 1, 1, 256)
+		return _bwd
+
 	def cuda_fused_linear_add_forward(self, inputs, outputs, scratch=None):
 		x, act, w, b = inputs
 		out = outputs[0]
@@ -254,64 +357,102 @@ class CudaBackend(Backend):
 		gamma_id = norm_weight.storage.ptr.buffer_id if norm_weight is not None else 0
 		gamma_off = norm_weight.storage.ptr.offset if norm_weight is not None else 0
 
+		fla_node = x.op
+		recompute_fla = (
+			fla_node is not None
+			and fla_node.op.op_name == "FusedLinearAdd"
+			and len(fla_node.inputs) == 4
+			and fla_node.inputs[1].op is not None
+			and fla_node.inputs[1].op.op.op_name == "FusedRMSNormFlashAttention"
+		)
+		if recompute_fla:
+			if H2 < 3 * C or H < 2 * C:
+				raise RuntimeError(f"MLP scratch too small for FA recompute: C={C}, H={H}")
+			x_in, attn_out, proj_w, proj_b = fla_node.inputs
+			x_nbytes = N * C * 4
+			self.cuda_recompute_fused_rms_fa(
+				attn_out,
+				(gu.ptr.buffer_id, gu.ptr.offset + x_nbytes),
+				(gu.ptr.buffer_id, gu.ptr.offset + 2 * x_nbytes),
+				(gu.ptr.buffer_id, gu.ptr.offset),
+			)
+			b_id = proj_b.storage.ptr.buffer_id if proj_b is not None else 0
+			b_off = proj_b.storage.ptr.offset if proj_b is not None else 0
+			x_id, x_off = hidden.ptr.buffer_id, hidden.ptr.offset
+			work_id, work_off = hidden.ptr.buffer_id, hidden.ptr.offset + x_nbytes
+			work_floats = N * (H - C)
+			self.ctx.dispatch("fused_linear_add_forward_kernel",
+				[x_in.storage.ptr.buffer_id, gu.ptr.buffer_id, proj_w.storage.ptr.buffer_id, b_id, x_id],
+				[x_in.storage.ptr.offset, gu.ptr.offset, proj_w.storage.ptr.offset, b_off, x_off],
+				[N, C, C], (C + 63) // 64, (N + 63) // 64, 1, 256)
+		else:
+			x_id, x_off = x.storage.ptr.buffer_id, x.storage.ptr.offset
+			work_id, work_off = hidden.ptr.buffer_id, hidden.ptr.offset
+			work_floats = N * H
+
 		# 1. 重算 X_norm -> hidden [N, C]（不借用 x.grad，保护残差梯度）
 		self.ctx.dispatch("rmsnorm_forward_kernel",
-			[x.storage.ptr.buffer_id, gamma_id, hidden.ptr.buffer_id],
-			[x.storage.ptr.offset, gamma_off, hidden.ptr.offset],
+			[x_id, gamma_id, work_id],
+			[x_off, gamma_off, work_off],
 			[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
 
 		# 2. 重算 GU = X_norm @ Wgu -> gu [N, 2H]
 		self.ctx.dispatch("cuda_sgemm_nn_kernel",
-			[hidden.ptr.buffer_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
-			[hidden.ptr.offset, wgu.storage.ptr.offset, gu.ptr.offset],
+			[work_id, wgu.storage.ptr.buffer_id, gu.ptr.buffer_id],
+			[work_off, wgu.storage.ptr.offset, gu.ptr.offset],
 			[N, H2, C, 0], (H2 + 63) // 64, (N + 63) // 64, 1, 256)
 
 		# 3. dWdown = HIDDEN^T @ dOUT（支持 FP32/BF16 直接累加写出）
 		if wdown.requires_grad:
-			self.ctx.dispatch("swiglu_forward_kernel",
-				[gu.ptr.buffer_id, hidden.ptr.buffer_id],
-				[gu.ptr.offset, hidden.ptr.offset],
-				[N, H], (H + 255) // 256, min(N, 65535), 1, 256)
 			dwdown_bf16 = int(np.dtype(wdown.grad.storage.dtype) == np.dtype(np.uint16))
-			self.ctx.dispatch("cuda_sgemm_tn_kernel",
-				[hidden.ptr.buffer_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
-				[hidden.ptr.offset, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset],
-				[H, C, N, accumulate, dwdown_bf16],
-				(C + 63) // 64, (H + 63) // 64, 1, 256)
+			dwdown_itemsize = 2 if dwdown_bf16 else 4
+			h_tile = min(H, work_floats // N)
+			for h0 in range(0, H, h_tile):
+				h_sub = min(h_tile, H - h0)
+				self.ctx.dispatch("swiglu_forward_kernel",
+					[gu.ptr.buffer_id, work_id],
+					[gu.ptr.offset + h0 * 4, work_off],
+					[N, H, h_sub], (h_sub + 255) // 256, min(N, 65535), 1, 256)
+				self.ctx.dispatch("cuda_sgemm_tn_kernel",
+					[work_id, out.grad.storage.ptr.buffer_id, wdown.grad.storage.ptr.buffer_id],
+					[work_off, out.grad.storage.ptr.offset, wdown.grad.storage.ptr.offset + h0 * C * dwdown_itemsize],
+					[h_sub, C, N, accumulate, dwdown_bf16],
+					(C + 63) // 64, (h_sub + 63) // 64, 1, 256)
 
 		if not (wgu.requires_grad or x.requires_grad or need_dgamma):
 			return
 
-		# 4. dHidden = dOUT @ Wdown^T -> hidden [N, H]
-		self.ctx.dispatch("cuda_sgemm_nt_kernel",
-			[out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-			[out.grad.storage.ptr.offset, wdown.storage.ptr.offset, hidden.ptr.offset],
-			[N, H, C, 0], (H + 63) // 64, (N + 63) // 64, 1, 256)
+		# 4 & 5. 按行分块计算 dHidden = dOUT @ Wdown^T 并原地更新 gu -> dGU [N, 2H]
+		chunk_rows = max(1, work_floats // H)
+		for r0 in range(0, N, chunk_rows):
+			rows = min(chunk_rows, N - r0)
+			self.ctx.dispatch("cuda_sgemm_nt_kernel",
+				[out.grad.storage.ptr.buffer_id, wdown.storage.ptr.buffer_id, work_id],
+				[out.grad.storage.ptr.offset + r0 * C * 4, wdown.storage.ptr.offset, work_off],
+				[rows, H, C, 0], (H + 63) // 64, (rows + 63) // 64, 1, 256)
+			self.ctx.dispatch("swiglu_backward_inplace_kernel",
+				[gu.ptr.buffer_id, work_id],
+				[gu.ptr.offset + r0 * H2 * 4, work_off],
+				[rows, H], (H + 255) // 256, min(rows, 65535), 1, 256)
 
-		# 5. 原地计算 dGU = [dGate, dUp] -> gu [N, 2H]
-		self.ctx.dispatch("swiglu_backward_inplace_kernel",
-			[gu.ptr.buffer_id, hidden.ptr.buffer_id],
-			[gu.ptr.offset, hidden.ptr.offset],
-			[N, H], (H + 255) // 256, min(N, 65535), 1, 256)
-
-		# 6. dWgu = X_norm^T @ dGU（复用释放后的 hidden 重算 X_norm）
+		# 6. dWgu = X_norm^T @ dGU（直接读取常驻的 x_id/x_off，无需二次重算 FA）
 		if wgu.requires_grad:
 			self.ctx.dispatch("rmsnorm_forward_kernel",
-				[x.storage.ptr.buffer_id, gamma_id, hidden.ptr.buffer_id],
-				[x.storage.ptr.offset, gamma_off, hidden.ptr.offset],
+				[x_id, gamma_id, work_id],
+				[x_off, gamma_off, work_off],
 				[N, C, eps_bits], (N + 3) // 4, 1, 1, 128)
 			dwgu_bf16 = int(np.dtype(wgu.grad.storage.dtype) == np.dtype(np.uint16))
 			self.ctx.dispatch("cuda_sgemm_tn_kernel",
-				[hidden.ptr.buffer_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
-				[hidden.ptr.offset, gu.ptr.offset, wgu.grad.storage.ptr.offset],
+				[work_id, gu.ptr.buffer_id, wgu.grad.storage.ptr.buffer_id],
+				[work_off, gu.ptr.offset, wgu.grad.storage.ptr.offset],
 				[C, H2, N, accumulate, dwgu_bf16],
 				(H2 + 63) // 64, (C + 63) // 64, 1, 256)
 
-		# 7. dX_norm = dGU @ Wgu^T -> hidden [N, C]，随后执行 RMSNorm 反向累加至 x.grad
+		# 7. dX_norm = dGU @ Wgu^T -> work_buf [N, C]，随后执行 RMSNorm 反向累加至 x.grad
 		if x.requires_grad or need_dgamma:
 			self.ctx.dispatch("cuda_sgemm_nt_kernel",
-				[gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, hidden.ptr.buffer_id],
-				[gu.ptr.offset, wgu.storage.ptr.offset, hidden.ptr.offset],
+				[gu.ptr.buffer_id, wgu.storage.ptr.buffer_id, work_id],
+				[gu.ptr.offset, wgu.storage.ptr.offset, work_off],
 				[N, C, H2, 0], (C + 63) // 64, (N + 63) // 64, 1, 256)
 
 			dx_id = x.grad.storage.ptr.buffer_id if x.requires_grad else 0
@@ -320,16 +461,16 @@ class CudaBackend(Backend):
 			inv_off = gu.ptr.offset if need_dgamma else 0
 			accum_x = int(x.op is not None or bool(accumulate))
 			self.ctx.dispatch("rmsnorm_backward_kernel",
-				[x.storage.ptr.buffer_id, hidden.ptr.buffer_id, gamma_id, dx_id, inv_id],
-				[x.storage.ptr.offset, hidden.ptr.offset, gamma_off, dx_off, inv_off],
+				[x_id, work_id, gamma_id, dx_id, inv_id],
+				[x_off, work_off, gamma_off, dx_off, inv_off],
 				[N, C, eps_bits, accum_x], (N + 3) // 4, 1, 1, 128)
 
 			if need_dgamma:
 				accum_g = int(norm_weight.op is None and bool(accumulate))
 				dg_bf16 = int(np.dtype(norm_weight.grad.storage.dtype) == np.dtype(np.uint16))
 				self.ctx.dispatch("rmsnorm_dgamma_kernel",
-					[x.storage.ptr.buffer_id, hidden.ptr.buffer_id, gu.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
-					[x.storage.ptr.offset, hidden.ptr.offset, gu.ptr.offset, norm_weight.grad.storage.ptr.offset],
+					[x_id, work_id, gu.ptr.buffer_id, norm_weight.grad.storage.ptr.buffer_id],
+					[x_off, work_off, gu.ptr.offset, norm_weight.grad.storage.ptr.offset],
 					[N, C, accum_g, dg_bf16], (C + 7) // 8, 1, 1, 256)
 
 	def cuda_recompute_fused_rms_fa(self, act, k_buf, v_buf, out_buf):
@@ -341,24 +482,27 @@ class CudaBackend(Backend):
 		is_causal = int(bool(act.op.op.is_causal))
 		eps_bits = f32_bits(act.op.op.eps)
 		total_pairs = N*H*(D // 2)
+		out_id, out_off = out_buf if isinstance(out_buf, tuple) else (out_buf.ptr.buffer_id, out_buf.ptr.offset)
+		k_id, k_off = k_buf if isinstance(k_buf, tuple) else (k_buf.ptr.buffer_id, k_buf.ptr.offset)
+		v_id, v_off = v_buf if isinstance(v_buf, tuple) else (v_buf.ptr.buffer_id, v_buf.ptr.offset)
 
 		self.ctx.dispatch("fused_rms_fa_qkv_kernel",
 			[x.storage.ptr.buffer_id, wq.storage.ptr.buffer_id, bq.storage.ptr.buffer_id,
 			 wk.storage.ptr.buffer_id, bk.storage.ptr.buffer_id, wv.storage.ptr.buffer_id, bv.storage.ptr.buffer_id,
-			 out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, v_buf.ptr.buffer_id],
+			 out_id, k_id, v_id],
 			[x.storage.ptr.offset, wq.storage.ptr.offset, bq.storage.ptr.offset,
 			 wk.storage.ptr.offset, bk.storage.ptr.offset, wv.storage.ptr.offset, bv.storage.ptr.offset,
-			 out_buf.ptr.offset, k_buf.ptr.offset, v_buf.ptr.offset],
+			 out_off, k_off, v_off],
 			[B, T, C, H, eps_bits, 1], (C + 63) // 64, (N + 63) // 64, 3, 256)
 
 		self.ctx.dispatch("rope_qk_inplace_kernel",
-			[out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
-			[out_buf.ptr.offset, k_buf.ptr.offset, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
+			[out_id, k_id, rope_cos.storage.ptr.buffer_id, rope_sin.storage.ptr.buffer_id],
+			[out_off, k_off, rope_cos.storage.ptr.offset, rope_sin.storage.ptr.offset],
 			[B, H, T, D, 2], (total_pairs + 255) // 256, 1, 1, 256)
 
 		self.ctx.dispatch("flash_attn_fwd_kernel",
-			[out_buf.ptr.buffer_id, k_buf.ptr.buffer_id, v_buf.ptr.buffer_id, out_buf.ptr.buffer_id, 0],
-			[out_buf.ptr.offset, k_buf.ptr.offset, v_buf.ptr.offset, out_buf.ptr.offset, 0],
+			[out_id, k_id, v_id, out_id, 0],
+			[out_off, k_off, v_off, out_off, 0],
 			[B, H, T, C, is_causal, 0, 1], (T + 31) // 32, B * H, 1, 256)
 
 	def cuda_fused_rms_fa_forward(self, inputs, outputs, scratch=None):
